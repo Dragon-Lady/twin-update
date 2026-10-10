@@ -26,6 +26,14 @@ CRASH_RE = re.compile(r"segmentation fault|core dumped|SIGSEGV|SIGABRT|SIGILL|SI
                       re.IGNORECASE)
 ARCHIVES = "/var/cache/apt/archives"
 APT_LISTS = "/var/lib/apt/lists"
+APT_UPDATE_STAMP = "/var/lib/apt/periodic/update-success-stamp"
+SOURCES_DIR = "/etc/apt/sources.list.d"
+# Our user-level `apt-get update` must not run the system's update hooks.
+CLEAR_HOOKS = ("#clear APT::Update::Pre-Invoke;\n#clear APT::Update::Post-Invoke;\n"
+               "#clear APT::Update::Post-Invoke-Success;\n#clear DPkg::Pre-Invoke;\n"
+               "#clear DPkg::Post-Invoke;\n")
+FETCH_FAIL = ("E:", "Err:", "GPG error", "NO_PUBKEY", "is not signed", "Failed to fetch",
+              "not available", "could not be verified")
 DPKG_INFO = "/var/lib/dpkg/info"
 
 
@@ -50,6 +58,8 @@ class Engine:
         self.archives = ARCHIVES
         self.dpkg_info = DPKG_INFO
         self.apt_lists = APT_LISTS
+        self.apt_update_stamp = APT_UPDATE_STAMP
+        self.sources_dir = SOURCES_DIR
 
     # ------------------------------------------------------------------ util
     def log(self, msg: str) -> None:
@@ -126,8 +136,8 @@ class Engine:
             return None, None
         return ver, arch
 
-    def candidate(self, pkg: str) -> str | None:
-        r = self.sys.run(["apt-cache", "policy", pkg])
+    def candidate(self, pkg: str, opts: list[str] | None = None) -> str | None:
+        r = self.sys.run(["apt-cache", "policy", *(opts or []), pkg])
         for line in r.out.splitlines():
             line = line.strip()
             if line.startswith("Candidate:"):
@@ -517,29 +527,121 @@ class Engine:
         return out
 
     # ---------------------------------------------------------------- check
-    def apt_lists_age_h(self) -> float | None:
-        """Hours since apt's package lists were last refreshed (newest Release file)."""
-        newest = None
-        for f in self.sys.listdir(self.apt_lists):
-            if f.endswith("Release"):
-                m = self.sys.mtime(os.path.join(self.apt_lists, f))
-                if m is not None and (newest is None or m > newest):
-                    newest = m
-        if newest is None:
+    def _age_h(self, ts: float | None) -> float | None:
+        if ts is None:
             return None
-        return round(max(0.0, self.sys.now() - newest) / 3600.0, 1)
+        return round(max(0.0, self.sys.now() - ts) / 3600.0, 1)
 
-    def check(self, apps: list[str]) -> dict:
-        """Read-only update check: dpkg-query + apt-cache policy on the lists apt
-        already has. No sudo, no apt-get update, no process or state changes."""
-        out = {"label": self.label, "apps": {}, "apt_lists_age_h": self.apt_lists_age_h(),
+    def apt_lists_age_h(self) -> float | None:
+        """Hours since the system's apt lists were last refreshed: the update
+        success stamp, or the lists/partial directory (touched on every
+        `apt-get update`, even when no list changed)."""
+        times = [t for t in (self.sys.mtime(self.apt_update_stamp),
+                             self.sys.mtime(os.path.join(self.apt_lists, "partial")))
+                 if t is not None]
+        return self._age_h(max(times) if times else None)
+
+    def _cache_root(self) -> str:
+        base = self.sys.env().get("XDG_CACHE_HOME") or os.path.join(self.sys.home(), ".cache")
+        return os.path.join(base, "twin-update", "apt")
+
+    def _repo_uris(self, pkg: str) -> set[str]:
+        """Repository base URIs that offer this package, from the system lists."""
+        r = self.sys.run(["apt-cache", "policy", pkg])
+        out = set()
+        for line in r.out.splitlines():
+            m = re.match(r"\s*-?\d+\s+((?:https?|ftp)://\S+)\s", line)
+            if m:
+                out.add(m.group(1).rstrip("/"))
+        return out
+
+    def _source_files(self, uris: set[str]) -> list[str]:
+        files = []
+        for f in self.sys.listdir(self.sources_dir):
+            if not f.endswith((".sources", ".list")):
+                continue
+            path = os.path.join(self.sources_dir, f)
+            if self._words(path) & uris:
+                files.append(path)
+        return files
+
+    def _fresh_opts(self, root: str) -> list[str]:
+        return ["-c", os.path.join(root, "apt.conf"),
+                "-o", f"Dir::State::Lists={root}/lists",
+                "-o", f"Dir::Cache={root}/cache",
+                "-o", f"Dir::Etc::sourcelist={root}/sources.list",
+                "-o", f"Dir::Etc::sourceparts={root}/sources.d",
+                "-o", "Debug::NoLocking=1"]
+
+    def fetch_lists(self, apps: list[str]) -> dict:
+        """Fetch fresh package lists for the enabled apps' repositories into a
+        user-owned cache, without root. /var/lib/apt is never written; the
+        repositories' Signed-By keyrings and apt's signature checks apply as
+        configured. Returns the apt options to read that cache."""
+        per_app, uris = {}, set()
+        for app in self._apps(apps):
+            u = self._repo_uris(app.package)
+            per_app[app.name] = u
+            uris |= u
+        files = self._source_files(uris)
+        if not files:
+            return {"ok": False, "reason": "no apt source file found for these apps"}
+        root = self._cache_root()
+        for d in ("lists/partial", "cache", "sources.d"):
+            self.sys.makedirs(os.path.join(root, d))
+        for f in self.sys.listdir(os.path.join(root, "sources.d")):
+            self.sys.remove(os.path.join(root, "sources.d", f))
+        for f in files:
+            self.sys.symlink(f, os.path.join(root, "sources.d", os.path.basename(f)))
+        self.sys.write_private(os.path.join(root, "sources.list"), "")
+        self.sys.write_private(os.path.join(root, "apt.conf"), CLEAR_HOOKS)
+        opts = self._fresh_opts(root)
+        env = {**self.sys.env(), "LC_ALL": "C"}
+        r = self.sys.run(["apt-get", "-q", *opts, "-o", f"APT::Sandbox::User={self.sys.whoami()}",
+                          "-o", "Acquire::Retries=1", "-o", "Acquire::http::Timeout=20",
+                          "-o", "Acquire::https::Timeout=20", "update"], timeout=120, env=env)
+        lines = [l.strip() for l in (r.out + "\n" + r.err).splitlines()]
+        bad = [l for l in lines if l.startswith(("E:", "Err:", "W:")) and any(k in l for k in FETCH_FAIL)]
+        if not r.ok or bad:
+            why = "timed out" if r.rc == 124 else (bad[0] if bad else f"apt-get exit {r.rc}")
+            return {"ok": False, "reason": why[:200]}
+        self.sys.write_private(os.path.join(root, "fetched-at"), str(self.sys.now()))
+        fetched = {w for f in files for w in self._words(f)}
+        covered = sorted(a for a, u in per_app.items() if u & fetched)
+        return {"ok": True, "opts": opts, "apps": covered,
+                "sources": sorted(os.path.basename(f) for f in files)}
+
+    def _words(self, path: str) -> set[str]:
+        text = self.sys.read_text(path) or ""
+        return {w.rstrip("/") for w in re.split(r"[\s\]]+", text) if "://" in w}
+
+    def check(self, apps: list[str], fresh: bool = True) -> dict:
+        """Read-only update check. With fresh=True it first fetches the apps'
+        repository lists into the user cache (no root); if that fails it uses
+        the system lists and says why. Never sudo, never closes or installs."""
+        lists = {"source": "system", "age_h": self.apt_lists_age_h()}
+        f = None
+        if fresh:
+            f = self.fetch_lists(apps)
+            root = self._cache_root()
+            if f["ok"]:
+                raw = self.sys.read_text(os.path.join(root, "fetched-at"))
+                lists = {"source": "fresh", "age_h": self._age_h(float(raw)) if raw else 0.0,
+                         "cache": self._redact(root), "cache_bytes": self.sys.dir_size(root),
+                         "sources": f["sources"], "apps": f["apps"]}
+            else:
+                lists["fallback_reason"] = f["reason"]
+        out = {"label": self.label, "apps": {}, "lists": lists,
+               "apt_lists_age_h": lists["age_h"],
                "apt_busy": self.apt_busy(), "identity_ok": self.identity()["ok"]}
         for app in self._apps(apps):
             ver, _ = self.installed(app.package)
-            cand = self.candidate(app.package) if ver else None
+            use_fresh = bool(f and f["ok"] and app.name in f["apps"])
+            cand = self.candidate(app.package, f["opts"] if use_fresh else None) if ver else None
             newer = bool(ver and cand and cand != ver and self.vercmp(cand, "gt", ver))
             out["apps"][app.name] = {"installed": ver, "candidate": cand,
-                                     "update_available": newer}
+                                     "update_available": newer,
+                                     "lists": "fresh" if use_fresh else "system"}
         return out
 
     def notice_due(self, kind: str, signature: str) -> bool:

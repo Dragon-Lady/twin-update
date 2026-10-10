@@ -145,6 +145,25 @@ class System:
     def isdir(self, path: str) -> bool:
         return os.path.isdir(path)
 
+    def symlink(self, src: str, dst: str) -> None:
+        os.symlink(src, dst)
+
+    def remove(self, path: str) -> None:
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+
+    def dir_size(self, path: str) -> int:
+        total = 0
+        for root, _dirs, files in os.walk(path):
+            for f in files:
+                try:
+                    total += os.lstat(os.path.join(root, f)).st_size
+                except OSError:
+                    pass
+        return total
+
     def mtime(self, path: str) -> float | None:
         try:
             return os.stat(path).st_mtime

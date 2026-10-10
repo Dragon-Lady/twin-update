@@ -68,7 +68,7 @@ def _build(args, ui, system=None, peer_factory=SshPeer):
             unreachable[peer] = str(exc)
             if sp is not None:
                 try:
-                    sp.proc.terminate()
+                    (getattr(sp, "abort", None) or sp.proc.terminate)()
                 except Exception:
                     pass
     else:
@@ -98,29 +98,27 @@ def _print(ui, data, as_json: bool) -> None:
             if "error" in checks:
                 ui.say(f"{l:8} error: {checks['error']}")
                 continue
-            bad = []
             for k in sorted(checks):
                 v = checks[k]
                 if k == "locks":
                     for path, state in v.items():
                         ui.say(f"{l:8} lock {path}: {state}")
-                    continue
-                if k == "notify_tool":
+                elif k == "notify_tool":
                     ui.say(f"{l:8} notify: {v or 'none (notifications skipped)'}")
-                    continue
-                ok = bool(v)
-                ui.say(f"{l:8} {k:18} {'ok' if ok else 'NO'}")
-                if not ok:
-                    bad.append(k)
-            ui.say(f"{l:8} {'all checks ok' if not bad else 'problems: ' + ', '.join(bad)}")
+                elif k != "locks_ok":
+                    ui.say(f"{l:8} {k:18} {'ok' if v else 'NO'}")
         for l, why in data.get("unreachable", {}).items():
             ui.say(f"{l:8} unreachable: {why}")
+        for l, ws in data.get("warnings", {}).items():
+            for w in ws:
+                ui.say(f"{l:8} warning: {w}")
+        for l, ps in data.get("problems", {}).items():
+            ui.say(f"{l:8} problems: {'; '.join(ps)}")
+        ui.say("result: all checks ok" if data.get("ok") else "result: problems found (exit 4)")
         return
     if kind == "check":
         for l, m in data.get("machines", {}).items():
-            age = m.get("apt_lists_age_h")
-            ui.say(f"{l:8} apt lists {'age unknown' if age is None else f'{age:.1f} h old'}"
-                   " (cached; not refreshed by this check)")
+            ui.say(f"{l:8} {_lists_line(m.get('lists'), m.get('apt_lists_age_h'))}")
         for line in data.get("summary", []):
             ui.say(line)
         for l, why in data.get("errors", {}).items():
@@ -192,6 +190,8 @@ def main(argv=None, ui=None, system=None, peer_factory=SshPeer) -> int:
     p.add_argument("--dry-run", action="store_true")
     p = sub.add_parser("check", help="read-only update check on both machines (no sudo)")
     common(p)
+    p.add_argument("--no-fetch", action="store_true",
+                   help="use the system apt lists as they are (no user-level fetch)")
     p.add_argument("--notify", action="store_true",
                    help="desktop notification on this machine if updates are available "
                         "(errors: at most one notice per day)")
@@ -240,7 +240,7 @@ def main(argv=None, ui=None, system=None, peer_factory=SshPeer) -> int:
                 data = orchestrator.rollback(sess, args.app, labels, args.dry_run,
                                              smoke=not args.no_smoke, hold=not args.no_hold)
             elif args.cmd == "check":
-                data = orchestrator.check(sess, unreachable)
+                data = orchestrator.check(sess, unreachable, fresh=not args.no_fetch)
                 if args.notify:
                     data["notification"] = _check_notify(sess, me, data)
             elif args.cmd == "holds":
@@ -261,8 +261,35 @@ def main(argv=None, ui=None, system=None, peer_factory=SshPeer) -> int:
     _print(ui, data, args.json)
     if data.get("kind") == "check":
         return data["exit_code"]
+    if data.get("kind") == "doctor":
+        return 0 if data.get("ok") else 4
     res = data.get("result")
     return 0 if res in (None, "ok", "dry-run") else (3 if res == "aborted" else 1)
+
+
+def _age(h) -> str:
+    if h is None:
+        return "at an unknown time"
+    if h < 1:
+        return f"{int(round(h * 60))} min ago"
+    return f"{h:.1f} h ago"
+
+
+def _size(n: int) -> str:
+    return f"{n / 1048576:.1f} MB" if n >= 1048576 else f"{n / 1024:.0f} KB"
+
+
+def _lists_line(lists: dict | None, age_h) -> str:
+    if not lists:  # peer running 0.2.0 (status fallback)
+        return "package lists: system (older twin-update there)"
+    if lists["source"] == "fresh":
+        return (f"package lists: fetched fresh {_age(lists['age_h'])} for "
+                f"{', '.join(lists.get('apps', [])) or 'no app'} "
+                f"(user cache {lists.get('cache')}, {_size(lists.get('cache_bytes', 0))})")
+    line = f"package lists: system lists, last refreshed {_age(lists['age_h'])}"
+    if lists.get("fallback_reason"):
+        line += f" (fresh fetch failed: {lists['fallback_reason']})"
+    return line
 
 
 def _check_notify(sess, me: str, data: dict) -> str:

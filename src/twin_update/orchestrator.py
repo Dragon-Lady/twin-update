@@ -328,28 +328,60 @@ def unhold(s: Session, app: str, labels, dry: bool) -> dict:
     return {"kind": "unhold", "machines": out}
 
 
+def doctor_findings(checks: dict) -> tuple[list[str], list[str]]:
+    """(problems, warnings) for one machine's doctor result."""
+    if "error" in checks:
+        return [f"error: {checks['error']}"], []
+    problems, warnings = [], []
+    for k, v in sorted(checks.items()):
+        if k == "locks":
+            for path, state in v.items():
+                if state.startswith("missing (parent"):
+                    problems.append(f"lock {path}: {state}")
+                elif state == "busy":
+                    warnings.append(f"lock {path} busy right now (a run waits for it)")
+        elif k == "notify_tool":
+            if not v:
+                warnings.append("no notify-send or gdbus: notifications are skipped")
+        elif k != "locks_ok" and isinstance(v, bool) and not v:
+            problems.append(k)
+    return problems, warnings
+
+
 def doctor(s: Session, unreachable: dict) -> dict:
-    out = {"kind": "doctor", "machines": {}, "unreachable": unreachable}
+    out = {"kind": "doctor", "machines": {}, "unreachable": unreachable,
+           "problems": {}, "warnings": {}}
     for l in s.order:
         try:
             out["machines"][l] = s.peers[l].call("doctor")
         except PeerError as exc:
             out["machines"][l] = {"error": str(exc)}
+    for l, checks in out["machines"].items():
+        p, w = doctor_findings(checks)
+        if p:
+            out["problems"][l] = p
+        if w:
+            out["warnings"][l] = w
+    for l, why in unreachable.items():
+        if not why.startswith("skipped"):
+            out["problems"].setdefault(l, []).append(f"unreachable: {why}")
+    out["ok"] = not out["problems"]
     return out
 
 
-def check(s: Session, unreachable: dict) -> dict:
+def check(s: Session, unreachable: dict, fresh: bool = True) -> dict:
     """Read-only update check on both machines; never asks for sudo."""
     out = {"kind": "check", "version": __version__, "machines": {}, "errors": {},
            "updates": [], "summary": []}
     for l, why in unreachable.items():
         if not why.startswith("skipped"):
-            out["errors"][l] = "could not reach it over ssh (it may be off or asleep)"
-            out.setdefault("error_detail", {})[l] = why
+            prefix = f"{l}: "
+            out["errors"][l] = why[len(prefix):] if why.startswith(prefix) else why
     for l in s.order:
         try:
             try:
-                r = s.peers[l].call("check", apps=s.cfg.enabled)
+                kw = {} if fresh else {"fresh": False}
+                r = s.peers[l].call("check", apps=s.cfg.enabled, **kw)
             except PeerError as exc:
                 if "op not allowed: check" not in str(exc):
                     raise

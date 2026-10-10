@@ -1,13 +1,23 @@
 # Changelog
 
-## 0.2.1 (2026-10-09)
+## 0.2.1 (unreleased)
 
-* New `twin-update check [--notify] [--json]`: read-only update check on both
-  machines using the apt lists already on disk (no `apt-get update`, no sudo,
-  no closes, no installs, no rollback captures). Shows the age of the apt
-  lists. Exit codes: 0 no updates, 10 updates available, 1 check incomplete.
+* New `twin-update check [--notify] [--json] [--no-fetch]`: update check on
+  both machines without root. It fetches fresh lists for only the enabled
+  apps' repositories into a user cache (`~/.cache/twin-update/apt`), keeping
+  the repositories' Signed-By keyrings and apt's signature checks, without
+  running the system's apt hooks or writing `/var/lib/apt`; on failure it
+  falls back to the system lists and says why. No sudo, no closes, no
+  installs, no rollback captures. Exit codes: 0 no updates, 10 updates
+  available, 1 check incomplete.
+* List age is the real last refresh (fresh fetch time, or the system's
+  update stamp / last `apt-get update`), not the last change of a file.
 * `--notify` notifies only on the machine running the check; the same notice
-  at most once per day. Errors use plain wording.
+  at most once per day.
+* ssh failures are explained: name lookup failed, login refused, connection
+  refused, interactive Tailscale SSH check, or timed out.
+* `doctor` exits 4 when it finds a problem, including an unreachable other
+  machine; a busy sync lock is a warning only.
 * Works against a peer running 0.2.0 (falls back to `status`).
 * README: example user-level systemd timer for a daily check.
 

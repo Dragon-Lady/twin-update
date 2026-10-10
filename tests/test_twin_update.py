@@ -428,8 +428,12 @@ class Transport(unittest.TestCase):
             def poll(self):
                 return None
 
+            def wait(self, timeout=None):
+                return 0
+
         p = SshPeer("machine-b", "user@host.example", "~/.local/bin/twin-update", popen=P,
                     connect_timeout=None)
+        self.addCleanup(p.close)
         p.call("set_password", password=PW)
         self.assertIn("BatchMode=yes", seen["argv"])
         self.assertNotIn(PW, " ".join(seen["argv"]))
@@ -550,7 +554,8 @@ class HumanOutput(unittest.TestCase):
             fh.write(CONFIG.format(keep="[]", fallback="[]"))
         buf = io.StringIO()
         self.assertFalse(buf.isatty())
-        with contextlib.redirect_stdout(buf):
+        from fakes import patched_paths
+        with contextlib.redirect_stdout(buf), patched_paths(t):
             rc = cli.main(["--config", cfgp, *args], system=t.sys["machine-a"])  # real ConsoleUI
         return rc, buf.getvalue()
 
@@ -609,22 +614,30 @@ class Check(unittest.TestCase):
             fh.write(CONFIG.format(keep="[]", fallback="[]"))
         factory = factory or (lambda label, target, cmd: t.peers[label])
         buf = io.StringIO()
-        from unittest import mock
-        from twin_update import engine as engine_mod
+        from fakes import patched_paths
         s = t.sys["machine-a"]
-        # The CLI builds its own local engine: keep its state and apt lists in the fake.
-        with contextlib.redirect_stdout(buf), \
-                mock.patch.dict(os.environ, {"HOME": s.home()}), \
-                mock.patch.object(engine_mod, "APT_LISTS", t.eng["machine-a"].apt_lists):
+        # The CLI builds its own local engine: keep its state, cache and apt paths in the fake.
+        with contextlib.redirect_stdout(buf), patched_paths(t):
             rc = cli.main(["--config", cfgp, "check", *args], system=s, peer_factory=factory)
         return rc, buf.getvalue()
 
     def _assert_read_only(self, t):
         for s in t.sys.values():
-            bad = [c[0] for c in s.calls if c[0][0] in self.FORBIDDEN
-                   or c[0][:2] in (["apt-mark", "hold"], ["apt-mark", "unhold"])]
-            self.assertEqual(bad, [])
-            self.assertTrue(all(c[1] is None for c in s.calls))   # nothing on stdin, no password
+            cache = s.home() + "/.cache/twin-update/apt"
+            for argv, stdin, _env in s.calls:
+                self.assertIsNone(stdin)                          # nothing on stdin, no password
+                self.assertNotIn(argv[0], ("sudo", "systemd-run", "pkexec"))
+                self.assertNotEqual(argv[:2], ["apt-mark", "hold"])
+                self.assertNotEqual(argv[:2], ["apt-mark", "unhold"])
+                if argv[0] == "apt-get":
+                    # only the user-level list fetch, entirely inside the user cache
+                    self.assertEqual(argv[-1], "update")
+                    dirs = [a.split("=", 1)[1] for a in argv if a.startswith("Dir::")]
+                    self.assertEqual(len(dirs), 4)
+                    self.assertTrue(all(d.startswith(cache) for d in dirs), dirs)
+                    self.assertIn("Debug::NoLocking=1", argv)
+                    self.assertTrue(argv[argv.index("-c") + 1].startswith(cache))
+                    self.assertNotIn("/var/lib/apt", " ".join(argv))
         self.assertEqual([e for e in t.events if e[1] in ("LAUNCH", "TERM", "UNHOLD")], [])
 
     def _notifies(self, t, label="machine-a"):
@@ -637,7 +650,8 @@ class Check(unittest.TestCase):
         self.assertEqual(rc, 10)
         self.assertIn("Cursor 3.23.23-1\u21923.24.9-1 on both machines", out)
         self.assertIn("ChatGPT 26.1002.52244\u219226.1007.21434 on both machines", out)
-        self.assertEqual(out.count("2.0 h old (cached; not refreshed by this check)"), 2)
+        self.assertEqual(out.count("package lists: fetched fresh 0 min ago for chatgpt, cursor, grok-bot"), 2)
+        self.assertIn("user cache ~/.cache/twin-update/apt", out)
         self.assertIn("notification: sent via notify-send", out)
         self.assertNotIn("Grok Bot", out)
         n = self._notifies(t)
@@ -680,10 +694,10 @@ class Check(unittest.TestCase):
         t.setup("grok-bot", "0.68.1", "0.68.1")
 
         def down(label, target, cmd):
-            raise PeerError(f"{label}: ssh session ended (exit 255)")
+            raise PeerError(f"{label}: timed out: the machine may be off, asleep or offline")
         rc, out = self._cli(t, ["--notify"], factory=down)
         self.assertEqual(rc, 1)
-        self.assertIn("machine-b error: could not reach it over ssh (it may be off or asleep)", out)
+        self.assertIn("machine-b error: timed out: the machine may be off, asleep or offline", out)
         self.assertIn("result: check incomplete", out)
         self.assertEqual(len(self._notifies(t)), 1)
         self.assertIn("check incomplete", self._notifies(t)[0][-2])
@@ -735,6 +749,179 @@ class Check(unittest.TestCase):
         rc, out = self._cli(t, [])
         self.assertIn("machine-b error: identity does not match the config", out)
         self.assertEqual(rc, 10)          # machine-a still has updates
+
+
+
+class FreshLists(unittest.TestCase):
+    def _t(self):
+        t = Twin()
+        t.setup("cursor", "3.24.9-1", "3.24.9-1")
+        t.setup("chatgpt", "26.1007.21434", "26.1007.21434")       # system lists: current
+        t.setup("grok-bot", "0.68.1", "0.68.1")
+        for s in t.sys.values():
+            s.fresh_cands["chatgpt"] = "26.1009.1"                  # the repo already has newer
+        return t
+
+    def test_fresh_fetch_sees_new_version_in_user_cache_only(self):
+        t = self._t()
+        rc, out = Check._cli(Check(), t, [])
+        self.assertEqual(rc, 10)
+        self.assertIn("ChatGPT 26.1007.21434\u219226.1009.1 on both machines", out)
+        e, s = t.eng["machine-a"], t.sys["machine-a"]
+        root = s.home() + "/.cache/twin-update/apt"
+        self.assertEqual(os.listdir(root + "/sources.d"), ["vendor.sources"])   # only the app repo
+        self.assertEqual(os.readlink(root + "/sources.d/vendor.sources"),
+                         os.path.join(e.sources_dir, "vendor.sources"))         # Signed-By kept as is
+        with open(root + "/apt.conf") as fh:
+            self.assertIn("#clear APT::Update::Post-Invoke;", fh.read())
+        Check._assert_read_only(Check(), t)
+
+    def test_no_fetch_uses_system_lists_with_real_age(self):
+        t = self._t()
+        rc, out = Check._cli(Check(), t, ["--no-fetch"])
+        self.assertEqual(rc, 0)
+        self.assertIn("package lists: system lists, last refreshed 2.0 h ago", out)
+        self.assertFalse(any(c[0][0] == "apt-get" for s in t.sys.values() for c in s.calls))
+
+    def test_update_stamp_counts_as_refresh(self):
+        t = self._t()
+        e = t.eng["machine-b"]
+        os.makedirs(os.path.dirname(e.apt_update_stamp))
+        open(e.apt_update_stamp, "w").close()
+        os.utime(e.apt_update_stamp, (t.clock.t - 1800, t.clock.t - 1800))
+        self.assertEqual(e.apt_lists_age_h(), 0.5)
+
+    def test_fetch_failure_falls_back_to_system_and_says_so(self):
+        t = self._t()
+        t.sys["machine-b"].fresh_fail = "W: GPG error: http://repo stable InRelease: NO_PUBKEY 0123"
+        rc, out = Check._cli(Check(), t, [])
+        self.assertEqual(rc, 10)                                  # machine-a still fetched
+        self.assertIn("ChatGPT 26.1007.21434\u219226.1009.1 on machine-a", out)
+        self.assertIn("machine-b package lists: system lists, last refreshed 2.0 h ago "
+                      "(fresh fetch failed: Err:1 http://repo stable InRelease)", out)
+
+    def test_fetch_timeout_reason(self):
+        t = self._t()
+        e, s = t.eng["machine-a"], t.sys["machine-a"]
+        real = s.run
+
+        def run(argv, **kw):
+            if argv[0] == "apt-get":
+                from twin_update.system import Result
+                return Result(124, "", "timeout")
+            return real(argv, **kw)
+        s.run = run
+        r = e.check(["chatgpt"])
+        self.assertEqual(r["lists"]["source"], "system")
+        self.assertEqual(r["lists"]["fallback_reason"], "timed out")
+        self.assertFalse(r["apps"]["chatgpt"]["update_available"])
+
+    def test_app_without_matching_source_uses_system_lists(self):
+        t = self._t()
+        e = t.eng["machine-a"]
+        os.remove(os.path.join(e.sources_dir, "vendor.sources"))
+        r = e.check(["chatgpt"])
+        self.assertEqual(r["lists"]["source"], "system")
+        self.assertEqual(r["lists"]["fallback_reason"], "no apt source file found for these apps")
+
+
+class SshErrors(unittest.TestCase):
+    def test_classification(self):
+        from twin_update.peer import classify_ssh_error as c
+        self.assertIn("name lookup failed",
+                      c("ssh: Could not resolve hostname h: Name or service not known\n", 255))
+        self.assertIn("login refused", c("user@h: Permission denied (publickey).\n", 255))
+        self.assertIn("login refused", c("Host key verification failed.\n", 255))
+        self.assertIn("connection refused",
+                      c("ssh: connect to host h port 22: Connection refused\n", 255))
+        self.assertIn("timed out", c("ssh: connect to host h port 22: Connection timed out\n", 255))
+        self.assertIn("timed out", c("ssh: connect to host h port 22: No route to host\n", 255))
+        self.assertIn("timed out", c("", None, no_answer=True))
+        self.assertIn("interactive check",
+                      c("# Tailscale SSH requires an additional check.\n# To authenticate, "
+                        "visit: https://login.tailscale.com/a/xyz\n", None, no_answer=True))
+        self.assertEqual(c("", 255), "ssh session failed (exit 255)")
+
+    def test_ssh_peer_reports_classified_reason(self):
+        from twin_update.peer import PeerError, SshPeer
+
+        class P:
+            def __init__(self, argv, stdin=None, stdout=None, stderr=None):
+                stderr.write(b"ssh: Could not resolve hostname other: Name or service not known\n")
+                self.stdin = io.BytesIO()
+                self.stdout = io.BytesIO(b"")
+
+            def poll(self):
+                return 255
+
+            def wait(self, timeout=None):
+                return 255
+
+            def terminate(self):
+                pass
+
+        p = SshPeer("machine-b", "u@other", "twin-update", popen=P, connect_timeout=None)
+        self.addCleanup(p.close)
+        with self.assertRaises(PeerError) as cm:
+            p.call("identity")
+        self.assertEqual(str(cm.exception), "machine-b: name lookup failed: its host name does not "
+                         "resolve on this machine (check DNS/MagicDNS, or use its address in "
+                         "ssh_target)")
+
+
+class DoctorExit(unittest.TestCase):
+    def _doctor(self, t, args=(), factory=None):
+        import contextlib
+        import tempfile
+        from fakes import CONFIG, patched_paths
+        from twin_update import cli
+        tmpd = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, tmpd, True)
+        cfgp = os.path.join(tmpd, "c.toml")
+        with open(cfgp, "w") as fh:
+            fh.write(CONFIG.format(keep="[]", fallback="[]"))
+        factory = factory or (lambda label, target, cmd: t.peers[label])
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), patched_paths(t):
+            rc = cli.main(["--config", cfgp, "doctor", *args], system=t.sys["machine-a"],
+                          peer_factory=factory)
+        return rc, buf.getvalue()
+
+    def test_all_ok_exit_0(self):
+        t = Twin(); standard(t)
+        rc, out = self._doctor(t)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("result: all checks ok", out)
+
+    def test_unreachable_other_machine_exit_4(self):
+        from twin_update.peer import PeerError
+        t = Twin(); standard(t)
+
+        def down(label, target, cmd):
+            raise PeerError(f"{label}: ssh login refused (authentication or host key)")
+        rc, out = self._doctor(t, factory=down)
+        self.assertEqual(rc, 4)
+        self.assertIn("machine-b problems: unreachable: machine-b: ssh login refused", out)
+        self.assertIn("result: problems found (exit 4)", out)
+
+    def test_failed_check_exit_4_and_busy_lock_is_only_a_warning(self):
+        t = Twin(); standard(t)
+        t.sys["machine-b"].apt_busy_flag = True
+        rc, out = self._doctor(t)
+        self.assertEqual(rc, 4)
+        self.assertIn("machine-b problems: apt_idle", out)
+        t = Twin(); standard(t)
+        t.sys["machine-b"].locked = True
+        rc, out = self._doctor(t, ["--json"])
+        self.assertEqual(rc, 0)
+        d = json.loads(out)
+        self.assertTrue(d["ok"])
+        self.assertIn("busy right now", d["warnings"]["machine-b"][0])
+
+    def test_local_only_skip_is_not_a_problem(self):
+        t = Twin(); standard(t)
+        rc, _ = self._doctor(t, ["--local-only"])
+        self.assertEqual(rc, 0)
 
 
 if __name__ == "__main__":

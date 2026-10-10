@@ -96,6 +96,9 @@ class FakeSystem(System):
         self.locked = False
         self.pid = 999999
         self.missing_tools = set()
+        self.fresh_cands = {}     # pkg -> candidate seen by a fresh user-level fetch
+        self.fresh_fail = None    # apt-get update error text, or None
+        self.fetched = False
 
     # identity
     def whoami(self): return self.user
@@ -205,8 +208,18 @@ class FakeSystem(System):
                 return Result(0, f"ii |{self.pkgs[pkg]}|amd64")
             return Result(1, "", "no packages found")
         if argv[:2] == ["apt-cache", "policy"]:
-            c = self.cands.get(argv[2])
-            return Result(0, f"{argv[2]}:\n  Installed: x\n  Candidate: {c or '(none)'}\n")
+            pkg = argv[-1]
+            fresh = any(a.startswith("Dir::State::Lists=") for a in argv)
+            c = (self.fresh_cands.get(pkg, self.cands.get(pkg)) if fresh and self.fetched
+                 else self.cands.get(pkg))
+            table = f"     {c} 500\n        500 http://repo stable/main amd64 Packages\n" if c else ""
+            return Result(0, f"{pkg}:\n  Installed: x\n  Candidate: {c or '(none)'}\n"
+                             f"  Version table:\n{table}")
+        if argv[0] == "apt-get" and argv[-1] == "update":
+            if self.fresh_fail:
+                return Result(100, "Err:1 http://repo stable InRelease\n", self.fresh_fail)
+            self.fetched = True
+            return Result(0, "Hit:1 http://repo stable InRelease\nReading package lists...\n")
         if argv[:2] == ["apt-cache", "madison"]:
             return Result(0, "".join(f" {argv[2]} | {v} | http://repo stable/main amd64 Packages\n"
                                      for v in self.repo.get(argv[2], [])))
@@ -319,10 +332,17 @@ class Twin:
             e = Engine(cfg, s, label, log=self.logs.append)
             e.archives, e.dpkg_info = s.archives_dir, s.info_dir
             e.apt_lists = os.path.join(s.root, "lists")
-            os.makedirs(e.apt_lists)
-            rel = os.path.join(e.apt_lists, "repo_dists_stable_InRelease")
-            open(rel, "w").close()
-            os.utime(rel, (self.clock.t - 7200, self.clock.t - 7200))
+            os.makedirs(os.path.join(e.apt_lists, "partial"))
+            ago = self.clock.t - 7200                      # system lists refreshed 2 h ago
+            os.utime(os.path.join(e.apt_lists, "partial"), (ago, ago))
+            e.apt_update_stamp = os.path.join(s.root, "periodic", "update-success-stamp")
+            e.sources_dir = os.path.join(s.root, "sources.list.d")
+            os.makedirs(e.sources_dir)
+            with open(os.path.join(e.sources_dir, "vendor.sources"), "w") as fh:
+                fh.write("Types: deb\nURIs: http://repo/\nSuites: stable\nComponents: main\n"
+                         "Signed-By: /usr/share/keyrings/vendor.gpg\n")
+            with open(os.path.join(e.sources_dir, "other.list"), "w") as fh:
+                fh.write("deb http://elsewhere.example stable main\n")
             self.sys[label], self.eng[label] = s, e
             self.peers[label] = LocalPeer(e)
             for pkg, root in (("cursor", "/usr/share/cursor"), ("chatgpt", "/usr/lib/chatgpt"),
@@ -342,3 +362,17 @@ class Twin:
     def session(self, ui):
         from twin_update.orchestrator import Session
         return Session(self.cfg, self.peers, ["machine-a", "machine-b"], ui)
+
+
+def patched_paths(t, label="machine-a"):
+    """Point a CLI-built engine (module defaults) and HOME at the fake machine."""
+    import contextlib
+    from unittest import mock
+    e, s = t.eng[label], t.sys[label]
+    stack = contextlib.ExitStack()
+    stack.enter_context(mock.patch.dict(os.environ, {"HOME": s.home()}))
+    for name, val in (("APT_LISTS", e.apt_lists), ("APT_UPDATE_STAMP", e.apt_update_stamp),
+                      ("SOURCES_DIR", e.sources_dir), ("ARCHIVES", e.archives),
+                      ("DPKG_INFO", e.dpkg_info)):
+        stack.enter_context(mock.patch.object(engine_mod, name, val))
+    return stack

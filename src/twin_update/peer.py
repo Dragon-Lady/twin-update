@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import selectors
 import subprocess
+import tempfile
 
 from twin_update.engine import Engine, EngineError
 
@@ -23,6 +24,29 @@ OPS = {
 
 class PeerError(Exception):
     pass
+
+
+def classify_ssh_error(stderr: str, exit_code: int | None, no_answer: bool = False) -> str:
+    """Plain-words reason for a failed ssh session (no host names or addresses)."""
+    t = stderr.lower()
+    if any(k in t for k in ("could not resolve hostname", "name or service not known",
+                            "temporary failure in name resolution", "no address associated")):
+        return ("name lookup failed: its host name does not resolve on this machine "
+                "(check DNS/MagicDNS, or use its address in ssh_target)")
+    if "tailscale ssh requires an additional check" in t or "login.tailscale.com" in t:
+        return ("Tailscale SSH asked for an interactive check; a non-interactive run needs "
+                "the policy action 'accept' for this pair")
+    if any(k in t for k in ("permission denied", "host key verification failed",
+                            "too many authentication failures", "remote host identification")):
+        return "ssh login refused (authentication or host key)"
+    if "connection refused" in t:
+        return "connection refused (no ssh server listening there, or it is blocked)"
+    if no_answer or any(k in t for k in ("timed out", "no route to host", "network is unreachable",
+                                         "host is down", "operation timed out")):
+        return "timed out: the machine may be off, asleep or offline"
+    if exit_code not in (None, 255) and "not found" in t:
+        return "twin-update not found there (check remote_command)"
+    return f"ssh session failed (exit {exit_code})"
 
 
 class LocalPeer:
@@ -48,8 +72,15 @@ class SshPeer:
         argv = ["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
                 "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4",
                 target, f"{remote_command} local --serve --as {label}"]
-        self.proc = popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                          stderr=subprocess.DEVNULL)
+        # stderr goes to an anonymous temp file (nothing on disk by name), read
+        # only to explain a failure.
+        self._err = tempfile.TemporaryFile()
+        try:
+            self.proc = popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                              stderr=self._err)
+        except BaseException:
+            self._err.close()
+            raise
         self._id = 0
         self._first_timeout = connect_timeout
 
@@ -60,7 +91,7 @@ class SshPeer:
         sel.register(self.proc.stdout, selectors.EVENT_READ)
         try:
             if not sel.select(timeout):
-                raise PeerError(f"{self.label}: no answer within {timeout:.0f}s (ssh)")
+                raise PeerError(f"{self.label}: {self._why(no_answer=True)}")
         finally:
             sel.close()
         return self.proc.stdout.readline()
@@ -74,17 +105,45 @@ class SshPeer:
             self.proc.stdin.write(line)
             self.proc.stdin.flush()
         except (BrokenPipeError, OSError):
-            raise PeerError(f"{self.label}: ssh session closed") from None
+            raise PeerError(f"{self.label}: {self._why()}") from None
         finally:
             del line  # may carry the sudo password; drop our reference
         timeout, self._first_timeout = self._first_timeout, None
         raw = self._readline(timeout)
         if not raw:
-            raise PeerError(f"{self.label}: ssh session ended (exit {self.proc.poll()})")
+            raise PeerError(f"{self.label}: {self._why()}")
         msg = json.loads(raw)
         if not msg.get("ok"):
             raise PeerError(f"{self.label}: {msg.get('error', 'error')}")
         return msg["result"]
+
+    def _why(self, no_answer: bool = False) -> str:
+        code = None
+        try:
+            code = self.proc.wait(timeout=0 if no_answer else 3)
+        except Exception:
+            pass
+        text = ""
+        try:
+            self._err.flush()
+            self._err.seek(0)
+            text = self._err.read(8192).decode("utf-8", "replace")
+        except (OSError, ValueError):
+            pass
+        return classify_ssh_error(text, code, no_answer=no_answer and code is None)
+
+    def abort(self) -> None:
+        try:
+            self.proc.terminate()
+        except Exception:
+            pass
+        self._close_err()
+
+    def _close_err(self) -> None:
+        try:
+            self._err.close()
+        except Exception:
+            pass
 
     def close(self) -> None:
         try:
@@ -95,6 +154,8 @@ class SshPeer:
             self.proc.wait(timeout=30)
         except subprocess.TimeoutExpired:
             self.proc.terminate()
+        finally:
+            self._close_err()
 
 
 def serve(engine: Engine, rfile, wfile) -> int:

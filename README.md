@@ -90,23 +90,34 @@ twin-update status [--local-only]          # per machine/app: installed, candida
 twin-update rollback <app> [--machine <label>|both] [--dry-run] [--no-hold]
 twin-update holds
 twin-update unhold <app> [--machine ...] [--dry-run]
-twin-update doctor                         # identity, sudo group, apt idle, locks, session, ssh
+twin-update doctor                         # identity, sudo group, apt idle, locks, session, ssh; exit 4 on problems
 twin-update local --serve                  # per-machine engine; the peer runs this over ssh
 ```
 
 ### Daily check (optional)
 
-`twin-update check` asks both machines, read-only, whether the enabled apps
-have newer versions: `dpkg-query` and `apt-cache policy` against the package
-lists apt **already has**. It never runs `apt-get update` (that needs root),
-so it is only as fresh as the last refresh by your system's own apt timer or
-a previous `twin-update run`; the output shows how old the lists are. It never
-asks for sudo, closes nothing, installs nothing and stores no rollback copies.
+`twin-update check` asks both machines, without root, whether the enabled apps
+have newer versions. First it fetches fresh package lists for **only the
+apps' own repositories** into a user-owned cache
+(`~/.cache/twin-update/apt`, or `$XDG_CACHE_HOME/twin-update/apt`) with
+`apt-get update` pointed at that cache: the repositories' existing
+`sources.list.d` entries are linked in unchanged, so their `Signed-By` keyrings
+and apt's signature checks apply as configured; the system's apt update hooks
+are not run; `/var/lib/apt` is never written. Then `apt-cache policy` reads that
+same cache. If the fetch fails or times out (2 minutes), it uses the system
+lists and says so, with how long ago they were last refreshed. `--no-fetch`
+skips the fetch. It never asks for sudo, closes nothing, installs nothing and
+stores no rollback copies. (`twin-update run` still refreshes and installs
+with the system apt, as root.)
 
 With `--notify` it sends a desktop notification **on the machine it runs on**
 when updates are available, or a short "check incomplete" notice when the
 other machine could not be reached or an error occurred. The same notice is
 sent at most once per day (state in `~/.local/state/twin-update/`).
+
+Unreachable machines are reported in plain words: name lookup failed, ssh
+login refused, connection refused, Tailscale SSH asked for an interactive
+check, or timed out (off, asleep or offline).
 
 Exit codes for `check`: **0** no updates, **10** updates available (also when
 only one machine could be checked), **1** check incomplete (error or other
@@ -215,7 +226,8 @@ python3 tools/build_zipapp.py        # -> dist/twin-update.pyz
 ```
 
 Standard library only. Exit codes (`check` differs, see above): 0 ok / dry-run,
-1 failed, 2 usage or config,
+4 `doctor` found a problem (including an unreachable other machine; a busy
+sync lock is only a warning), 1 failed, 2 usage or config,
 3 aborted (nothing changed).
 
 ## License
