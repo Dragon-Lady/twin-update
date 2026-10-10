@@ -901,8 +901,22 @@ class DoctorExit(unittest.TestCase):
             raise PeerError(f"{label}: ssh login refused (authentication or host key)")
         rc, out = self._doctor(t, factory=down)
         self.assertEqual(rc, 4)
-        self.assertIn("machine-b problems: unreachable: machine-b: ssh login refused", out)
+        self.assertIn("machine-b problems: unreachable: ssh login refused", out)
+        self.assertIn("machine-b unreachable: ssh login refused", out)
+        self.assertNotIn("machine-b: machine-b", out)
+        self.assertNotIn("unreachable: machine-b:", out)
         self.assertIn("result: problems found (exit 4)", out)
+        rc, out = self._doctor(t, ["--json"], factory=down)
+        d = json.loads(out)
+        self.assertEqual(d["unreachable"]["machine-b"],
+                         "ssh login refused (authentication or host key)")
+
+    def test_label_never_repeated_for_any_machine(self):
+        from twin_update import cli
+        for label in ("machine-a", "machine-b", "x"):
+            self.assertEqual(cli._without_label(label, f"{label}: timed out"), "timed out")
+            self.assertEqual(cli._without_label(label, f"{label}: {label}: timed out"), "timed out")
+            self.assertEqual(cli._without_label(label, "other: timed out"), "other: timed out")
 
     def test_failed_check_exit_4_and_busy_lock_is_only_a_warning(self):
         t = Twin(); standard(t)

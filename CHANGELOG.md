@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.1 (unreleased)
+## 0.2.1 (2026-10-09)
 
 * New `twin-update check [--notify] [--json] [--no-fetch]`: update check on
   both machines without root. It fetches fresh lists for only the enabled

@@ -50,6 +50,14 @@ def _detach_if_needed(args) -> None:
     os.execvp(argv[0], argv)
 
 
+def _without_label(label: str, why: str) -> str:
+    """Drop a leading "<label>: " so output lines don't repeat the machine label."""
+    prefix = f"{label}: "
+    while why.startswith(prefix):
+        why = why[len(prefix):]
+    return why
+
+
 def _build(args, ui, system=None, peer_factory=SshPeer):
     system = system or System()
     cfg = load(args.config)
@@ -65,7 +73,7 @@ def _build(args, ui, system=None, peer_factory=SshPeer):
             sp.call("identity")
             peers[peer] = sp
         except (PeerError, OSError, ValueError) as exc:
-            unreachable[peer] = str(exc)
+            unreachable[peer] = _without_label(peer, str(exc))
             if sp is not None:
                 try:
                     (getattr(sp, "abort", None) or sp.proc.terminate)()
