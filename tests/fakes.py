@@ -1,0 +1,339 @@
+"""Fakes for subprocess, dpkg, apt, ps, sudo and ssh. Files are real (temp dirs)."""
+
+from __future__ import annotations
+
+import atexit
+import json
+import os
+import re
+import shutil
+import tempfile
+
+from twin_update import engine as engine_mod
+from twin_update.config import load
+from twin_update.engine import Engine
+from twin_update.peer import LocalPeer
+from twin_update.system import Proc, Result, System
+
+CONFIG = """
+[machines.machine-a]
+user = "alice"
+ssh_target = "alice@machine-a.example"
+lock_paths = ["~/.local/state/sync/sync.lock"]
+
+[machines.machine-b]
+user = "bob"
+ssh_target = "bob@machine-b.example"
+lock_paths = ["~/.local/state/sync/sync.lock"]
+
+[apps]
+enabled = ["cursor", "chatgpt", "grok-bot"]
+keep_holds = {keep}
+
+[rollback]
+fallback = {fallback}
+
+[timeouts]
+close_s = 5
+smoke_s = 3
+apt_lock_s = 0
+lock_wait_s = 0
+"""
+
+PW = "c0rrect-Horse!pw"
+
+
+_TMP = []
+
+
+@atexit.register
+def _cleanup():
+    for d in _TMP:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def _load(path):
+    with open(path) as fh:
+        return json.load(fh)
+
+
+def vkey(v):
+    return [int(x) if x.isdigit() else x for x in re.split(r"(\d+)", v) if x]
+
+
+class Clock:
+    def __init__(self):
+        self.t = 1_800_000_000.0
+
+
+class FakeSystem(System):
+    def __init__(self, user, events, clock):
+        self.user = user
+        self.events = events
+        self.clock = clock
+        self.root = tempfile.mkdtemp(prefix=f"tu-{user}-")
+        _TMP.append(self.root)
+        self._home = os.path.join(self.root, "home")
+        os.makedirs(self._home)
+        os.makedirs(os.path.join(self._home, ".local/state/sync"))
+        open(os.path.join(self._home, ".local/state/sync/sync.lock"), "w").close()
+        os.makedirs(os.path.join(self._home, "Downloads"))
+        self.archives_dir = os.path.join(self.root, "archives")
+        self.info_dir = os.path.join(self.root, "info")
+        os.makedirs(self.archives_dir)
+        os.makedirs(self.info_dir)
+        self.pkgs = {}            # pkg -> version
+        self.cands = {}           # pkg -> candidate
+        self.repo = {}            # pkg -> [versions]
+        self.held = set()
+        self.files = {}           # pkg -> [exe paths]
+        self.proc_table = {}      # pid -> Proc
+        self.stubborn = set()     # pids that ignore SIGTERM
+        self.calls = []           # (argv, input, env)
+        self.fail_install = set()
+        self.smoke_dies = set()
+        self.apt_busy_flag = False
+        self.locked = False
+        self.pid = 999999
+        self.missing_tools = set()
+
+    # identity
+    def whoami(self): return self.user
+    def uid(self): return 1000
+    def home(self): return self._home
+    def groups(self): return ["sudo", self.user]
+    def machine_id(self): return "mid-" + self.user
+    def env(self): return {"PATH": "/usr/bin", "HOME": self._home}
+    def own_pid(self): return self.pid
+    def all_comms(self): return ["dpkg"] if self.apt_busy_flag else ["bash"]
+    def which(self, name):
+        return None if name in self.missing_tools else "/usr/bin/" + name
+    def now(self): return self.clock.t
+    def sleep(self, s): self.clock.t += s
+    def is_executable_file(self, p): return True
+
+    # processes
+    def add_app_procs(self, exe_main, n_children=2, start=100, child_exes=()):
+        base = max(self.proc_table or [1000]) + 1
+        self.proc_table[base] = Proc(base, 1, exe_main, "main", start)
+        for i in range(n_children):
+            self.proc_table[base + 1 + i] = Proc(base + 1 + i, base, exe_main, "child", start + 1)
+        nxt = base + 1 + n_children
+        for ce in child_exes:
+            self.proc_table[nxt] = Proc(nxt, base, ce, "helper", start + 2)
+            nxt += 1
+        return base
+
+    def procs(self):
+        return dict(self.proc_table)
+
+    def term(self, pid, start):
+        p = self.proc_table.get(pid)
+        if not p or p.start != start:
+            return False
+        self.events.append((self.user, "TERM", p.exe))
+        if pid in self.stubborn:
+            return True
+        # main exits with its tree
+        doomed = {pid}
+        changed = True
+        while changed:
+            changed = False
+            for q in list(self.proc_table.values()):
+                if q.ppid in doomed and q.pid not in doomed and q.pid not in self.stubborn:
+                    doomed.add(q.pid)
+                    changed = True
+        for d in doomed:
+            self.proc_table.pop(d, None)
+        return True
+
+    # locks
+    def try_flock(self, path):
+        if self.locked or not os.path.exists(path):
+            return None
+        return 42
+
+    def unlock(self, fd):
+        pass
+
+    # debs
+    def make_deb(self, d, pkg, ver, arch="amd64", md5="m-"):
+        name = engine_mod.deb_name(pkg, ver, arch)
+        path = os.path.join(d, name)
+        with open(path, "w") as fh:
+            json.dump({"Package": pkg, "Version": ver, "Architecture": arch,
+                       "md5sums": md5 + pkg + ver}, fh)
+        return path
+
+    def make_deb_without_md5sums(self, d, pkg, ver, files, arch="amd64"):
+        """Vendor-style deb: no md5sums member, only file contents (name -> md5)."""
+        name = engine_mod.deb_name(pkg, ver, arch)
+        path = os.path.join(d, name)
+        with open(path, "w") as fh:
+            json.dump({"Package": pkg, "Version": ver, "Architecture": arch,
+                       "content": files}, fh)
+        return path
+
+    def deb_file_md5s(self, path):
+        try:
+            d = _load(path)
+        except (OSError, ValueError):
+            return None
+        return "\n".join(f"{m}  {n}" for n, m in d.get("content", {}).items())
+
+    def install_pkg(self, pkg, ver, arch="amd64"):
+        self.pkgs[pkg] = ver
+        with open(os.path.join(self.info_dir, f"{pkg}.md5sums"), "w") as fh:
+            fh.write("m-" + pkg + ver)
+
+    # subprocess
+    def run(self, argv, input=None, timeout=None, env=None, cwd=None):
+        argv = list(argv)
+        self.calls.append((argv, input, env))
+        if argv[:1] == ["sudo"]:
+            assert argv[:6] == ["sudo", "-k", "-S", "-p", "", "--"], argv
+            if input != (PW + "\n").encode():
+                return Result(1, "", "Sorry, try again.")
+            return self._root(argv[6:])
+        return self._user(argv, cwd)
+
+    def _user(self, argv, cwd):
+        cmd = argv[0]
+        if cmd == "dpkg-query":
+            pkg = argv[-1]
+            if pkg in self.pkgs:
+                return Result(0, f"ii |{self.pkgs[pkg]}|amd64")
+            return Result(1, "", "no packages found")
+        if argv[:2] == ["apt-cache", "policy"]:
+            c = self.cands.get(argv[2])
+            return Result(0, f"{argv[2]}:\n  Installed: x\n  Candidate: {c or '(none)'}\n")
+        if argv[:2] == ["apt-cache", "madison"]:
+            return Result(0, "".join(f" {argv[2]} | {v} | http://repo stable/main amd64 Packages\n"
+                                     for v in self.repo.get(argv[2], [])))
+        if argv[:2] == ["apt-mark", "showhold"]:
+            return Result(0, "".join(h + "\n" for h in sorted(self.held)))
+        if argv[:2] == ["dpkg", "--compare-versions"]:
+            a, op, b = argv[2:5]
+            ka, kb = vkey(a), vkey(b)
+            res = {"lt": ka < kb, "gt": ka > kb, "eq": ka == kb}[op]
+            return Result(0 if res else 1)
+        if argv[:2] == ["dpkg", "-L"]:
+            return Result(0, "\n".join(self.files.get(argv[2], [])))
+        if argv[:2] == ["dpkg", "-V"]:
+            return Result(0, "")
+        if cmd == "dpkg-deb":
+            try:
+                d = _load(argv[2] if argv[1] in ("-f", "-I") else argv[-1])
+            except (OSError, ValueError):
+                return Result(2, "", "not a deb")
+            if argv[1] == "-f":
+                return Result(0, "".join(f"{k}: {d[k]}\n" for k in argv[3:]))
+            if "md5sums" not in d:
+                return Result(1, "", "no md5sums member")
+            return Result(0, d["md5sums"])
+        if argv[:2] == ["apt-get", "download"]:
+            pkg, ver = argv[2].split("=", 1)
+            if ver not in self.repo.get(pkg, []):
+                return Result(100, "", "E: Version not found")
+            self.make_deb(cwd, pkg, ver)
+            return Result(0)
+        if cmd == "systemd-run":
+            unit = [a for a in argv if a.startswith("--unit=")][0][7:]
+            self.events.append((self.user, "LAUNCH", unit))
+            return Result(0)
+        if argv[:3] == ["systemctl", "--user", "is-active"]:
+            app = argv[3].split("-")[2]
+            return Result(0, "failed" if app in self.smoke_dies else "active")
+        if argv[:3] == ["systemctl", "--user", "show-environment"]:
+            return Result(0, "WAYLAND_DISPLAY=wayland-1\n")
+        if cmd in ("journalctl", "notify-send", "gdbus"):
+            return Result(0, "")
+        return Result(127, "", f"fake: unknown {argv}")
+
+    def _root(self, argv):
+        if argv == ["true"]:
+            return Result(0)
+        if argv[:2] == ["apt-mark", "unhold"]:
+            self.held.discard(argv[2]); self.events.append((self.user, "UNHOLD", argv[2]))
+            return Result(0)
+        if argv[:2] == ["apt-mark", "hold"]:
+            self.held.add(argv[2]); return Result(0)
+        if argv and argv[0] == "env":
+            argv = argv[1:]
+            while argv and "=" in argv[0] and not argv[0].startswith("-"):
+                argv = argv[1:]
+        if argv[:1] == ["apt-get"]:
+            if "update" in argv:
+                self.events.append((self.user, "APT-UPDATE", ""))
+                return Result(0)
+            if "install" in argv:
+                tgt = argv[-1]
+                if "--only-upgrade" in argv:
+                    pkg, ver = tgt.split("=", 1)
+                    self.events.append((self.user, "INSTALL", tgt))
+                    if pkg in self.fail_install:
+                        return Result(100, "", "E: broken")
+                    self.install_pkg(pkg, ver)
+                    return Result(0)
+                if "--allow-downgrades" in argv:
+                    d = _load(tgt)
+                    self.events.append((self.user, "DOWNGRADE", d["Version"]))
+                    self.install_pkg(d["Package"], d["Version"])
+                    return Result(0)
+        return Result(127, "", f"fake root: unknown {argv}")
+
+
+class FakeUI:
+    def __init__(self, password=PW, confirm=False):
+        self.password = password
+        self.answer = confirm
+        self.lines = []
+        self.prompts = []
+
+    def say(self, msg):
+        self.lines.append(msg)
+
+    def getpass(self, prompt):
+        self.prompts.append(prompt)
+        return self.password
+
+    def confirm(self, prompt):
+        self.prompts.append(prompt)
+        return self.answer
+
+
+class Twin:
+    """Two fake machines wired as LocalPeers."""
+
+    def __init__(self, keep=(), fallback=()):
+        self.events = []
+        self.logs = []
+        self.clock = Clock()
+        self.sys = {}
+        self.eng = {}
+        self.peers = {}
+        text = CONFIG.format(keep=json.dumps(list(keep)), fallback=json.dumps(list(fallback)))
+        for label, user in (("machine-a", "alice"), ("machine-b", "bob")):
+            s = FakeSystem(user, self.events, self.clock)
+            cfg = load(text=text, home=s.home())
+            e = Engine(cfg, s, label, log=self.logs.append)
+            e.archives, e.dpkg_info = s.archives_dir, s.info_dir
+            self.sys[label], self.eng[label] = s, e
+            self.peers[label] = LocalPeer(e)
+            for pkg, root in (("cursor", "/usr/share/cursor"), ("chatgpt", "/usr/lib/chatgpt"),
+                              ("grok-bot", "/opt/Grok Bot")):
+                s.files[pkg] = [root + "/" + pkg]
+        self.cfg = self.eng["machine-a"].cfg
+
+    def setup(self, pkg, installed, candidate, cached=True, machines=("machine-a", "machine-b")):
+        for l in machines:
+            s = self.sys[l]
+            s.install_pkg(pkg, installed if isinstance(installed, str) else installed[l])
+            s.cands[pkg] = candidate if isinstance(candidate, str) else candidate[l]
+            s.repo[pkg] = [s.cands[pkg]]
+            if cached:
+                s.make_deb(s.archives_dir, pkg, s.pkgs[pkg])
+
+    def session(self, ui):
+        from twin_update.orchestrator import Session
+        return Session(self.cfg, self.peers, ["machine-a", "machine-b"], ui)

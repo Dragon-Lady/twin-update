@@ -1,0 +1,46 @@
+# ~/.config/twin-update/config.toml  (chmod 600)
+# Put the SAME file on both machines. Labels ("desktop-a", "laptop-b") are your
+# own names; use anything. Each machine finds its own table by `whoami`, and by
+# machine_id_sha256 when the user name is the same on both machines.
+#   machine_id_sha256 value:  tr -d '\n' < /etc/machine-id | sha256sum
+
+[machines.desktop-a]
+user = "alice"                                       # exact `whoami` on that machine
+ssh_target = "alice@desktop-a"                       # how the OTHER machine reaches it
+remote_command = "~/.local/bin/twin-update"          # where twin-update lives on it
+machine_id_sha256 = "<sha256 of desktop-a's /etc/machine-id>"
+lock_paths = [                                       # flock files of jobs that must not
+  # "~/.local/state/example-sync/example-sync.lock", # run during an update (sync, backup)
+]
+
+[machines.laptop-b]
+user = "alice"
+ssh_target = "alice@laptop-b"
+remote_command = "~/.local/bin/twin-update"
+machine_id_sha256 = "<sha256 of laptop-b's /etc/machine-id>"
+lock_paths = []
+
+[apps]
+enabled = ["cursor", "chatgpt", "grok-bot"]
+keep_holds = []          # apps whose apt holds twin-update must never clear
+
+# Override or add apps (package must be an apt package):
+# [apps.cursor]
+# launch = ["/usr/share/cursor/cursor"]
+# [apps.example-app]
+# package = "example-app"
+# roots = ["/opt/example-app"]
+# launch = ["/usr/bin/example-app"]
+
+[timeouts]
+close_s = 90             # graceful close wait; no force-kill, the run aborts instead
+smoke_s = 20             # launch smoke test duration
+apt_lock_s = 300         # wait for apt/dpkg locks
+lock_wait_s = 600        # wait for lock_paths
+
+[rollback]
+# store = "~/.local/share/twin-update/rollback"
+search_dirs = ["~/Downloads"]   # also look here for the exact installed .deb
+fallback = []                   # apps allowed a flagged "closest older .deb" fallback
+grace_days = 7
+grace_launches = 2
