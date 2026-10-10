@@ -85,6 +85,7 @@ app whose terminal launched it does not stop it.
 ## Other commands
 
 ```
+twin-update check [--notify] [--json]      # read-only: are updates available? (no sudo)
 twin-update status [--local-only]          # per machine/app: installed, candidate, running, rollback copy, hold
 twin-update rollback <app> [--machine <label>|both] [--dry-run] [--no-hold]
 twin-update holds
@@ -92,6 +93,54 @@ twin-update unhold <app> [--machine ...] [--dry-run]
 twin-update doctor                         # identity, sudo group, apt idle, locks, session, ssh
 twin-update local --serve                  # per-machine engine; the peer runs this over ssh
 ```
+
+### Daily check (optional)
+
+`twin-update check` asks both machines, read-only, whether the enabled apps
+have newer versions: `dpkg-query` and `apt-cache policy` against the package
+lists apt **already has**. It never runs `apt-get update` (that needs root),
+so it is only as fresh as the last refresh by your system's own apt timer or
+a previous `twin-update run`; the output shows how old the lists are. It never
+asks for sudo, closes nothing, installs nothing and stores no rollback copies.
+
+With `--notify` it sends a desktop notification **on the machine it runs on**
+when updates are available, or a short "check incomplete" notice when the
+other machine could not be reached or an error occurred. The same notice is
+sent at most once per day (state in `~/.local/state/twin-update/`).
+
+Exit codes for `check`: **0** no updates, **10** updates available (also when
+only one machine could be checked), **1** check incomplete (error or other
+machine unreachable, and no updates found), **2** usage or config error.
+
+Example user timer (no root needed; runs while you are logged in, or always
+with lingering enabled):
+
+```ini
+# ~/.config/systemd/user/twin-update-check.service
+[Unit]
+Description=Twin Update: daily read-only update check
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/twin-update check --notify
+SuccessExitStatus=10
+TimeoutStartSec=5min
+Nice=10
+IOSchedulingClass=idle
+
+# ~/.config/systemd/user/twin-update-check.timer
+[Unit]
+Description=Twin Update: daily update check
+
+[Timer]
+OnCalendar=*-*-* 09:13:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+`systemctl --user daemon-reload && systemctl --user enable --now twin-update-check.timer`
 
 `rollback` checks the stored copy's sha256, closes the app gracefully, installs
 it with `apt-get install --allow-downgrades ./<deb>`, sets `apt-mark hold`
@@ -165,7 +214,8 @@ PYTHONPATH=src:tests python3 -m unittest discover -s tests
 python3 tools/build_zipapp.py        # -> dist/twin-update.pyz
 ```
 
-Standard library only. Exit codes: 0 ok / dry-run, 1 failed, 2 usage or config,
+Standard library only. Exit codes (`check` differs, see above): 0 ok / dry-run,
+1 failed, 2 usage or config,
 3 aborted (nothing changed).
 
 ## License

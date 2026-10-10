@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.1 (2026-10-09)
+
+* New `twin-update check [--notify] [--json]`: read-only update check on both
+  machines using the apt lists already on disk (no `apt-get update`, no sudo,
+  no closes, no installs, no rollback captures). Shows the age of the apt
+  lists. Exit codes: 0 no updates, 10 updates available, 1 check incomplete.
+* `--notify` notifies only on the machine running the check; the same notice
+  at most once per day. Errors use plain wording.
+* Works against a peer running 0.2.0 (falls back to `status`).
+* README: example user-level systemd timer for a daily check.
+
 ## 0.2.0 (2026-10-09)
 
 First public release.

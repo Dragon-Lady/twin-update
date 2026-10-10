@@ -336,3 +336,47 @@ def doctor(s: Session, unreachable: dict) -> dict:
         except PeerError as exc:
             out["machines"][l] = {"error": str(exc)}
     return out
+
+
+def check(s: Session, unreachable: dict) -> dict:
+    """Read-only update check on both machines; never asks for sudo."""
+    out = {"kind": "check", "version": __version__, "machines": {}, "errors": {},
+           "updates": [], "summary": []}
+    for l, why in unreachable.items():
+        if not why.startswith("skipped"):
+            out["errors"][l] = "could not reach it over ssh (it may be off or asleep)"
+            out.setdefault("error_detail", {})[l] = why
+    for l in s.order:
+        try:
+            try:
+                r = s.peers[l].call("check", apps=s.cfg.enabled)
+            except PeerError as exc:
+                if "op not allowed: check" not in str(exc):
+                    raise
+                # older twin-update on the other machine: fall back to status
+                st = s.peers[l].call("status", apps=s.cfg.enabled)
+                r = {"label": l, "apt_lists_age_h": None, "identity_ok": True,
+                     "apps": {a: {k: v[k] for k in ("installed", "candidate", "update_available")}
+                              for a, v in st["apps"].items()}}
+        except PeerError as exc:
+            out["errors"][l] = str(exc)
+            continue
+        if not r.get("identity_ok", True):
+            out["errors"][l] = "identity does not match the config"
+            continue
+        out["machines"][l] = r
+    for app in s.cfg.enabled:
+        on = {l: m["apps"][app] for l, m in out["machines"].items()
+              if m["apps"].get(app, {}).get("update_available")}
+        if not on:
+            continue
+        name = s.cfg.apps[app].display
+        parts = sorted({f"{r['installed']}\u2192{r['candidate']}" for r in on.values()})
+        where = "both machines" if len(on) == 2 else ", ".join(sorted(on))
+        out["updates"].append({"app": app, "machines": {l: dict(r) for l, r in on.items()}})
+        out["summary"].append(f"{name} {' / '.join(parts)} on {where}")
+    ages = {l: m.get("apt_lists_age_h") for l, m in out["machines"].items()}
+    out["apt_lists_age_h"] = ages
+    out["result"] = ("updates" if out["updates"] else ("error" if out["errors"] else "none"))
+    out["exit_code"] = 10 if out["updates"] else (1 if out["errors"] else 0)
+    return out

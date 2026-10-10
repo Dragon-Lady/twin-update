@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "twin-update"
-version = "0.2.0"
+version = "0.2.1"
 description = "Close, update and verify the same apt-packaged desktop apps on two Linux machines in one run, with a verified one-command rollback."
 readme = "README.md"
 requires-python = ">=3.11"

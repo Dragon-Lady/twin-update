@@ -17,7 +17,7 @@ OPS = {
     "identity", "set_password", "validate_sudo", "status", "acquire_locks", "apt_update",
     "capture", "holds", "clear_holds", "close_start", "close_wait", "upgrade", "verify",
     "reopen", "notify", "rollback_target", "rollback_install", "prune", "doctor", "release",
-    "hold", "unhold", "record_run",
+    "hold", "unhold", "record_run", "check", "notice_due",
 }
 
 

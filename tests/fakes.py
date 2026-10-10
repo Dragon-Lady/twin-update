@@ -318,6 +318,11 @@ class Twin:
             cfg = load(text=text, home=s.home())
             e = Engine(cfg, s, label, log=self.logs.append)
             e.archives, e.dpkg_info = s.archives_dir, s.info_dir
+            e.apt_lists = os.path.join(s.root, "lists")
+            os.makedirs(e.apt_lists)
+            rel = os.path.join(e.apt_lists, "repo_dists_stable_InRelease")
+            open(rel, "w").close()
+            os.utime(rel, (self.clock.t - 7200, self.clock.t - 7200))
             self.sys[label], self.eng[label] = s, e
             self.peers[label] = LocalPeer(e)
             for pkg, root in (("cursor", "/usr/share/cursor"), ("chatgpt", "/usr/lib/chatgpt"),

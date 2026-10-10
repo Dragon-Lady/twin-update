@@ -15,6 +15,7 @@ import fnmatch
 import json
 import os
 import re
+import time
 from typing import Callable
 
 from twin_update.config import App, Config
@@ -24,6 +25,7 @@ APT_BUSY = {"apt", "apt-get", "dpkg", "unattended-upgr", "apt.systemd.dai", "apt
 CRASH_RE = re.compile(r"segmentation fault|core dumped|SIGSEGV|SIGABRT|SIGILL|SIGBUS",
                       re.IGNORECASE)
 ARCHIVES = "/var/cache/apt/archives"
+APT_LISTS = "/var/lib/apt/lists"
 DPKG_INFO = "/var/lib/dpkg/info"
 
 
@@ -47,6 +49,7 @@ class Engine:
         self._exes: dict[str, set[str]] = {}
         self.archives = ARCHIVES
         self.dpkg_info = DPKG_INFO
+        self.apt_lists = APT_LISTS
 
     # ------------------------------------------------------------------ util
     def log(self, msg: str) -> None:
@@ -512,6 +515,47 @@ class Engine:
                 "good_launches": st.get("good_launches"),
             }
         return out
+
+    # ---------------------------------------------------------------- check
+    def apt_lists_age_h(self) -> float | None:
+        """Hours since apt's package lists were last refreshed (newest Release file)."""
+        newest = None
+        for f in self.sys.listdir(self.apt_lists):
+            if f.endswith("Release"):
+                m = self.sys.mtime(os.path.join(self.apt_lists, f))
+                if m is not None and (newest is None or m > newest):
+                    newest = m
+        if newest is None:
+            return None
+        return round(max(0.0, self.sys.now() - newest) / 3600.0, 1)
+
+    def check(self, apps: list[str]) -> dict:
+        """Read-only update check: dpkg-query + apt-cache policy on the lists apt
+        already has. No sudo, no apt-get update, no process or state changes."""
+        out = {"label": self.label, "apps": {}, "apt_lists_age_h": self.apt_lists_age_h(),
+               "apt_busy": self.apt_busy(), "identity_ok": self.identity()["ok"]}
+        for app in self._apps(apps):
+            ver, _ = self.installed(app.package)
+            cand = self.candidate(app.package) if ver else None
+            newer = bool(ver and cand and cand != ver and self.vercmp(cand, "gt", ver))
+            out["apps"][app.name] = {"installed": ver, "candidate": cand,
+                                     "update_available": newer}
+        return out
+
+    def notice_due(self, kind: str, signature: str) -> bool:
+        """True (and recorded) unless the same notice was already sent today."""
+        path = os.path.join(self.cfg.state_dir, "check-notices.json")
+        raw = self.sys.read_text(path)
+        try:
+            seen = json.loads(raw) if raw else {}
+        except ValueError:
+            seen = {}
+        today = time.strftime("%Y-%m-%d", time.localtime(self.sys.now()))
+        if seen.get(kind) == {"date": today, "sig": signature}:
+            return False
+        seen[kind] = {"date": today, "sig": signature}
+        self.sys.write_private(path, json.dumps(seen, indent=2, sort_keys=True))
+        return True
 
     def _count_launch(self, app: App, st: dict, tree: dict, procs) -> None:
         starts = sorted(procs[p].start for p in tree["mains"])

@@ -145,6 +145,12 @@ class System:
     def isdir(self, path: str) -> bool:
         return os.path.isdir(path)
 
+    def mtime(self, path: str) -> float | None:
+        try:
+            return os.stat(path).st_mtime
+        except OSError:
+            return None
+
     def listdir(self, path: str) -> list[str]:
         try:
             return sorted(os.listdir(path))

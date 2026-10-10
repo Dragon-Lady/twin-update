@@ -116,6 +116,22 @@ def _print(ui, data, as_json: bool) -> None:
         for l, why in data.get("unreachable", {}).items():
             ui.say(f"{l:8} unreachable: {why}")
         return
+    if kind == "check":
+        for l, m in data.get("machines", {}).items():
+            age = m.get("apt_lists_age_h")
+            ui.say(f"{l:8} apt lists {'age unknown' if age is None else f'{age:.1f} h old'}"
+                   " (cached; not refreshed by this check)")
+        for line in data.get("summary", []):
+            ui.say(line)
+        for l, why in data.get("errors", {}).items():
+            ui.say(f"{l:8} error: {why}")
+        n = data.get("notification")
+        if n:
+            ui.say(f"notification: {n}")
+        ui.say({"updates": "result: updates available (run: twin-update run)",
+                "none": "result: no updates",
+                "error": "result: check incomplete"}[data["result"]])
+        return
     if kind == "holds":
         for l, h in data.get("machines", {}).items():
             managed = h.get("managed", {})
@@ -174,6 +190,11 @@ def main(argv=None, ui=None, system=None, peer_factory=SshPeer) -> int:
     p.add_argument("app")
     p.add_argument("--machine", default="both")
     p.add_argument("--dry-run", action="store_true")
+    p = sub.add_parser("check", help="read-only update check on both machines (no sudo)")
+    common(p)
+    p.add_argument("--notify", action="store_true",
+                   help="desktop notification on this machine if updates are available "
+                        "(errors: at most one notice per day)")
     p = sub.add_parser("doctor"); common(p)
     p = sub.add_parser("local", help="per-machine engine (used by the peer over ssh)")
     p.add_argument("--serve", action="store_true")
@@ -218,6 +239,10 @@ def main(argv=None, ui=None, system=None, peer_factory=SshPeer) -> int:
                 labels = _labels(args.machine, me, peer, sess)
                 data = orchestrator.rollback(sess, args.app, labels, args.dry_run,
                                              smoke=not args.no_smoke, hold=not args.no_hold)
+            elif args.cmd == "check":
+                data = orchestrator.check(sess, unreachable)
+                if args.notify:
+                    data["notification"] = _check_notify(sess, me, data)
             elif args.cmd == "holds":
                 data = orchestrator.holds(sess)
             elif args.cmd == "unhold":
@@ -234,8 +259,32 @@ def main(argv=None, ui=None, system=None, peer_factory=SshPeer) -> int:
         ui.say(f"error: {exc}")
         return 1
     _print(ui, data, args.json)
+    if data.get("kind") == "check":
+        return data["exit_code"]
     res = data.get("result")
     return 0 if res in (None, "ok", "dry-run") else (3 if res == "aborted" else 1)
+
+
+def _check_notify(sess, me: str, data: dict) -> str:
+    """Notify on this machine only. Same notice at most once per day."""
+    local = sess.peers[me]
+    if data["updates"]:
+        summary = "Twin Update: updates available"
+        body = "\n".join(data["summary"])
+        if data["errors"]:
+            body += "\nNot checked: " + ", ".join(sorted(data["errors"]))
+        body += "\nRun: twin-update run"
+        kind, sig = "updates", body
+    elif data["errors"]:
+        summary = "Twin Update: check incomplete"
+        body = "\n".join(f"{l}: {why}" for l, why in sorted(data["errors"].items()))
+        kind, sig = "error", ",".join(sorted(data["errors"]))
+    else:
+        return "none needed"
+    if not local.call("notice_due", kind=kind, signature=sig):
+        return "skipped (same notice already sent today)"
+    r = local.call("notify", summary=summary, body=body)
+    return f"sent via {r.get('tool')}" if r.get("ok") else f"failed ({r.get('reason') or r.get('tool')})"
 
 
 def _labels(choice: str, me: str, peer: str, sess) -> list[str]:

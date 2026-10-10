@@ -591,5 +591,151 @@ class SameUserName(unittest.TestCase):
             cfg.self_label("alice", "m3")
 
 
+
+class Check(unittest.TestCase):
+    """twin-update check: read-only, no sudo, notify on this machine only."""
+
+    FORBIDDEN = ("sudo", "systemd-run", "apt-get", "notify-send-never")
+
+    def _cli(self, t, args, factory=None):
+        import contextlib
+        import tempfile
+        from fakes import CONFIG
+        from twin_update import cli
+        tmpd = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, tmpd, True)
+        cfgp = os.path.join(tmpd, "c.toml")
+        with open(cfgp, "w") as fh:
+            fh.write(CONFIG.format(keep="[]", fallback="[]"))
+        factory = factory or (lambda label, target, cmd: t.peers[label])
+        buf = io.StringIO()
+        from unittest import mock
+        from twin_update import engine as engine_mod
+        s = t.sys["machine-a"]
+        # The CLI builds its own local engine: keep its state and apt lists in the fake.
+        with contextlib.redirect_stdout(buf), \
+                mock.patch.dict(os.environ, {"HOME": s.home()}), \
+                mock.patch.object(engine_mod, "APT_LISTS", t.eng["machine-a"].apt_lists):
+            rc = cli.main(["--config", cfgp, "check", *args], system=s, peer_factory=factory)
+        return rc, buf.getvalue()
+
+    def _assert_read_only(self, t):
+        for s in t.sys.values():
+            bad = [c[0] for c in s.calls if c[0][0] in self.FORBIDDEN
+                   or c[0][:2] in (["apt-mark", "hold"], ["apt-mark", "unhold"])]
+            self.assertEqual(bad, [])
+            self.assertTrue(all(c[1] is None for c in s.calls))   # nothing on stdin, no password
+        self.assertEqual([e for e in t.events if e[1] in ("LAUNCH", "TERM", "UNHOLD")], [])
+
+    def _notifies(self, t, label="machine-a"):
+        return [c[0] for c in t.sys[label].calls if c[0][0] in ("notify-send", "gdbus")]
+
+    def test_updates_available_exit_10_and_notify_once_per_day(self):
+        t = Twin(); standard(t)
+        t.sys["machine-a"].add_app_procs(CUR)
+        rc, out = self._cli(t, ["--notify"])
+        self.assertEqual(rc, 10)
+        self.assertIn("Cursor 3.23.23-1\u21923.24.9-1 on both machines", out)
+        self.assertIn("ChatGPT 26.1002.52244\u219226.1007.21434 on both machines", out)
+        self.assertEqual(out.count("2.0 h old (cached; not refreshed by this check)"), 2)
+        self.assertIn("notification: sent via notify-send", out)
+        self.assertNotIn("Grok Bot", out)
+        n = self._notifies(t)
+        self.assertEqual(len(n), 1)
+        self.assertIn("Run: twin-update run", n[0][-1])
+        self.assertEqual(self._notifies(t, "machine-b"), [])     # other machine never notified
+        rc, out = self._cli(t, ["--notify"])                      # same day, same updates
+        self.assertEqual(rc, 10)
+        self.assertIn("already sent today", out)
+        self.assertEqual(len(self._notifies(t)), 1)
+        t.clock.t += 86400                                        # next day: notify again
+        self._cli(t, ["--notify"])
+        self.assertEqual(len(self._notifies(t)), 2)
+        self._assert_read_only(t)
+
+    def test_no_updates_exit_0_and_silent(self):
+        t = Twin()
+        t.setup("cursor", "3.24.9-1", "3.24.9-1")
+        t.setup("chatgpt", "26.1007.21434", "26.1007.21434")
+        t.setup("grok-bot", "0.68.1", "0.68.1")
+        rc, out = self._cli(t, ["--notify"])
+        self.assertEqual(rc, 0)
+        self.assertIn("result: no updates", out)
+        self.assertEqual(self._notifies(t), [])
+        self._assert_read_only(t)
+
+    def test_older_candidate_is_not_an_update(self):
+        t = Twin()
+        t.setup("cursor", "3.24.9-1", "3.24.8-1")
+        t.setup("chatgpt", "26.1007.21434", "26.1007.21434")
+        t.setup("grok-bot", "0.68.1", "0.68.1")
+        rc, _ = self._cli(t, [])
+        self.assertEqual(rc, 0)
+
+    def test_unreachable_peer_exit_1_error_notice_once_per_day(self):
+        from twin_update.peer import PeerError
+        t = Twin()
+        t.setup("cursor", "3.24.9-1", "3.24.9-1")
+        t.setup("chatgpt", "26.1007.21434", "26.1007.21434")
+        t.setup("grok-bot", "0.68.1", "0.68.1")
+
+        def down(label, target, cmd):
+            raise PeerError(f"{label}: ssh session ended (exit 255)")
+        rc, out = self._cli(t, ["--notify"], factory=down)
+        self.assertEqual(rc, 1)
+        self.assertIn("machine-b error: could not reach it over ssh (it may be off or asleep)", out)
+        self.assertIn("result: check incomplete", out)
+        self.assertEqual(len(self._notifies(t)), 1)
+        self.assertIn("check incomplete", self._notifies(t)[0][-2])
+        rc, out = self._cli(t, ["--notify"], factory=down)
+        self.assertEqual(rc, 1)
+        self.assertEqual(len(self._notifies(t)), 1)                # at most once a day
+        self._assert_read_only(t)
+
+    def test_unreachable_peer_but_local_updates_exit_10(self):
+        from twin_update.peer import PeerError
+        t = Twin(); standard(t)
+
+        def down(label, target, cmd):
+            raise PeerError("no answer")
+        rc, out = self._cli(t, ["--notify"], factory=down)
+        self.assertEqual(rc, 10)
+        self.assertIn("on machine-a", out)
+        self.assertIn("Not checked: machine-b", self._notifies(t)[0][-1])
+
+    def test_local_only_is_not_an_error(self):
+        t = Twin()
+        t.setup("cursor", "3.24.9-1", "3.24.9-1")
+        t.setup("chatgpt", "26.1007.21434", "26.1007.21434")
+        t.setup("grok-bot", "0.68.1", "0.68.1")
+        rc, out = self._cli(t, ["--local-only", "--json"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(out)["errors"], {})
+
+    def test_older_peer_without_check_falls_back_to_status(self):
+        from twin_update.peer import PeerError
+        t = Twin(); standard(t)
+        real = t.peers["machine-b"]
+
+        class Old:
+            def call(self, op, **kw):
+                if op == "check":
+                    raise PeerError("machine-b: op not allowed: check")
+                return real.call(op, **kw)
+
+            def close(self):
+                real.close()
+        rc, out = self._cli(t, [], factory=lambda l, tg, c: Old())
+        self.assertEqual(rc, 10)
+        self.assertIn("on both machines", out)
+
+    def test_identity_mismatch_is_an_error(self):
+        t = Twin(); standard(t)
+        t.sys["machine-b"].user = "mallory"
+        rc, out = self._cli(t, [])
+        self.assertIn("machine-b error: identity does not match the config", out)
+        self.assertEqual(rc, 10)          # machine-a still has updates
+
+
 if __name__ == "__main__":
     unittest.main()
