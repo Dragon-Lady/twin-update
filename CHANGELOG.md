@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.3.0 (unreleased)
+## 0.3.0 (2026-10-23)
 
 - Preserve per-app no-launch controls and default Cursor to close/update/stay closed.
 - Add an opt-in locked snapshot hook with bounded background upload and snapshot-only external adapters.
