@@ -133,6 +133,10 @@ class System:
                         break
             except (FileNotFoundError, ProcessLookupError):
                 continue
+            except PermissionError:
+                # A same-user non-dumpable process can hide its descriptors.
+                # Keep this uncertainty blocking instead of declaring no holder.
+                holders.append({"pid": int(name), "comm": "unreadable descriptors", "unreadable": True})
         return holders
 
     def term(self, pid: int, start: int) -> bool:

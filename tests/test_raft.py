@@ -186,6 +186,15 @@ class RaftTests(unittest.TestCase):
         with tempfile.NamedTemporaryFile() as f:
             self.assertIn(os.getpid(), [h["pid"] for h in System().fd_holders([f.name])])
 
+    def test_unreadable_descriptors_block_snapshot(self):
+        with patch("os.listdir", return_value=[str(os.getpid())]), patch("os.readlink", side_effect=PermissionError):
+            holders = System().fd_holders(["/tmp/invented.sqlite"])
+        self.assertTrue(holders[0]["unreadable"])
+        t = Twin(); e = enabled(t); e.sys.holder_table = holders
+        result = e.pre_reopen_hook("cursor", True)
+        self.assertEqual(result["skipped"], "holder check incomplete")
+        self.assertEqual(e.sys.calls, [])
+
     def test_reaper_preserves_old_and_unrelated_workers(self):
         t = Twin(); e = t.eng["machine-a"]; s = e.sys
         root = s.home() + "/.config/Cursor/User/globalStorage/anysphere.cursor-agent-worker/"

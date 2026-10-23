@@ -77,7 +77,7 @@ def pre_reopen(engine, app_name, smoke_ok):
         paths = [str(source) + suffix for suffix in ("", "-wal", "-shm")]
         holders = engine.sys.fd_holders(paths)
         if holders:
-            return skip("database holders", holders=holders)
+            return skip("holder check incomplete" if any(h.get("unreadable") for h in holders) else "database holders", holders=holders)
         scripts = _adapters(engine)
         path = Path(tempfile.mkdtemp(prefix="snapshot-", dir=root))
         path.chmod(0o700)
