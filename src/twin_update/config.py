@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import tomllib
 from dataclasses import dataclass, field
 
@@ -55,6 +56,19 @@ class App:
 
 
 @dataclass
+class Raft:
+    enabled: bool = False
+    script_dir: str = ""
+    remote: str = ""
+    lock_path: str = ""
+    snapshot_timeout_s: int = 120
+    upload_timeout_s: int = 1200
+    keep: int = 2
+    upload_prefix: str = "cursor-liferaft"
+    machines: list[str] = field(default_factory=list)
+
+
+@dataclass
 class Config:
     machines: dict[str, Machine]
     apps: dict[str, App]
@@ -70,6 +84,11 @@ class Config:
     search_dirs: list[str] = field(default_factory=lambda: ["~/Downloads"])
     grace_days: float = 7.0
     grace_launches: int = 2
+    # Apps twin-update must never start: no smoke launch, no reopen after a run.
+    # They are still closed gracefully before an update and still updated.
+    no_launch: list[str] = field(default_factory=lambda: ["cursor"])
+    raft: Raft = field(default_factory=Raft)
+    config_path: str = ""
 
     def self_label(self, whoami: str, machine_id_sha256: str = "") -> str:
         """Find this machine's label: by user, then by machine-id when the
@@ -143,9 +162,34 @@ def load(path: str | None = None, home: str | None = None, text: str | None = No
     for n in enabled:
         if n not in apps:
             raise ConfigError(f"unknown app in enabled: {n}")
+    no_launch = list(asec.get("no_launch", ["cursor"]))
+    for n in no_launch:
+        if n not in apps:
+            raise ConfigError(f"unknown app in no_launch: {n}")
 
     t = data.get("timeouts") or {}
     r = data.get("rollback") or {}
+    rs = data.get("raft") or {}
+    if not isinstance(rs, dict) or set(rs) - set(Raft.__dataclass_fields__):
+        raise ConfigError("unknown raft configuration key")
+    raft = Raft(**rs)
+    if not isinstance(raft.enabled, bool):
+        raise ConfigError("raft.enabled must be boolean")
+    for key in ("script_dir", "remote", "lock_path", "upload_prefix"):
+        if not isinstance(getattr(raft, key), str):
+            raise ConfigError(f"raft.{key} must be text")
+    raft.script_dir = _expand(raft.script_dir or "~/.local/share/twin-update/raft", home)
+    raft.lock_path = _expand(raft.lock_path, home)
+    for key, limit in (("snapshot_timeout_s", 600), ("upload_timeout_s", 86400), ("keep", 100)):
+        value = getattr(raft, key)
+        if type(value) is not int or not 1 <= value <= limit:
+            raise ConfigError(f"raft.{key} must be between 1 and {limit}")
+    if not isinstance(raft.machines, list) or any(x not in machines for x in raft.machines):
+        raise ConfigError("raft.machines must contain configured machine labels")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", raft.upload_prefix):
+        raise ConfigError("raft.upload_prefix must be a simple name")
+    if raft.enabled and (not os.path.isabs(raft.lock_path) or not raft.remote or raft.remote.startswith("-")):
+        raise ConfigError("enabled raft requires an absolute lock_path and an explicit remote")
     return Config(
         machines=machines, apps=apps, enabled=enabled,
         keep_holds=list(asec.get("keep_holds", [])),
@@ -159,4 +203,7 @@ def load(path: str | None = None, home: str | None = None, text: str | None = No
         search_dirs=[_expand(p, home) for p in r.get("search_dirs", ["~/Downloads"])],
         grace_days=float(r.get("grace_days", 7)),
         grace_launches=int(r.get("grace_launches", 2)),
+        no_launch=no_launch,
+        raft=raft,
+        config_path=_expand(path or DEFAULT_PATH, home) if text is None else "",
     )

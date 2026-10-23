@@ -22,6 +22,7 @@ lock_paths = []
 
 [apps]
 enabled = ["cursor", "chatgpt", "grok-bot"]
+no_launch = ["cursor"]  # close/update if open, then leave closed; no launch smoke test
 keep_holds = []          # apps whose apt holds twin-update must never clear
 
 # Override or add apps (package must be an apt package):
@@ -44,3 +45,16 @@ search_dirs = ["~/Downloads"]   # also look here for the exact installed .deb
 fallback = []                   # apps allowed a flagged "closest older .deb" fallback
 grace_days = 7
 grace_launches = 2
+
+# Optional closed-profile snapshot hook. Does not override no_launch.
+[raft]
+enabled = false
+script_dir = "~/.local/share/twin-update/raft"
+# Required when enabled: use the exact lock shared with your existing backup job.
+# lock_path = "~/.local/state/example-backup/backup.lock"
+# remote = "backup:archive"
+upload_prefix = "cursor-liferaft"
+snapshot_timeout_s = 120
+upload_timeout_s = 1200
+keep = 2
+machines = []

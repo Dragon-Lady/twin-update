@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.0 (unreleased)
+
+- Preserve per-app no-launch controls and default Cursor to close/update/stay closed.
+- Add an opt-in locked snapshot hook with bounded background upload and snapshot-only external adapters.
+- Bound peer hook waits and recover reopening through a fresh connection after timeout.
+- Reap only new same-user Cursor smoke-test workers with guarded SIGTERM.
+
+
 ## 0.2.1 (2026-10-09)
 
 * New `twin-update check [--notify] [--json] [--no-fetch]`: update check on

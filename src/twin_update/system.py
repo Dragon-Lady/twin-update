@@ -36,6 +36,7 @@ class Proc:
     comm: str
     start: int        # starttime in clock ticks, guards against PID reuse
     deleted: bool = False
+    argv: tuple[str, ...] = ()
 
 
 class System:
@@ -103,8 +104,36 @@ class System:
             deleted = exe.endswith(" (deleted)")
             if deleted:
                 exe = exe[: -len(" (deleted)")]
-            out[pid] = Proc(pid, ppid, exe, comm, start, deleted)
+            try:
+                with open(f"/proc/{pid}/cmdline", "rb") as fh:
+                    argv = tuple(x.decode("utf-8", "replace") for x in fh.read(8192).split(b"\0")[:2])
+            except OSError:
+                argv = ()
+            out[pid] = Proc(pid, ppid, exe, comm, start, deleted, argv)
         return out
+
+    def fd_holders(self, paths) -> list[dict]:
+        targets = {os.path.realpath(p) for p in paths}
+        holders = []
+        for name in os.listdir("/proc"):
+            if not name.isdigit():
+                continue
+            root = f"/proc/{name}"
+            try:
+                if os.stat(root).st_uid != self.uid():
+                    continue
+                for fd in os.listdir(root + "/fd"):
+                    try:
+                        target = os.readlink(root + "/fd/" + fd).removesuffix(" (deleted)")
+                    except FileNotFoundError:
+                        continue
+                    if os.path.realpath(target) in targets:
+                        with open(root + "/comm") as fh:
+                            holders.append({"pid": int(name), "comm": fh.read().strip()})
+                        break
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+        return holders
 
     def term(self, pid: int, start: int) -> bool:
         """SIGTERM via pidfd, only if the pid still has the same start time."""

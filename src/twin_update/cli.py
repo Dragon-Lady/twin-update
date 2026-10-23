@@ -207,11 +207,18 @@ def main(argv=None, ui=None, system=None, peer_factory=SshPeer) -> int:
     p = sub.add_parser("local", help="per-machine engine (used by the peer over ssh)")
     p.add_argument("--serve", action="store_true")
     p.add_argument("--as", dest="as_label", default=None)
+    p = sub.add_parser("raft-upload", help=argparse.SUPPRESS)
+    p.add_argument("snapshot")
 
     args = ap.parse_args(argv)
     system = system or System()
 
     try:
+        if args.cmd == "raft-upload":
+            from twin_update.raft import upload
+            cfg = load(args.config)
+            me = cfg.self_label(system.whoami(), system.machine_id())
+            return 0 if upload(Engine(cfg, system, me), args.snapshot)["ok"] else 1
         if args.cmd == "local":
             cfg = load(args.config)
             me = cfg.self_label(system.whoami(), system.machine_id())

@@ -28,6 +28,7 @@ lock_paths = ["~/.local/state/sync/sync.lock"]
 
 [apps]
 enabled = ["cursor", "chatgpt", "grok-bot"]
+no_launch = []
 keep_holds = {keep}
 
 [rollback]
@@ -88,6 +89,7 @@ class FakeSystem(System):
         self.held = set()
         self.files = {}           # pkg -> [exe paths]
         self.proc_table = {}      # pid -> Proc
+        self.holder_table = []
         self.stubborn = set()     # pids that ignore SIGTERM
         self.calls = []           # (argv, input, env)
         self.fail_install = set()
@@ -129,6 +131,9 @@ class FakeSystem(System):
 
     def procs(self):
         return dict(self.proc_table)
+
+    def fd_holders(self, paths):
+        return list(self.holder_table)
 
     def term(self, pid, start):
         p = self.proc_table.get(pid)

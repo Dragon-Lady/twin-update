@@ -8,6 +8,8 @@ only for the length of one command; nothing listens afterwards.
 from __future__ import annotations
 
 import json
+import os
+import time
 import selectors
 import subprocess
 import tempfile
@@ -18,7 +20,7 @@ OPS = {
     "identity", "set_password", "validate_sudo", "status", "acquire_locks", "apt_update",
     "capture", "holds", "clear_holds", "close_start", "close_wait", "upgrade", "verify",
     "reopen", "notify", "rollback_target", "rollback_install", "prune", "doctor", "release",
-    "hold", "unhold", "record_run", "check", "notice_due",
+    "hold", "unhold", "record_run", "check", "notice_due", "pre_reopen_hook", "raft_upload_start",
 }
 
 
@@ -54,7 +56,7 @@ class LocalPeer:
         self.engine = engine
         self.label = engine.label
 
-    def call(self, op: str, **kw):
+    def call(self, op: str, call_timeout: float | None = None, **kw):
         if op not in OPS:
             raise PeerError(f"op not allowed: {op}")
         return getattr(self.engine, op)(**kw)
@@ -69,6 +71,9 @@ class SshPeer:
         if not target:
             raise PeerError(f"no ssh_target configured for {label}")
         self.label = label
+        self._connection = (label, target, remote_command, connect_timeout, popen)
+        self._timed_out = False
+        self._buffer = b""
         argv = ["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
                 "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4",
                 target, f"{remote_command} local --serve --as {label}"]
@@ -85,20 +90,37 @@ class SshPeer:
         self._first_timeout = connect_timeout
 
     def _readline(self, timeout: float | None) -> bytes:
-        if timeout is None:
+        if timeout is None and not self._buffer:
             return self.proc.stdout.readline()
         sel = selectors.DefaultSelector()
         sel.register(self.proc.stdout, selectors.EVENT_READ)
+        deadline = None if timeout is None else time.monotonic() + timeout
         try:
-            if not sel.select(timeout):
-                raise PeerError(f"{self.label}: {self._why(no_answer=True)}")
+            while b"\n" not in self._buffer:
+                remaining = None if deadline is None else max(0, deadline - time.monotonic())
+                if not sel.select(remaining):
+                    self._timed_out = True
+                    raise PeerError(f"{self.label}: operation timed out")
+                part = os.read(self.proc.stdout.fileno(), 65536)
+                if not part:
+                    return b""
+                self._buffer += part
+            line, self._buffer = self._buffer.split(b"\n", 1)
+            return line + b"\n"
         finally:
             sel.close()
-        return self.proc.stdout.readline()
 
-    def call(self, op: str, **kw):
+    def call(self, op: str, call_timeout: float | None = None, **kw):
         if op not in OPS:
             raise PeerError(f"op not allowed: {op}")
+        if self._timed_out:
+            # A late response must not be mistaken for the reopen response.
+            # Keep recovery independent of the blocked request's server loop.
+            recovery = SshPeer(*self._connection)
+            try:
+                return recovery.call(op, call_timeout=call_timeout or 30, **kw)
+            finally:
+                recovery.close()
         self._id += 1
         line = json.dumps({"id": self._id, "op": op, "args": kw}).encode() + b"\n"
         try:
@@ -108,11 +130,13 @@ class SshPeer:
             raise PeerError(f"{self.label}: {self._why()}") from None
         finally:
             del line  # may carry the sudo password; drop our reference
-        timeout, self._first_timeout = self._first_timeout, None
+        timeout, self._first_timeout = call_timeout if call_timeout is not None else self._first_timeout, None
         raw = self._readline(timeout)
         if not raw:
             raise PeerError(f"{self.label}: {self._why()}")
         msg = json.loads(raw)
+        if msg.get("id") != self._id:
+            raise PeerError("unexpected peer response id")
         if not msg.get("ok"):
             raise PeerError(f"{self.label}: {msg.get('error', 'error')}")
         return msg["result"]

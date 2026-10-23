@@ -4,8 +4,7 @@ The orchestrator drives one Engine per machine: in-process for this machine,
 over the ssh session (``twin-update local --serve``) for the peer.
 Rules enforced here:
   * graceful close only (SIGTERM via pidfd); never SIGKILL;
-  * never open, copy or touch app databases (we only touch package files,
-    our own store and our own state);
+  * app data is untouched except the explicit opt-in closed-profile snapshot;
   * the sudo password only ever travels on sudo's stdin.
 """
 
@@ -740,12 +739,24 @@ class Engine:
     def smoke(self, app_name: str) -> dict:
         """Start the app in the user's graphical session, check it stays up, close gracefully."""
         app = self._apps([app_name])[0]
+        if app.name in self.cfg.no_launch:
+            return {"ok": True, "skipped": "no_launch: never started by twin-update"}
+        worker_root = os.path.join(self.sys.home(), ".config/Cursor/User/globalStorage/anysphere.cursor-agent-worker")
+        def worker(p):
+            return any(os.path.isabs(v) and os.path.realpath(v).startswith(worker_root + "/")
+                       for v in (p.exe, *p.argv[:2]))
+        before = {(p.pid, p.start) for p in self.sys.procs().values() if worker(p)} if app.name == "cursor" else set()
         env = self._user_env()
         unit = f"twin-smoke-{app.name}-{int(self.sys.now())}"
         r = self.sys.run(["systemd-run", "--user", "--quiet", "--collect", f"--unit={unit}",
                           "-p", "ExitType=cgroup", "--", *app.launch], env=env, timeout=60)
         if not r.ok:
             return {"ok": False, "reason": "could not start", "err": r.err[-300:]}
+        threshold = None
+        if app.name == "cursor":
+            main = self.sys.run(["systemctl", "--user", "show", unit, "--property=MainPID", "--value"], env=env, timeout=10)
+            p = self.sys.procs().get(int(main.out.strip())) if main.out.strip().isdigit() else None
+            threshold = p.start if p else None
         stayed = True
         waited = 0.0
         while waited < self.cfg.smoke_s:
@@ -762,6 +773,13 @@ class Engine:
         ok = stayed and not crashed and wait["closed"]
         res = {"ok": ok, "stayed_up_s": waited if stayed else waited - 1, "crash_in_journal": crashed,
                "closed_gracefully": wait["closed"]}
+        if app.name == "cursor":
+            res["stray_reaped"] = []
+            if threshold is not None:
+                for p in self.sys.procs().values():
+                    if worker(p) and p.start >= threshold and (p.pid, p.start) not in before:
+                        if self.sys.term(p.pid, p.start):
+                            res["stray_reaped"].append({"pid": p.pid, "exe_basename": os.path.basename(p.exe)})
         if not wait["closed"]:
             res["remaining"] = wait["remaining"]
         if ok:
@@ -779,6 +797,9 @@ class Engine:
         if res["dpkg_ok"]:
             vr = self.sys.run(["dpkg", "-V", app.package])
             res["dpkg_verify_clean"] = vr.ok and not vr.out.strip()
+        if smoke and app.name in self.cfg.no_launch:
+            res["smoke"] = {"ok": True, "skipped": "no_launch: never started by twin-update"}
+            smoke = False
         if smoke and res["dpkg_ok"]:
             res["smoke"] = self.smoke(app.name)
         res["ok"] = res["dpkg_ok"] and (not smoke or res.get("smoke", {}).get("ok", False))
@@ -792,11 +813,23 @@ class Engine:
         env = self._user_env()
         out = {}
         for app in self._apps(apps):
+            if app.name in self.cfg.no_launch:
+                out[app.name] = {"ok": True, "skipped": "no_launch: left closed"}
+                self.log(f"reopen {app.name}: skipped (no_launch)")
+                continue
             unit = f"twin-reopen-{app.name}-{int(self.sys.now())}"
             r = self.sys.run(["systemd-run", "--user", "--quiet", "--collect", f"--unit={unit}",
                               "-p", "ExitType=cgroup", "--", *app.launch], env=env, timeout=60)
             out[app.name] = {"ok": r.ok}
         return out
+
+    def pre_reopen_hook(self, app_name: str, smoke_ok: bool) -> dict:
+        from twin_update.raft import pre_reopen
+        return pre_reopen(self, app_name, smoke_ok)
+
+    def raft_upload_start(self, snapshot: str) -> dict:
+        from twin_update.raft import upload_start
+        return upload_start(self, snapshot)
 
     def notify_tool(self) -> str | None:
         for tool in ("notify-send", "gdbus"):

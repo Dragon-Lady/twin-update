@@ -164,6 +164,49 @@ def status(s: Session) -> dict:
     return {"kind": "status", "machines": s.both("status", apps=s.cfg.enabled)}
 
 
+def _raft_dry(s, rep, was_open):
+    if s.cfg.raft.enabled:
+        for label, apps in was_open.items():
+            if "cursor" in apps and "cursor" not in s.cfg.no_launch:
+                rep["summary"].append(f"Cursor {label}: would raft (snapshot before reopen, upload to {s.cfg.raft.remote})")
+
+
+def _reopen(s, rep, was_open, results):
+    reopened = {}
+    for label, apps in was_open.items():
+        if not apps:
+            continue
+        hook = None
+        try:
+            if "cursor" in apps and s.cfg.raft.enabled and "cursor" not in s.cfg.no_launch:
+                result = results.get("cursor", {}).get(label, {})
+                verification = result.get("rollback_verify", {}) if "rollback" in result else result.get("verify", {})
+                smoke = verification.get("smoke", {})
+                try:
+                    hook = s.peers[label].call("pre_reopen_hook", app_name="cursor",
+                                              smoke_ok=smoke.get("ok") is True and not smoke.get("skipped"),
+                                              call_timeout=s.cfg.raft.snapshot_timeout_s + 30)
+                except Exception as exc:
+                    hook = {"ok": False, "error": str(exc)}
+                rep.setdefault("raft", {})[label] = hook
+        finally:
+            # The engine honors no_launch. A hook failure never suppresses
+            # reopening of apps whose launch policy explicitly permits it.
+            reopened[label] = s.peers[label].call("reopen", apps=apps)
+        if hook:
+            if hook.get("ok"):
+                try:
+                    started = s.peers[label].call("raft_upload_start", snapshot=hook["snapshot"], call_timeout=30)
+                except Exception as exc:
+                    started = {"started": False, "reason": str(exc)}
+                hook["upload"] = started
+                detail = f"upload running in {started['unit']}" if started.get("started") else "upload not started; snapshot retained"
+                rep["summary"].append(f"Cursor {label}: raft snapshot taken, {detail}")
+            else:
+                rep["summary"].append(f"Cursor {label}: raft skipped ({hook.get('skipped') or hook.get('error')})")
+    return reopened
+
+
 def run(s: Session, apps, dry: bool, smoke: bool = True, unreachable=None) -> dict:
     rep = _new_report("run", dry, apps, s.order, unreachable or {})
     rep["blockers"] = [f"{l} unreachable: {why}" for l, why in (unreachable or {}).items()]
@@ -229,6 +272,7 @@ def run(s: Session, apps, dry: bool, smoke: bool = True, unreachable=None) -> di
                 elif p.get("reason"):
                     line += f" ({p['reason']})"
                 rep["summary"].append(line)
+            _raft_dry(s, rep, was_open)
             return _finish(s, rep, dry)
 
         results = {}
@@ -261,8 +305,7 @@ def run(s: Session, apps, dry: bool, smoke: bool = True, unreachable=None) -> di
                 rep["summary"].append(f"{s.cfg.apps[app].display}: versions differ now "
                                       + ", ".join(f"{l}={v}" for l, v in vs.items()))
         rep["final_versions"] = finals
-        rep["reopen"] = {l: s.peers[l].call("reopen", apps=apps_)
-                         for l, apps_ in was_open.items() if apps_}
+        rep["reopen"] = _reopen(s, rep, was_open, results)
         rep["prune"] = {l: s.peers[l].call("prune", apps=list(todo), dry=False) for l in labels}
         all_ok = all(r["verify"]["ok"] for m in results.values() for r in m.values())
         rep["result"] = "ok" if all_ok else "failed"
@@ -296,6 +339,7 @@ def rollback(s: Session, app: str, labels, dry: bool, smoke: bool = True,
                               f"{t['installed']}\u2192{t['version']}"
                               + (" (fallback copy)" if t.get("fallback") else "")
                               for l, t in targets.items()]
+            _raft_dry(s, rep, was_open)
             return _finish(s, rep, dry)
         res = {}
         for l in labels:
@@ -307,7 +351,8 @@ def rollback(s: Session, app: str, labels, dry: bool, smoke: bool = True,
                                   f"{rb.get('from')}\u2192{rb.get('to')} {_ok(ver['ok'])}"
                                   + (" hold set" if rb.get("hold") else ""))
         rep["results"] = res
-        rep["reopen"] = {l: s.peers[l].call("reopen", apps=a) for l, a in was_open.items() if a}
+        # Rollback verification is the final verification on this path.
+        rep["reopen"] = _reopen(s, rep, was_open, {app: {l: {"verify": r["verify"]} for l, r in res.items()}})
         rep["result"] = "ok" if all(r["verify"]["ok"] for r in res.values()) else "failed"
     except (Abort, PeerError) as exc:
         rep["result"] = "aborted"

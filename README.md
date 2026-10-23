@@ -233,3 +233,52 @@ sync lock is only a warning), 1 failed, 2 usage or config,
 ## License
 
 Apache License 2.0. See [LICENSE](LICENSE).
+
+## Cursor launch policy and optional life-raft (0.3.0 draft)
+
+Cursor is in `apps.no_launch` by default. If it is open when an update or rollback
+needs to close it, it is closed gracefully and updated, then left closed. Neither
+the smoke check nor reopen starts it. The opt-in raft hook never overrides this
+policy. Existing per-app no-launch lists are preserved. Other apps retain their
+configured launch behavior. No installed tool or machine configuration changes
+as part of this draft.
+
+The optional `[raft]` hook applies only when Cursor reopening is explicitly
+permitted, a real smoke check passed, and the machine is allowed. It takes the
+configured shared backup lock before checking processes and database holders,
+then creates a private local SQLite snapshot. It checks holders again and discards
+a raced or failed snapshot. Hook errors and timeouts cannot suppress reopening
+for apps whose policy permits it; `no_launch` apps remain closed throughout.
+
+The snapshot is queued to a bounded user service after reopen. Its helper takes
+the same lock with a 30-second wait, logs lock/start/upload failures, and retains
+the snapshot on failure. The latest two snapshots are retained by default; older
+ones are pruned under the shared lock. A successful upload must pass a downloaded
+content comparison before the local snapshot is deleted. Folders use 0700 and
+files 0600. Snapshot data and external adapters are never included in this repo.
+
+`raft.lock_path` and `raft.remote` are required when enabling this feature. Use
+the actual nightly-backup lock; do not invent a second lock. `remote_command`
+must resolve to the installed executable's absolute path for the background
+service; the interpreter is also absolute. A custom `--config` path is retained.
+
+External snapshot-only adapter protocol 1 is required in `script_dir`:
+
+- `twin-update-raft.json`: exactly `{"protocol": 1}`.
+- `backup_cursor.py --source DB --output SNAPSHOT_DB`: read-only SQLite backup,
+  local only; no upload or application launch.
+- `export_cursor_return.py SNAPSHOT_DIR`: prepare `SNAPSHOT_DIR/payload` using
+  only the captured database, never the live profile.
+- `verify_cursor_payload.py SNAPSHOT_DIR`: verify the prepared payload; nonzero
+  aborts the upload.
+- `make_return_manifest.py SNAPSHOT_DIR`: add the payload integrity manifest.
+
+Legacy fixed-path scripts are incompatible and must not be relabeled as protocol
+1. Prepare separate adapters outside the repo, test with invented data, and retain
+existing nightly scripts. The hook skips safely until compatible adapters exist.
+
+The smoke-test reaper is relevant only to apps explicitly allowed to launch. For
+Cursor it records pre-existing worker identities, obtains the smoke main process
+start tick, then uses guarded SIGTERM only for newly started same-user workers
+under Cursor's worker directory (executable or first two argv paths). No known
+main start tick means no reaping. It never sends SIGKILL.

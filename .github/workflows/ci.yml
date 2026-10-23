@@ -1,0 +1,29 @@
+name: Draft checks
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ['3.11', '3.12', '3.13']
+    steps:
+      - uses: socketdev/action@ba6de6cc0565af1f42295590380973573297e31f
+        with:
+          mode: firewall-free
+          firewall-version: '1.15.4'
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: ${{ matrix.python }}
+      - run: sfw pip install build==1.6.1 'setuptools>=77' wheel push-guard==0.4.3 pytest==9.1.1
+      - run: PYTHONPATH=src:tests python -m pytest -q
+      - run: python -m compileall -q src tests
+      - run: python tools/build_zipapp.py && python dist/twin-update.pyz --version
+      - run: python -m build --no-isolation
+      - run: push-guard scan --base origin/main --head HEAD --no-infer
+      - run: push-guard scan-package --no-infer dist/*.whl dist/*.tar.gz
