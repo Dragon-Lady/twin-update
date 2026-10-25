@@ -525,6 +525,21 @@ class TestSlotDoesNotBlockReal(unittest.TestCase):
 
 
 class DetachedRun(unittest.TestCase):
+    def test_start_and_follow_run_starts_scope(self):
+        t = Twin()
+        s = t.sys["machine-a"]
+        ui = FakeUI()
+        rc = notice.start_and_follow_run(
+            s, ["twin-update", "run", "--no-detach"], {}, ui)
+        self.assertEqual(rc, 0)
+        self.assertTrue(s.run_units)
+        unit, inner = s.run_units[0]
+        self.assertTrue(unit.startswith("twin-update-run-"))
+        self.assertIn("TWIN_UPDATE_SCOPE=1", inner)
+        self.assertIn("--no-detach", inner)
+        self.assertTrue(any("update unit:" in l for l in ui.lines))
+        self.assertTrue(any("systemctl --user stop" in l for l in ui.lines))
+
     def test_yes_starts_a_run_unit(self):
         import contextlib
         import io
@@ -573,6 +588,18 @@ class PasswordHandoff(unittest.TestCase):
         from twin_update import cli
         ui = cli.ConsoleUI()
         with mock.patch.object(cli.sys.stdin, "isatty", return_value=False):
+            with self.assertRaises(EOFError) as ctx:
+                ui.getpass("sudo password: ")
+        self.assertIn("sudo password needed", str(ctx.exception))
+
+    def test_console_getpass_eio_is_eof(self):
+        from unittest import mock
+        from twin_update import cli
+        ui = cli.ConsoleUI()
+        with mock.patch.object(cli.sys.stdin, "isatty", return_value=True), \
+             mock.patch.object(cli.sys.stdin, "fileno", return_value=0), \
+             mock.patch("termios.tcgetattr", side_effect=OSError(5, "Input/output error")), \
+             mock.patch.object(cli.getpass, "getpass", side_effect=OSError(5, "Input/output error")):
             with self.assertRaises(EOFError) as ctx:
                 ui.getpass("sudo password: ")
         self.assertIn("sudo password needed", str(ctx.exception))
@@ -708,6 +735,18 @@ class SlotMerge(unittest.TestCase):
         s.pid_starts[6000] = 99
         self.assertFalse(notice.slot_held(s, path))
         self.assertTrue(notice.slot_pid_reused(s, path))
+
+    def test_starting_slot_stays_held_while_unit_active(self):
+        t = Twin(); s = t.sys["machine-a"]
+        path = notice.window_lock_path(t.cfg.state_dir)
+        unit = "twin-update-prompt-held"
+        s.prompt_pids[unit] = 0
+        notice.write_window_pid(s, path, 0, started=False, unit=unit,
+                                opened_at=s.now() - 20)
+        self.assertTrue(notice.read_slot(s, path).get("starting"))
+        self.assertTrue(notice.slot_held(s, path))
+        del s.prompt_pids[unit]
+        self.assertFalse(notice.slot_held(s, path))
 
     def test_window_older_than_a_day_does_not_hold(self):
         t = Twin(); s = t.sys["machine-a"]

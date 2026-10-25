@@ -308,6 +308,8 @@ def slot_held(system, path: str) -> bool:
     if data.get("starting") and isinstance(data.get("opened_at"), (int, float)):
         if system.now() - data["opened_at"] < STARTING_SLOT_S:
             return True
+        if unit_still_up(system, data.get("unit")):
+            return True
     return False
 
 

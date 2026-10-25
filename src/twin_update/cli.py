@@ -50,7 +50,7 @@ class ConsoleUI:
         except (OSError, AttributeError):
             try:
                 return getpass.getpass(prompt)
-            except EOFError:
+            except (EOFError, OSError):
                 raise EOFError(notice.SUDO_NEEDED) from None
         if not line:
             raise EOFError(notice.SUDO_NEEDED)

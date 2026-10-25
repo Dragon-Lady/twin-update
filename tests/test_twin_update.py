@@ -390,7 +390,8 @@ class RunFlow(unittest.TestCase):
         import os
         import signal
         t = Twin(); standard(t)
-        t.sys["machine-a"].add_app_procs(CUR)
+        t.sys["machine-a"].add_app_procs(GPT)
+        t.sys["machine-b"].add_app_procs(GPT)
         real = t.peers["machine-a"]
         counts = {"reopen": 0}
 
@@ -406,11 +407,38 @@ class RunFlow(unittest.TestCase):
                 real.close()
 
         t.peers["machine-a"] = Term()
-        rep = orchestrator.run(t.session(FakeUI()), ["cursor"], dry=False, smoke=False)
-        self.assertGreaterEqual(counts["reopen"], 1)
+        rep = orchestrator.run(t.session(FakeUI()), ["chatgpt"], dry=False, smoke=False)
+        self.assertGreaterEqual(counts["reopen"], 2)
         self.assertLessEqual(counts["reopen"], 2)
-        self.assertTrue((rep.get("reopen") or {}).get("machine-a")
-                        or t.eng["machine-a"]._reopened)
+        self.assertTrue(rep.get("interrupted"))
+        self.assertEqual(rep["result"], "aborted")
+        for label in ("machine-a", "machine-b"):
+            ra = (rep.get("reopen") or {}).get(label) or {}
+            self.assertIn("chatgpt", ra, ra)
+            self.assertNotEqual(ra.get("error"), "")
+            self.assertTrue(ra["chatgpt"].get("ok"))
+
+    def test_sighup_during_run_does_not_stop(self):
+        import os
+        import signal
+        t = Twin(); standard(t)
+        real = t.peers["machine-a"]
+
+        class Hup:
+            def call(self, op, **kw):
+                if op == "upgrade":
+                    os.kill(os.getpid(), signal.SIGHUP)
+                return real.call(op, **kw)
+
+            def close(self):
+                real.close()
+
+        t.peers["machine-a"] = Hup()
+        rep = orchestrator.run(t.session(FakeUI()), ["cursor"], dry=False, smoke=False)
+        self.assertEqual(rep["result"], "ok")
+        self.assertFalse(rep.get("interrupted"))
+        self.assertEqual(t.sys["machine-a"].pkgs["cursor"], "3.24.9-1")
+        self.assertEqual(t.sys["machine-b"].pkgs["cursor"], "3.24.9-1")
 
     def test_eof_at_rollback_reopens_and_does_not_upgrade_peer(self):
         t = Twin(); standard(t)

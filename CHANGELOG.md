@@ -2,32 +2,53 @@
 
 ## 0.4.1 - 2026-10-25
 
-- Confirming Update now starts the update in its own user scope that keeps
-  this window's keyboard. Ctrl-C and closing the window do not stop it.
-  Cancel with `systemctl --user stop <the update unit>` (the window prints
-  the name). That stop reopens apps that were closed. The window waits for
-  the update to finish cleanup and never force-kills it.
-- A stop or a dropped connection while closing the second machine still
-  reopens apps already closed on the first. The run is always recorded.
+- Confirming Update starts the update in its own user scope that keeps
+  this window's keyboard. The sudo password is read from this window
+  (not a separate tty). Ctrl-C and closing the window do not stop it.
+  Cancel with `systemctl --user stop <the update unit>` (the window
+  prints the name). That stop reopens apps that were closed. The window
+  waits for cleanup and never force-kills the update. systemd gives the
+  run scope 90 seconds to clean up before it is force-killed.
+- A stop or dropped connection while closing the second machine still
+  reopens apps already closed on the first. The run is recorded.
+- A second stop during the final reopen is retried once. The run is
+  flagged as stopped (exit 3). A failed reopen names the machine and
+  never prints an empty reason.
 - Stopping during the final record/notify step still writes the run and
-  tries every machine. A failed reopen is named in the report.
+  tries every machine.
 - `sudo apt-get` / `dpkg` is not force-killed on interrupt. If apt was
   mid-install, recover with `sudo dpkg --configure -a`. `doctor` warns
   when `/var/lib/dpkg/updates` is not empty.
 - A failed check records that version only and does not upgrade the other
   machine. A newer candidate is still offered. A failed `apt-mark showhold`
   does not erase the rejected-version record. A failed hold after a failed
-  check is reported, not swallowed.
-- Broken or unreadable state files (wrong JSON type, a directory in the
-  way) are ignored. `doctor` names the file. They never block an update
-  and never crash the timer.
+  check is reported.
+- Both machines need the same twin-update for a mixed `run` (0.4.1 or
+  newer). A peer with no version stops before anything is closed and says
+  how to install it. On rollback, an older peer that does not understand
+  `running` is still tolerated.
 - Exit 3 means you stopped it. Exit 5 means the update stopped before
   finishing (see the report; a failed check may have left a version
   installed). A broken `config.toml` is a config error (exit 2) and the
   window waits for Enter.
-- Both machines need twin-update 0.4.1 or newer. A peer with no version
-  stops before anything is closed and says how to install it. On rollback,
-  an older peer that does not understand `running` is still tolerated.
+- Broken or unreadable state files (wrong JSON type, a directory in the
+  way) are ignored. `doctor` names the file.
+- The prompt prints `Checking...` and the real per-machine error when a
+  check fails. The day is recorded only after the question is shown, not
+  when the window launches. Only an explicit N/no closes without waiting
+  for Enter; other endings pause so the window can be read.
+- A test window uses its own slot and does not block the real daily
+  window. A window older than 24 hours no longer holds the slot; `doctor`
+  still warns. A launch that has not yet reported a pid stays reserved
+  while its unit is still active.
+- Terminal flags match the launcher (cosmic-term `--no-daemon`,
+  gnome-terminal `--wait --`, and the other known ones). The prompt unit
+  is checked by MainPID polling, including MainPID 0 while it is still
+  starting.
+- The smoke check waits its full interval. `doctor` warns when the
+  installed check service or timer has drifted from what this package
+  ships.
+- The zipapp build is reproducible (`SOURCE_DATE_EPOCH`).
 - After the window is gone, later questions have no keyboard and take the
   non-interactive stop path. A kill of the process cannot run cleanup.
 
@@ -43,8 +64,7 @@
 - The timer unit is not a graphical session: the window is launched with
   WAYLAND_DISPLAY, DISPLAY, XDG_RUNTIME_DIR and DBUS_SESSION_BUS_ADDRESS
   from `systemctl --user show-environment`. If no graphical session is up,
-  nothing is recorded; a failed launch is not retried until the next timer
-  run. Persistent=true only catches up a missed timer run.
+  nothing is recorded and the next login (Persistent=true) retries.
 - A single-window lock/pid file prevents stacked windows. The prompt does
   not hold the sync lock while waiting; only `run` takes it.
 - A plain, button-less desktop notice is only an extra reminder

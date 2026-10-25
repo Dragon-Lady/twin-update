@@ -113,17 +113,24 @@ def _warn_version_mismatch(s: Session, rep: dict) -> None:
 
 
 def _install_stop_handlers() -> dict:
-    """Treat SIGTERM/SIGHUP like Ctrl-C so a stop can reopen closed apps."""
+    """Treat SIGTERM/SIGINT like Ctrl-C so a stop can reopen closed apps.
+
+    SIGHUP stays ignored: closing the terminal must not stop the update.
+    """
     prev = {}
 
     def _on_stop(signum, frame):
         raise KeyboardInterrupt
 
-    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+    for sig in (signal.SIGTERM, signal.SIGINT):
         try:
             prev[sig] = signal.signal(sig, _on_stop)
         except (ValueError, OSError):
             pass
+    try:
+        prev[signal.SIGHUP] = signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    except (ValueError, OSError):
+        pass
     return prev
 
 
@@ -381,10 +388,13 @@ def _reopen(s, rep, was_open, results):
             # reopening of apps whose launch policy explicitly permits it.
             try:
                 reopened[label] = s.peers[label].call("reopen", apps=apps)
-            except (PeerError, KeyboardInterrupt, EOFError) as exc:
-                reopened[label] = {"error": str(exc)}
-                rep.setdefault("reopen_errors", {})[label] = str(exc)
-                rep["summary"].append(f"could not reopen apps on {label}: {exc}")
+            except KeyboardInterrupt:
+                raise
+            except (PeerError, EOFError) as exc:
+                why = str(exc) or exc.__class__.__name__
+                reopened[label] = {"error": why}
+                rep.setdefault("reopen_errors", {})[label] = why
+                rep["summary"].append(f"could not reopen apps on {label}: {why}")
         if hook:
             if hook.get("ok"):
                 try:
@@ -598,6 +608,7 @@ def _run(s: Session, apps, dry: bool, smoke: bool = True, unreachable=None) -> d
                 reopened = True
             except KeyboardInterrupt:
                 ensure_reopen()
+                raise
             rep["prune"] = {l: s.peers[l].call("prune", apps=list(todo), dry=False) for l in labels}
             all_ok = all(r["verify"]["ok"] for m in results.values() for r in m.values())
             rep["result"] = "ok" if all_ok else "failed"
@@ -711,6 +722,7 @@ def _rollback(s: Session, app: str, labels, dry: bool, smoke: bool = True,
                 reopened = True
             except KeyboardInterrupt:
                 ensure_reopen()
+                raise
             rep["result"] = "ok" if all(r["verify"]["ok"] for r in res.values()) else "failed"
         except (Abort, PeerError, KeyboardInterrupt, EOFError) as exc:
             ensure_reopen()
