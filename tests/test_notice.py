@@ -540,6 +540,48 @@ class DetachedRun(unittest.TestCase):
         self.assertTrue(any("update unit:" in l for l in ui.lines))
         self.assertTrue(any("systemctl --user stop" in l for l in ui.lines))
 
+    def test_start_and_follow_run_sets_stop_timeout(self):
+        t = Twin()
+        s = t.sys["machine-a"]
+        notice.start_and_follow_run(
+            s, ["twin-update", "run", "--no-detach"], {}, FakeUI())
+        started = [c for c in s.calls if c[0][:1] == ["systemd-run"]
+                   and any(a.startswith("--unit=twin-update-run-") for a in c[0])]
+        self.assertTrue(started)
+        argv = started[0][0]
+        self.assertIn("-p", argv)
+        props = [argv[i + 1] for i, a in enumerate(argv) if a == "-p" and i + 1 < len(argv)]
+        stop = [p for p in props if p.startswith("TimeoutStopSec=")]
+        self.assertTrue(stop, argv)
+        sec = stop[0].split("=", 1)[1]
+        self.assertNotEqual(sec.lower(), "infinity")
+        self.assertGreaterEqual(int(sec), 1800)
+
+    def test_detach_if_needed_sets_stop_timeout(self):
+        from argparse import Namespace
+        from unittest import mock
+        from twin_update import cli
+        captured = []
+
+        def fake_execvp(file, argv):
+            captured.extend(argv)
+            raise OSError("exec")
+
+        prev = os.environ.pop("TWIN_UPDATE_SCOPE", None)
+        try:
+            with mock.patch.object(cli.shutil, "which", return_value="/usr/bin/systemd-run"), \
+                    mock.patch.object(cli.os, "execvp", fake_execvp):
+                with self.assertRaises(OSError):
+                    cli._detach_if_needed(Namespace(no_detach=False))
+        finally:
+            if prev is not None:
+                os.environ["TWIN_UPDATE_SCOPE"] = prev
+        self.assertIn("-p", captured)
+        stop = [a for a in captured if a.startswith("TimeoutStopSec=")]
+        self.assertTrue(stop, captured)
+        self.assertNotEqual(stop[0].split("=", 1)[1].lower(), "infinity")
+        self.assertGreaterEqual(int(stop[0].split("=", 1)[1]), 1800)
+
     def test_yes_starts_a_run_unit(self):
         import contextlib
         import io
@@ -574,6 +616,11 @@ class DetachedRun(unittest.TestCase):
         self.assertIn("--scope", argv)
         self.assertNotIn("--pipe", argv)
         self.assertNotIn("--collect", argv)
+        self.assertIn("-p", argv)
+        props = [argv[i + 1] for i, a in enumerate(argv) if a == "-p" and i + 1 < len(argv)]
+        stop = [p for p in props if p.startswith("TimeoutStopSec=")]
+        self.assertTrue(stop, argv)
+        self.assertGreaterEqual(int(stop[0].split("=", 1)[1]), 1800)
         self.assertNotIn("c0rrect-Horse!pw", " ".join(argv))
         self.assertIn(notice.UPDATE_FINISHED, ui.lines)
         self.assertTrue(any("systemctl --user stop" in l for l in ui.lines))

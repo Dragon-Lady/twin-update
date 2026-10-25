@@ -647,7 +647,8 @@ def start_and_follow_run(system, argv: list[str], env: dict, ui) -> int:
         runner = system.run_inherit if hasattr(system, "run_inherit") else system.run
         started = runner(
             ["systemd-run", "--user", "--scope", "--quiet",
-             f"--unit={unit}", "--", "env", "TWIN_UPDATE_SCOPE=1", *argv],
+             f"--unit={unit}", "-p", "TimeoutStopSec=5400", "--",
+             "env", "TWIN_UPDATE_SCOPE=1", *argv],
             env=env, timeout=None)
     finally:
         for sig, old in prev.items():

@@ -96,7 +96,8 @@ def _detach_if_needed(args) -> None:
         signal.signal(signal.SIGHUP, signal.SIG_IGN)
         return
     unit = f"twin-update-run-{int(time.time())}-{os.getpid()}-{os.urandom(2).hex()}"
-    argv = ["systemd-run", "--user", "--scope", "--quiet", f"--unit={unit}", "--",
+    argv = ["systemd-run", "--user", "--scope", "--quiet", f"--unit={unit}",
+            "-p", "TimeoutStopSec=5400", "--",
             "env", "TWIN_UPDATE_SCOPE=1", sys.executable, *sys.argv]
     os.execvp(argv[0], argv)
 

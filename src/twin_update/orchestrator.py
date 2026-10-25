@@ -271,6 +271,15 @@ def _interrupt_abort(exc: BaseException, after_close: bool = True) -> Abort:
     return Abort(str(exc) if str(exc) else "interrupted", interrupted=True)
 
 
+def _mark_internal_after_close(rep: dict, exc: BaseException) -> None:
+    why = str(exc) or type(exc).__name__
+    rep["result"] = "failed"
+    rep["error"] = why
+    line = f"internal error after close: {why}"
+    if line not in rep["summary"]:
+        rep["summary"].append(line)
+
+
 def _close_all(s: Session, rep: dict, per_machine: dict, dry: bool) -> dict:
     """per_machine: label -> [apps]. Returns was_open map; raises Abort if anything stays."""
     started = {}
@@ -281,6 +290,9 @@ def _close_all(s: Session, rep: dict, per_machine: dict, dry: bool) -> dict:
         for l, apps in per_machine.items():
             if not apps:
                 continue
+            # Reply may be lost if this call is interrupted; treat as closed.
+            was_open[l] = list(apps)
+            rep["was_open"] = dict(was_open)
             res = s.peers[l].call("close_start", apps=apps, dry=dry)
             started[l] = res
             was_open[l] = [a for a, r in res.items() if r.get("was_open")]
@@ -538,7 +550,9 @@ def _run(s: Session, apps, dry: bool, smoke: bool = True, unreachable=None) -> d
                     ver = s.peers[l].call("verify", app_name=app, version=p["target"],
                                           smoke=smoke) if up["ok"] else {"ok": False}
                     r = {"upgrade": up, "verify": ver}
-                    if not ver["ok"]:
+                    if ver.get("inconclusive"):
+                        r["inconclusive"] = True
+                    elif not ver["ok"]:
                         want_rb = False
                         try:
                             if _ui_can_prompt(s.ui):
@@ -581,9 +595,16 @@ def _run(s: Session, apps, dry: bool, smoke: bool = True, unreachable=None) -> d
                                     f"Not upgrading {', '.join(remaining)}. "
                                     f"To undo: {ROLLBACK_CMD}")
                     results.setdefault(app, {})[l] = r
-                    mark = ver["ok"]
-                    txt = (f"{s.cfg.apps[app].display} {l} {up.get('before')}\u2192"
-                           f"{up.get('after')} {_ok(mark)}")
+                    if ver.get("inconclusive"):
+                        why = ((ver.get("smoke") or {}).get("reason")
+                               or f"could not check {s.cfg.apps[app].display}: "
+                                  "it was opened during the update")
+                        txt = (f"{s.cfg.apps[app].display} {l} {up.get('before')}\u2192"
+                               f"{up.get('after')} (not verified: {why})")
+                    else:
+                        mark = ver["ok"]
+                        txt = (f"{s.cfg.apps[app].display} {l} {up.get('before')}\u2192"
+                               f"{up.get('after')} {_ok(mark)}")
                     if "rollback" in r:
                         txt += f" (rolled back to {r['rollback'].get('to')})"
                     elif r.get("held_failed"):
@@ -637,6 +658,15 @@ def _run(s: Session, apps, dry: bool, smoke: bool = True, unreachable=None) -> d
         rep["result"] = "aborted"
         rep["error"] = str(exc)
         rep["summary"].append(f"aborted: {exc}")
+    except Exception as exc:
+        if was_open or rep.get("was_open"):
+            try:
+                ensure_reopen()
+            except Exception:
+                pass
+            _mark_internal_after_close(rep, exc)
+            _finish(s, rep, dry)
+        raise
     return _finish(s, rep, dry)
 
 
@@ -747,6 +777,15 @@ def _rollback(s: Session, app: str, labels, dry: bool, smoke: bool = True,
         rep["result"] = "aborted"
         rep["error"] = str(exc)
         rep["summary"].append(f"aborted: {exc}")
+    except Exception as exc:
+        if was_open or rep.get("was_open"):
+            try:
+                ensure_reopen()
+            except Exception:
+                pass
+            _mark_internal_after_close(rep, exc)
+            _finish(s, rep, dry)
+        raise
     return _finish(s, rep, dry)
 
 

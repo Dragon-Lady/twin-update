@@ -74,7 +74,12 @@ class SshPeer:
             raise PeerError(f"no ssh_target configured for {label}")
         self.label = label
         self._connection = (label, target, remote_command, connect_timeout, popen)
+        self._connect()
+
+    def _connect(self) -> None:
+        label, target, remote_command, connect_timeout, popen = self._connection
         self._timed_out = False
+        self._dirty = False
         self._buffer = b""
         argv = ["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
                 "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4",
@@ -104,6 +109,27 @@ class SshPeer:
         self._id = 0
         self._first_timeout = connect_timeout
 
+    def _reset_session(self) -> None:
+        """Abandon a dirty session: let the remote finish, then reconnect.
+
+        Closing stdin ends serve after the current request (no SIGKILL, so a
+        remote apt upgrade is not cut off). Wait for that process, then open
+        a fresh session so request ids cannot collide with a stale reply.
+        """
+        proc = getattr(self, "proc", None)
+        if proc is not None:
+            try:
+                if proc.stdin:
+                    proc.stdin.close()
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=5400)
+            except Exception:
+                pass
+        self._close_err()
+        self._connect()
+
     def _readline(self, timeout: float | None) -> bytes:
         if timeout is None and not self._buffer:
             return self.proc.stdout.readline()
@@ -128,21 +154,21 @@ class SshPeer:
     def call(self, op: str, call_timeout: float | None = None, **kw):
         if op not in OPS:
             raise PeerError(f"op not allowed: {op}")
-        if self._timed_out:
-            # A late response must not be mistaken for the reopen response.
-            # Keep recovery independent of the blocked request's server loop.
-            recovery = SshPeer(*self._connection)
-            try:
-                return recovery.call(op, call_timeout=call_timeout or 30, **kw)
-            finally:
-                recovery.close()
+        if self._timed_out or self._dirty:
+            self._reset_session()
         self._id += 1
         line = json.dumps({"id": self._id, "op": op, "args": kw}).encode() + b"\n"
         try:
             self.proc.stdin.write(line)
             self.proc.stdin.flush()
         except (BrokenPipeError, OSError):
+            self._timed_out = True
+            self._dirty = True
             raise PeerError(f"{self.label}: {self._why()}") from None
+        except KeyboardInterrupt:
+            self._timed_out = True
+            self._dirty = True
+            raise
         finally:
             del line  # may carry the sudo password; drop our reference
         timeout, self._first_timeout = call_timeout if call_timeout is not None else self._first_timeout, None
@@ -150,36 +176,45 @@ class SshPeer:
             raw = self._readline(timeout)
         except (KeyboardInterrupt, BrokenPipeError, OSError):
             self._timed_out = True
+            self._dirty = True
             raise
         except PeerError:
             self._timed_out = True
+            self._dirty = True
             raise
         if not raw:
             self._timed_out = True
+            self._dirty = True
             raise PeerError(f"{self.label}: {self._why()}")
         try:
             msg = json.loads(raw)
         except ValueError:
             self._timed_out = True
+            self._dirty = True
             raise PeerError(f"{self.label}: {self._why()}") from None
         if not isinstance(msg, dict):
             self._timed_out = True
+            self._dirty = True
             raise PeerError(f"{self.label}: {self._why()}")
         while isinstance(msg.get("id"), int) and msg["id"] < self._id:
             raw = self._readline(timeout)
             if not raw:
                 self._timed_out = True
+                self._dirty = True
                 raise PeerError(f"{self.label}: {self._why()}")
             try:
                 msg = json.loads(raw)
             except ValueError:
                 self._timed_out = True
+                self._dirty = True
                 raise PeerError(f"{self.label}: {self._why()}") from None
             if not isinstance(msg, dict):
                 self._timed_out = True
+                self._dirty = True
                 raise PeerError(f"{self.label}: {self._why()}")
         if msg.get("id") != self._id:
             self._timed_out = True
+            self._dirty = True
             raise PeerError("unexpected peer response id")
         if not msg.get("ok"):
             raise PeerError(f"{self.label}: {msg.get('error', 'error')}")
@@ -208,6 +243,7 @@ class SshPeer:
         except Exception:
             pass
         self._timed_out = True
+        self._dirty = True
         try:
             self.proc.wait(timeout=5)
         except Exception:

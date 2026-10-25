@@ -943,8 +943,9 @@ class Engine:
         # main_only: leftover helpers do not count. An unidentified main is
         # treated as running (fail closed — do not start over a live app).
         if self.running(app_name, main_only=True):
-            return {"ok": False,
-                    "reason": "app is running again; not killing a user-launched instance"}
+            return {"ok": True, "inconclusive": True,
+                    "skipped": "opened during the update",
+                    "reason": f"could not check {app.name}: it was opened during the update"}
         worker_root = os.path.join(self.sys.home(), ".config/Cursor/User/globalStorage/anysphere.cursor-agent-worker")
         def worker(p):
             return any(os.path.isabs(v) and os.path.realpath(v).startswith(worker_root + "/")
@@ -1062,9 +1063,14 @@ class Engine:
             smoke = False
         if smoke and res["dpkg_ok"]:
             res["smoke"] = self.smoke(app.name)
-        res["ok"] = res["dpkg_ok"] and (not smoke or res.get("smoke", {}).get("ok", False))
+        smoke_res = res.get("smoke") or {}
+        if smoke_res.get("inconclusive"):
+            res["ok"] = bool(res["dpkg_ok"])
+            res["inconclusive"] = True
+        else:
+            res["ok"] = res["dpkg_ok"] and (not smoke or smoke_res.get("ok", False))
         st = self._state(app)
-        if res["ok"] and st and st.get("to_version") == inst:
+        if res["ok"] and not res.get("inconclusive") and st and st.get("to_version") == inst:
             st["verified"] = True
             self._save_state(app, st)
         return res

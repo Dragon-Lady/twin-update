@@ -281,8 +281,10 @@ class RunFlow(unittest.TestCase):
         t = Twin(); standard(t)
         t.sys["machine-a"].add_app_procs(GPT)
         res = t.eng["machine-a"].smoke("chatgpt")
-        self.assertFalse(res["ok"])
-        self.assertIn("user-launched", res["reason"])
+        self.assertTrue(res["ok"], res)
+        self.assertTrue(res.get("inconclusive"), res)
+        self.assertIn("could not check", res["reason"])
+        self.assertIn("opened during the update", res["reason"])
         self.assertTrue(t.eng["machine-a"].running("chatgpt"))
 
     def test_smoke_helper_is_not_a_user_relaunched_app(self):
@@ -1576,6 +1578,206 @@ class DoctorExit(unittest.TestCase):
         t = Twin(); standard(t)
         rc, _ = self._doctor(t, ["--local-only"])
         self.assertEqual(rc, 0)
+
+
+def _recorded_reports(t, kind=None):
+    runs = os.path.join(t.cfg.state_dir, "runs")
+    if not os.path.isdir(runs):
+        return []
+    out = []
+    for name in sorted(os.listdir(runs)):
+        with open(os.path.join(runs, name)) as fh:
+            rec = json.load(fh)
+        if kind is None or rec.get("kind") == kind:
+            out.append(rec)
+    return out
+
+
+class AfterClose041(unittest.TestCase):
+    def _cli(self, t, args, ui=None):
+        import tempfile
+        from fakes import patched_paths, CONFIG
+        from twin_update import cli
+        tmpd = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, tmpd, True)
+        cfgp = os.path.join(tmpd, "c.toml")
+        with open(cfgp, "w") as fh:
+            fh.write(CONFIG.format(keep="[]", fallback="[]"))
+        ui = ui or FakeUI()
+        with patched_paths(t):
+            rc = cli.main(["--config", cfgp, *args], ui=ui,
+                          system=t.sys["machine-a"],
+                          peer_factory=lambda label, target, cmd: t.peers[label])
+        return rc, ui
+
+    def _wrap(self, t, label, boom_op, exc):
+        real = t.peers[label]
+
+        class Boom:
+            def call(self, op, **kw):
+                if op == boom_op:
+                    raise exc
+                return real.call(op, **kw)
+
+            def close(self):
+                real.close()
+
+        t.peers[label] = Boom()
+
+    def test_unexpected_oserror_after_close_reopens_and_records(self):
+        t = Twin(); standard(t)
+        t.sys["machine-a"].add_app_procs(CUR)
+        t.sys["machine-b"].add_app_procs(CUR)
+        self._wrap(t, "machine-b", "upgrade", OSError("disk full"))
+        rc, ui = self._cli(t, ["run", "--no-detach", "--no-smoke"])
+        self.assertNotEqual(rc, 0)
+        self.assertNotEqual(rc, 3)
+        self.assertTrue(any("internal error" in l for l in ui.lines), ui.lines)
+        self.assertTrue(any("details:" in l and "last-error.log" in l for l in ui.lines), ui.lines)
+        recs = _recorded_reports(t, "run")
+        self.assertTrue(recs, "run was not recorded")
+        rec = recs[-1]
+        self.assertEqual(rec.get("result"), "failed")
+        self.assertTrue(any("internal error after close" in l for l in rec.get("summary") or []))
+        for label in ("machine-a", "machine-b"):
+            self.assertIn("cursor", (rec.get("reopen") or {}).get(label, {}), rec)
+
+    def test_unexpected_engineerror_after_close_reopens_and_records(self):
+        from twin_update.engine import EngineError
+        t = Twin(); standard(t)
+        t.sys["machine-a"].add_app_procs(GPT)
+        t.sys["machine-b"].add_app_procs(GPT)
+        self._wrap(t, "machine-b", "verify", EngineError("peer engine broke"))
+        rc, ui = self._cli(t, ["run", "--no-detach", "--no-smoke"])
+        self.assertNotEqual(rc, 0)
+        self.assertNotEqual(rc, 3)
+        self.assertTrue(any("internal error" in l for l in ui.lines), ui.lines)
+        self.assertTrue(any("details:" in l and "last-error.log" in l for l in ui.lines), ui.lines)
+        recs = _recorded_reports(t, "run")
+        self.assertTrue(recs, "run was not recorded")
+        rec = recs[-1]
+        self.assertEqual(rec.get("result"), "failed")
+        for label in ("machine-a", "machine-b"):
+            self.assertIn("chatgpt", (rec.get("reopen") or {}).get(label, {}), rec)
+
+    def test_unexpected_error_during_rollback_after_close_reopens(self):
+        t = Twin()
+        t.setup("cursor", "3.23.23-1", "3.24.9-1")
+        orchestrator.run(t.session(FakeUI()), ["cursor"], dry=False, smoke=False)
+        t.sys["machine-a"].add_app_procs(CUR)
+        t.sys["machine-b"].add_app_procs(CUR)
+        self._wrap(t, "machine-b", "rollback_install", KeyError("missing copy key"))
+        rc, ui = self._cli(t, ["rollback", "cursor", "--no-detach", "--no-smoke"])
+        self.assertNotEqual(rc, 0)
+        self.assertNotEqual(rc, 3)
+        self.assertTrue(any("internal error" in l for l in ui.lines), ui.lines)
+        recs = _recorded_reports(t, "rollback")
+        self.assertTrue(recs, "rollback was not recorded")
+        rec = recs[-1]
+        self.assertEqual(rec.get("result"), "failed")
+        for label in ("machine-a", "machine-b"):
+            self.assertIn("cursor", (rec.get("reopen") or {}).get(label, {}), rec)
+
+    def test_smoke_opened_during_update_vs_real_failure(self):
+        t = Twin(); standard(t)
+        real = t.peers["machine-a"]
+
+        class Opened:
+            def call(self, op, **kw):
+                if op == "upgrade":
+                    r = real.call(op, **kw)
+                    t.sys["machine-a"].add_app_procs(CUR)
+                    return r
+                return real.call(op, **kw)
+
+            def close(self):
+                real.close()
+
+        t.peers["machine-a"] = Opened()
+        ui = FakeUI(confirm=True)
+        rep = orchestrator.run(t.session(ui), ["cursor"], dry=False)
+        self.assertEqual(rep["result"], "ok", rep)
+        self.assertFalse(any("Roll back" in p for p in ui.prompts), ui.prompts)
+        self.assertTrue(any("not verified" in l for l in rep["summary"]), rep["summary"])
+        self.assertTrue(any("could not check" in l and "opened during the update" in l
+                            for l in rep["summary"]), rep["summary"])
+        ver = rep["results"]["cursor"]["machine-a"]["verify"]
+        self.assertTrue(ver.get("inconclusive"), ver)
+        self.assertTrue(ver.get("ok"), ver)
+        chk = t.eng["machine-a"].check(["cursor"])
+        self.assertNotEqual(chk["apps"]["cursor"].get("rejected"), "3.24.9-1")
+        self.assertNotIn("cursor", t.sys["machine-a"].held)
+        st = t.eng["machine-a"]._state(t.cfg.apps["cursor"])
+        self.assertFalse(st.get("verified"))
+        self.assertTrue(t.eng["machine-a"].running("cursor", main_only=True))
+
+        t2 = Twin(); standard(t2)
+        t2.sys["machine-a"].smoke_dies.add("cursor")
+        ui2 = FakeUI(confirm=False)
+        rep2 = orchestrator.run(t2.session(ui2), ["cursor"], dry=False)
+        self.assertNotEqual(rep2["result"], "ok", rep2)
+        self.assertTrue(any("Roll back" in p for p in ui2.prompts), ui2.prompts)
+        self.assertEqual(t2.eng["machine-a"].check(["cursor"])["apps"]["cursor"].get("rejected"),
+                         "3.24.9-1")
+        self.assertIn("cursor", t2.sys["machine-a"].held)
+        self.assertFalse(any("not verified" in l for l in (rep2.get("summary") or [])))
+
+    def test_close_start_in_flight_is_reopened(self):
+        t = Twin(); standard(t)
+        t.sys["machine-a"].add_app_procs(GPT)
+        t.sys["machine-b"].add_app_procs(GPT)
+        real = t.peers["machine-b"]
+
+        class Inflight:
+            def call(self, op, **kw):
+                if op == "close_start":
+                    raise KeyboardInterrupt
+                return real.call(op, **kw)
+
+            def close(self):
+                real.close()
+
+        t.peers["machine-b"] = Inflight()
+        rep = orchestrator.run(t.session(FakeUI()), ["chatgpt"], dry=False, smoke=False)
+        self.assertTrue(rep.get("interrupted"), rep)
+        self.assertEqual(rep["result"], "aborted")
+        for label in ("machine-a", "machine-b"):
+            ra = (rep.get("reopen") or {}).get(label) or {}
+            self.assertIn("chatgpt", ra, label)
+
+    def test_sigterm_during_rollback_final_reopen_reopens_and_exits_3(self):
+        import signal
+        t = Twin()
+        t.setup("chatgpt", "26.1002.52244", "26.1007.21434")
+        orchestrator.run(t.session(FakeUI()), ["chatgpt"], dry=False, smoke=False)
+        t.sys["machine-a"].add_app_procs(GPT)
+        t.sys["machine-b"].add_app_procs(GPT)
+        real = t.peers["machine-b"]
+        counts = {"reopen": 0}
+
+        class Term:
+            def call(self, op, **kw):
+                if op == "reopen":
+                    counts["reopen"] += 1
+                    if counts["reopen"] == 1:
+                        os.kill(os.getpid(), signal.SIGTERM)
+                return real.call(op, **kw)
+
+            def close(self):
+                real.close()
+
+        t.peers["machine-b"] = Term()
+        rc, ui = self._cli(t, ["rollback", "chatgpt", "--no-detach", "--no-smoke"])
+        self.assertEqual(rc, 3)
+        recs = _recorded_reports(t, "rollback")
+        self.assertTrue(recs)
+        rec = recs[-1]
+        self.assertTrue(rec.get("interrupted"), rec)
+        self.assertEqual(rec["result"], "aborted")
+        for label in ("machine-a", "machine-b"):
+            ra = (rec.get("reopen") or {}).get(label) or {}
+            self.assertIn("chatgpt", ra, ra)
+            self.assertTrue(ra["chatgpt"].get("ok"), ra)
 
 
 if __name__ == "__main__":

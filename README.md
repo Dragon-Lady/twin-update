@@ -90,7 +90,8 @@ The run is in its own session: Ctrl-C in the prompt window does not stop
 it, and closing the window (SIGHUP) does not stop it either. Cancel with
 `systemctl --user stop <the update unit>` (the window prints the unit
 name). That SIGTERM reopens apps that were closed for the run. systemd
-gives the run scope 90 seconds to clean up before it is force-killed.
+gives the run scope 90 minutes to finish apt and reopen apps before it
+is force-killed.
 If the run is killed outright or apt is interrupted, recover with
 `sudo dpkg --configure -a` (also noted by `twin-update doctor`).
 

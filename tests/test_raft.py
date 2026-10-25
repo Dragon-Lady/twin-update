@@ -226,22 +226,98 @@ class RaftTests(unittest.TestCase):
     def test_peer_timeout_recovery_uses_fresh_connection(self):
         from twin_update.peer import SshPeer, PeerError
         streams = []
+        procs = []
+        overlap = []
         class P:
             def __init__(self, argv, **kw):
+                if any(getattr(p, "upgrading", False) for p in procs):
+                    overlap.append(True)
                 read_fd, write_fd = os.pipe()
                 self.stdout = os.fdopen(read_fd, 'rb', buffering=0)
                 self.stdin = io.BytesIO()
+                self.upgrading = False
+                self.waited = False
                 streams.append((self.stdout, write_fd))
+                procs.append(self)
                 os.write(write_fd, b'{"id":1,"ok":true,"result":{"ok":true}}\n')
-            def wait(self, timeout=None): return 0
+            def wait(self, timeout=None):
+                self.waited = True
+                self.upgrading = False
+                return 0
         peer = SshPeer("machine-b", "user@host.example", "/opt/tool.pyz", popen=P)
         try:
             self.assertTrue(peer.call("identity")["ok"])
+            procs[0].upgrading = True
             with self.assertRaises(PeerError):
                 peer.call("pre_reopen_hook", call_timeout=0.01, app_name="cursor", smoke_ok=True)
             self.assertTrue(peer.call("reopen", apps=["cursor"])["ok"])
             self.assertEqual(len(streams), 2)
+            self.assertTrue(procs[0].waited)
+            self.assertFalse(overlap)
         finally:
             peer.close()
             for stream, fd in streams:
                 stream.close(); os.close(fd)
+
+    def test_interrupted_peer_call_resets_before_reopen(self):
+        from twin_update.peer import SshPeer
+        sessions = []
+        overlap = []
+
+        class P:
+            def __init__(self, argv, **kw):
+                if any(s.upgrading for s in sessions):
+                    overlap.append(True)
+                self.upgrading = False
+                self.waited = False
+                self.stdin_closed = False
+                read_fd, write_fd = os.pipe()
+                self.stdout = os.fdopen(read_fd, "rb", buffering=0)
+                self._w = write_fd
+                self.stdin = self
+                sessions.append(self)
+
+            def write(self, data):
+                req = json.loads(data)
+                if req.get("op") == "upgrade":
+                    self.upgrading = True
+                    raise KeyboardInterrupt
+                os.write(self._w, (json.dumps(
+                    {"id": req["id"], "ok": True, "result": {"ok": True}}) + "\n").encode())
+
+            def flush(self):
+                pass
+
+            def close(self):
+                self.stdin_closed = True
+
+            def wait(self, timeout=None):
+                self.waited = True
+                self.upgrading = False
+                return 0
+
+        peer = SshPeer("machine-b", "user@host.example", "/opt/tool.pyz", popen=P)
+        try:
+            self.assertTrue(peer.call("identity")["ok"])
+            with self.assertRaises(KeyboardInterrupt):
+                peer.call("upgrade", app_name="cursor", version="1")
+            self.assertTrue(getattr(peer, "_timed_out", False)
+                            or getattr(peer, "_dirty", False))
+            self.assertTrue(sessions[0].upgrading)
+            self.assertTrue(peer.call("reopen", apps=["cursor"])["ok"])
+            self.assertEqual(len(sessions), 2)
+            self.assertTrue(sessions[0].waited)
+            self.assertTrue(sessions[0].stdin_closed)
+            self.assertFalse(overlap)
+            self.assertFalse(sessions[0].upgrading)
+        finally:
+            peer.close()
+            for s in sessions:
+                try:
+                    s.stdout.close()
+                except Exception:
+                    pass
+                try:
+                    os.close(s._w)
+                except Exception:
+                    pass

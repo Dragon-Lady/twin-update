@@ -8,7 +8,8 @@
   Cancel with `systemctl --user stop <the update unit>` (the window
   prints the name). That stop reopens apps that were closed. The window
   waits for cleanup and never force-kills the update. systemd gives the
-  run scope 90 seconds to clean up before it is force-killed.
+  run scope 90 minutes to finish apt and reopen apps before it is
+  force-killed.
 - A stop or dropped connection while closing the second machine still
   reopens apps already closed on the first. The run is recorded.
 - A second stop during the final reopen is retried once. The run is
@@ -36,7 +37,8 @@
 - Broken or unreadable state files (wrong JSON type, a directory in the
   way) are ignored. `doctor` names the file.
 - An unexpected error prints `internal error:` and a `details:` path, and
-  writes `last-error.log` in the state directory.
+  writes `last-error.log` in the state directory. After apps have been
+  closed, they are reopened and the run is recorded before that exit.
 - `doctor` also reports how long the update window has been open, a
   reused slot pid, a failure to record today's prompt, a check-service
   ExecStart that does not exist, and names an unreachable machine.
@@ -59,9 +61,16 @@
   gnome-terminal `--wait --`, and the other known ones). The prompt unit
   is checked by MainPID polling, including MainPID 0 while it is still
   starting.
-- The smoke check waits its full interval. `doctor` warns when the
-  installed check service or timer has drifted from what this package
-  ships.
+- The smoke check waits its full interval. If an app is opened during
+  the update, that check is reported as not verified (not a failure):
+  there is no rollback offer, that version is not held, and the instance
+  the user opened is left running. A real start or crash failure is
+  still a failed check. `doctor` warns when the installed check service
+  or timer has drifted from what this package ships.
+- A stop while talking to the other machine waits for that command to
+  finish, then uses a fresh session so a reopen cannot collide with an
+  upgrade still in progress. A machine whose close was in flight is
+  treated as closed and is reopened.
 - The zipapp build is reproducible (`SOURCE_DATE_EPOCH`).
 - After the window is gone, later questions have no keyboard and take the
   non-interactive stop path. A kill of the process cannot run cleanup.
