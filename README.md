@@ -89,9 +89,10 @@ tty is kept: the sudo password and the rollback question stay interactive.
 The run is in its own session: Ctrl-C in the prompt window does not stop
 it, and closing the window (SIGHUP) does not stop it either. Cancel with
 `systemctl --user stop <the update unit>` (the window prints the unit
-name). That SIGTERM reopens apps that were closed for the run. systemd
-gives the run scope 90 minutes to finish apt and reopen apps before it
-is force-killed.
+name). That SIGTERM reopens apps that were closed for the run. A stop signals
+the run right away and is force-killed only after 90 minutes. A stop
+can wait for the other machine's step to finish (up to that time) and
+may look quiet meanwhile.
 If the run is killed outright or apt is interrupted, recover with
 `sudo dpkg --configure -a` (also noted by `twin-update doctor`).
 

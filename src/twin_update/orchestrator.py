@@ -252,7 +252,10 @@ def _reopen_each(s: Session, was_open: dict, rep: dict) -> dict:
             continue
         try:
             reopened[l] = s.peers[l].call("reopen", apps=apps)
-        except (PeerError, KeyboardInterrupt, EOFError) as exc:
+        except KeyboardInterrupt as exc:
+            failed[l] = str(exc) or exc.__class__.__name__
+            reopened[l] = {"error": failed[l]}
+        except Exception as exc:
             failed[l] = str(exc) or exc.__class__.__name__
             reopened[l] = {"error": failed[l]}
     if failed:
@@ -262,6 +265,13 @@ def _reopen_each(s: Session, was_open: dict, rep: dict) -> dict:
             if line not in rep["summary"]:
                 rep["summary"].append(line)
     return reopened
+
+
+def _keep_close_prefill(peer, exc: BaseException) -> bool:
+    """True when close_start was interrupted or the session is dead/dirty."""
+    if isinstance(exc, (KeyboardInterrupt, EOFError)):
+        return True
+    return bool(getattr(peer, "_dirty", False) or getattr(peer, "_timed_out", False))
 
 
 def _interrupt_abort(exc: BaseException, after_close: bool = True) -> Abort:
@@ -290,10 +300,21 @@ def _close_all(s: Session, rep: dict, per_machine: dict, dry: bool) -> dict:
         for l, apps in per_machine.items():
             if not apps:
                 continue
-            # Reply may be lost if this call is interrupted; treat as closed.
-            was_open[l] = list(apps)
-            rep["was_open"] = dict(was_open)
-            res = s.peers[l].call("close_start", apps=apps, dry=dry)
+            prior = list(was_open[l]) if l in was_open else None
+            if not dry:
+                # Reply may be lost if this call is interrupted; treat as closed.
+                was_open[l] = list(apps)
+                rep["was_open"] = dict(was_open)
+            try:
+                res = s.peers[l].call("close_start", apps=apps, dry=dry)
+            except (KeyboardInterrupt, EOFError, PeerError) as exc:
+                if dry or not _keep_close_prefill(s.peers[l], exc):
+                    if prior is None:
+                        was_open.pop(l, None)
+                    else:
+                        was_open[l] = prior
+                    rep["was_open"] = dict(was_open)
+                raise
             started[l] = res
             was_open[l] = [a for a, r in res.items() if r.get("was_open")]
             rep["was_open"] = dict(was_open)
@@ -402,7 +423,7 @@ def _reopen(s, rep, was_open, results):
                 reopened[label] = s.peers[label].call("reopen", apps=apps)
             except KeyboardInterrupt:
                 raise
-            except (PeerError, EOFError) as exc:
+            except Exception as exc:
                 why = str(exc) or exc.__class__.__name__
                 reopened[label] = {"error": why}
                 rep.setdefault("reopen_errors", {})[label] = why

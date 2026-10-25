@@ -304,7 +304,7 @@ class RaftTests(unittest.TestCase):
             self.assertTrue(getattr(peer, "_timed_out", False)
                             or getattr(peer, "_dirty", False))
             self.assertTrue(sessions[0].upgrading)
-            self.assertTrue(peer.call("reopen", apps=["cursor"])["ok"])
+            self.assertTrue(peer.call("reopen", apps=["cursor"], call_timeout=0.5)["ok"])
             self.assertEqual(len(sessions), 2)
             self.assertTrue(sessions[0].waited)
             self.assertTrue(sessions[0].stdin_closed)
@@ -321,3 +321,45 @@ class RaftTests(unittest.TestCase):
                     os.close(s._w)
                 except Exception:
                     pass
+
+    def test_failed_ssh_start_is_peer_error_and_retries(self):
+        from twin_update.peer import SshPeer, PeerError
+        starts = {"n": 0}
+        streams = []
+
+        class P:
+            def __init__(self, argv, **kw):
+                starts["n"] += 1
+                if starts["n"] == 2:
+                    raise OSError("ssh failed")
+                read_fd, write_fd = os.pipe()
+                self.stdout = os.fdopen(read_fd, "rb", buffering=0)
+                self.stdin = io.BytesIO()
+                streams.append((self.stdout, write_fd))
+                os.write(write_fd, b'{"id":1,"ok":true,"result":{"ok":true}}\n')
+
+            def wait(self, timeout=None):
+                return 0
+
+        peer = SshPeer("machine-b", "user@host.example", "/opt/tool.pyz", popen=P)
+        try:
+            self.assertTrue(peer.call("identity")["ok"])
+            peer._dirty = True
+            try:
+                peer.call("reopen", apps=["cursor"], call_timeout=0.5)
+            except PeerError as exc:
+                err = exc
+            except OSError:
+                self.fail("ssh start leaked OSError")
+            else:
+                self.fail("expected PeerError from failed ssh start")
+            self.assertTrue(peer._dirty)
+            self.assertIn("ssh", str(err).lower())
+            self.assertTrue(peer.call("identity")["ok"])
+            self.assertEqual(starts["n"], 3)
+            self.assertFalse(peer._dirty)
+        finally:
+            peer.close()
+            for stream, fd in streams:
+                stream.close()
+                os.close(fd)

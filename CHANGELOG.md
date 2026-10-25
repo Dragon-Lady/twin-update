@@ -7,9 +7,8 @@
   (not a separate tty). Ctrl-C and closing the window do not stop it.
   Cancel with `systemctl --user stop <the update unit>` (the window
   prints the name). That stop reopens apps that were closed. The window
-  waits for cleanup and never force-kills the update. systemd gives the
-  run scope 90 minutes to finish apt and reopen apps before it is
-  force-killed.
+  waits for cleanup and never force-kills the update. A stop signals
+  the run right away; systemd force-kills it only after 90 minutes.
 - A stop or dropped connection while closing the second machine still
   reopens apps already closed on the first. The run is recorded.
 - A second stop during the final reopen is retried once. The run is
@@ -62,15 +61,19 @@
   is checked by MainPID polling, including MainPID 0 while it is still
   starting.
 - The smoke check waits its full interval. If an app is opened during
-  the update, that check is reported as not verified (not a failure):
-  there is no rollback offer, that version is not held, and the instance
-  the user opened is left running. A real start or crash failure is
+  the update, the run summary says `not verified` (not a failure): there
+  is no rollback offer, that version is not held, and the instance the
+  user opened is left running. A rollback whose check is inconclusive
+  still prints its normal ok line. A real start or crash failure is
   still a failed check. `doctor` warns when the installed check service
   or timer has drifted from what this package ships.
 - A stop while talking to the other machine waits for that command to
   finish, then uses a fresh session so a reopen cannot collide with an
-  upgrade still in progress. A machine whose close was in flight is
-  treated as closed and is reopened.
+  upgrade still in progress. A stop while a close is in flight still
+  reopens that machine's apps. A dry run or a clean close error does
+  not reopen apps that were never open.
+- A failure reopening one machine still reopens the other.
+- A failed ssh start is reported as a peer error and is retried.
 - The zipapp build is reproducible (`SOURCE_DATE_EPOCH`).
 - After the window is gone, later questions have no keyboard and take the
   non-interactive stop path. A kill of the process cannot run cleanup.

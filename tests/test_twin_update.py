@@ -1779,6 +1779,71 @@ class AfterClose041(unittest.TestCase):
             self.assertIn("chatgpt", ra, ra)
             self.assertTrue(ra["chatgpt"].get("ok"), ra)
 
+    def test_dry_run_close_start_error_does_not_launch(self):
+        from twin_update.peer import PeerError
+        t = Twin(); standard(t)
+        real = t.peers["machine-b"]
+
+        class Boom:
+            def call(self, op, **kw):
+                if op == "close_start":
+                    raise PeerError("machine-b: close failed")
+                return real.call(op, **kw)
+
+            def close(self):
+                real.close()
+
+        t.peers["machine-b"] = Boom()
+        orchestrator.run(t.session(FakeUI()), ["cursor"], dry=True)
+        self.assertEqual(kinds(t, "LAUNCH"), [])
+
+    def test_clean_close_start_error_does_not_reopen_never_open(self):
+        from twin_update.peer import PeerError
+        t = Twin(); standard(t)
+        real = t.peers["machine-b"]
+
+        class Boom:
+            def call(self, op, **kw):
+                if op == "close_start":
+                    raise PeerError("machine-b: EngineError: cannot close")
+                return real.call(op, **kw)
+
+            def close(self):
+                real.close()
+
+        t.peers["machine-b"] = Boom()
+        rep = orchestrator.run(t.session(FakeUI()), ["cursor"], dry=False, smoke=False)
+        self.assertEqual(kinds(t, "LAUNCH"), [])
+        self.assertNotIn("cursor", (rep.get("reopen") or {}).get("machine-b") or {})
+
+    def test_reopen_permission_error_still_reopens_other_machine(self):
+        t = Twin(); standard(t)
+        t.sys["machine-a"].add_app_procs(CUR)
+        t.sys["machine-b"].add_app_procs(CUR)
+        real = t.peers["machine-a"]
+
+        class Boom:
+            def call(self, op, **kw):
+                if op == "reopen":
+                    raise PermissionError("cannot launch")
+                return real.call(op, **kw)
+
+            def close(self):
+                real.close()
+
+        t.peers["machine-a"] = Boom()
+        try:
+            rep = orchestrator.run(t.session(FakeUI()), ["cursor"], dry=False, smoke=False)
+        except PermissionError:
+            self.fail("PermissionError escaped reopen")
+        self.assertIn("cursor", (rep.get("reopen") or {}).get("machine-b") or {}, rep)
+        self.assertTrue(
+            (rep.get("reopen") or {}).get("machine-b", {}).get("cursor", {}).get("ok"))
+        why = (rep.get("reopen_errors") or {}).get("machine-a") or ""
+        self.assertIn("cannot launch", why)
+        self.assertTrue(any("could not reopen apps on machine-a" in l
+                            for l in rep["summary"]), rep["summary"])
+
 
 if __name__ == "__main__":
     unittest.main()

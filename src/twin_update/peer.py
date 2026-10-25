@@ -78,8 +78,6 @@ class SshPeer:
 
     def _connect(self) -> None:
         label, target, remote_command, connect_timeout, popen = self._connection
-        self._timed_out = False
-        self._dirty = False
         self._buffer = b""
         argv = ["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
                 "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4",
@@ -91,23 +89,38 @@ class SshPeer:
             signal.signal(signal.SIGTERM, signal.SIG_IGN)
             signal.signal(signal.SIGINT, signal.SIG_IGN)
 
+        def _fail_start(exc):
+            try:
+                self._err.close()
+            except Exception:
+                pass
+            if isinstance(exc, OSError):
+                raise PeerError(
+                    f"{label}: {classify_ssh_error(str(exc), None)}") from exc
+            raise exc
+
         try:
-            self.proc = popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                              stderr=self._err, start_new_session=True,
-                              preexec_fn=_preexec)
-        except TypeError:
-            # Test fakes and older Popen wrappers may not take these kwargs.
             try:
                 self.proc = popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                  stderr=self._err)
-            except BaseException:
-                self._err.close()
-                raise
-        except BaseException:
-            self._err.close()
+                                  stderr=self._err, start_new_session=True,
+                                  preexec_fn=_preexec)
+            except TypeError:
+                # Test fakes and older Popen wrappers may not take these kwargs.
+                try:
+                    self.proc = popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                      stderr=self._err)
+                except BaseException as exc:
+                    _fail_start(exc)
+            except BaseException as exc:
+                _fail_start(exc)
+        except Exception:
+            self._dirty = True
+            self._timed_out = True
             raise
         self._id = 0
         self._first_timeout = connect_timeout
+        self._timed_out = False
+        self._dirty = False
 
     def _reset_session(self) -> None:
         """Abandon a dirty session: let the remote finish, then reconnect.
