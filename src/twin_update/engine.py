@@ -643,20 +643,41 @@ class Engine:
                                      "lists": "fresh" if use_fresh else "system"}
         return out
 
-    def notice_due(self, kind: str, signature: str) -> bool:
-        """True (and recorded) unless the same notice was already sent today."""
+    def _notice_state(self) -> dict:
         path = os.path.join(self.cfg.state_dir, "check-notices.json")
         raw = self.sys.read_text(path)
         try:
             seen = json.loads(raw) if raw else {}
         except ValueError:
             seen = {}
+        return seen if isinstance(seen, dict) else {}
+
+    def notice_due(self, kind: str, signature: str = "") -> bool:
+        """True unless a notice of this kind was already recorded today.
+
+        Read-only: does not write. Reminders repeat each calendar day while
+        updates remain pending.
+        """
+        del signature
         today = time.strftime("%Y-%m-%d", time.localtime(self.sys.now()))
-        if seen.get(kind) == {"date": today, "sig": signature}:
-            return False
-        seen[kind] = {"date": today, "sig": signature}
+        rec = self._notice_state().get(kind) or {}
+        return rec.get("date") != today
+
+    def record_notice(self, kind: str, signature: str = "") -> dict:
+        """Record that a window was opened (call only after launch+verify)."""
+        seen = self._notice_state()
+        today = time.strftime("%Y-%m-%d", time.localtime(self.sys.now()))
+        seen[kind] = {"date": today, "sig": signature, "handed_at": int(self.sys.now())}
+        path = os.path.join(self.cfg.state_dir, "check-notices.json")
         self.sys.write_private(path, json.dumps(seen, indent=2, sort_keys=True))
-        return True
+        return {"ok": True}
+
+    def last_window_opened(self) -> str | None:
+        rec = self._notice_state().get("updates") or {}
+        ts = rec.get("handed_at")
+        if not ts:
+            return None
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
 
     def _count_launch(self, app: App, st: dict, tree: dict, procs) -> None:
         starts = sorted(procs[p].start for p in tree["mains"])
@@ -741,6 +762,9 @@ class Engine:
         app = self._apps([app_name])[0]
         if app.name in self.cfg.no_launch:
             return {"ok": True, "skipped": "no_launch: never started by twin-update"}
+        if self.running(app_name):
+            return {"ok": False,
+                    "reason": "app is running again; not killing a user-launched instance"}
         worker_root = os.path.join(self.sys.home(), ".config/Cursor/User/globalStorage/anysphere.cursor-agent-worker")
         def worker(p):
             return any(os.path.isabs(v) and os.path.realpath(v).startswith(worker_root + "/")
@@ -764,7 +788,9 @@ class Engine:
             waited += 1.0
             a = self.sys.run(["systemctl", "--user", "is-active", unit], env=env)
             if a.out.strip() not in ("active", "activating"):
-                stayed = False
+                # Single-instance apps often exit the transient unit after
+                # handing off to the already-started process.
+                stayed = self.running(app_name)
                 break
         j = self.sys.run(["journalctl", "--user", "-u", unit, "--no-pager", "-o", "cat"], env=env)
         crashed = bool(CRASH_RE.search(j.out))
@@ -935,4 +961,20 @@ class Engine:
         env = self._user_env()
         r = self.sys.run(["systemctl", "--user", "show-environment"], env=env, timeout=15)
         checks["graphical_session"] = r.ok and ("WAYLAND_DISPLAY=" in r.out or "DISPLAY=" in r.out)
+        from twin_update.notice import launcher_name
+        checks["terminal_launcher"] = launcher_name(self.sys.which)
+        en = self.sys.run(["systemctl", "--user", "is-enabled", "twin-update-check.timer"],
+                          env=env, timeout=15)
+        checks["check_timer"] = en.ok and en.out.strip() in {
+            "enabled", "enabled-runtime", "linked", "linked-runtime", "static"}
+        show = self.sys.run(
+            ["systemctl", "--user", "show", "twin-update-check.timer",
+             "--property=UnitFileState,NextElapseUSecRealtime,ActiveState"],
+            env=env, timeout=15)
+        nxt = None
+        for line in show.out.splitlines():
+            if line.startswith("NextElapseUSecRealtime=") and line.split("=", 1)[1] not in ("", "0"):
+                nxt = line.split("=", 1)[1]
+        checks["check_timer_next"] = nxt
+        checks["last_window"] = self.last_window_opened() or "none"
         return checks

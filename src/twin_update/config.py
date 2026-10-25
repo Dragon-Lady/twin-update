@@ -79,6 +79,7 @@ class Config:
     smoke_s: float = 20.0
     apt_lock_timeout_s: int = 300
     lock_wait_s: float = 600.0
+    rollback_prompt_s: float = 60.0
     store: str = "~/.local/share/twin-update/rollback"
     state_dir: str = "~/.local/state/twin-update"
     search_dirs: list[str] = field(default_factory=lambda: ["~/Downloads"])
@@ -198,6 +199,7 @@ def load(path: str | None = None, home: str | None = None, text: str | None = No
         smoke_s=float(t.get("smoke_s", 20)),
         apt_lock_timeout_s=int(t.get("apt_lock_s", 300)),
         lock_wait_s=float(t.get("lock_wait_s", 600)),
+        rollback_prompt_s=float(t.get("rollback_prompt_s", 60)),
         store=_expand(r.get("store", "~/.local/share/twin-update/rollback"), home),
         state_dir=_expand(data.get("state_dir", "~/.local/state/twin-update"), home),
         search_dirs=[_expand(p, home) for p in r.get("search_dirs", ["~/Downloads"])],

@@ -30,8 +30,9 @@ use `desktop-a` and `laptop-b`.
   in time, the run **aborts on both machines before anything is updated**.
 * **Rollback copy before every update**, verified against what dpkg installed;
   no verified copy on either machine means the app is skipped on both.
-* **Nothing resident.** No daemon, timer or listener; apps close only inside a
-  run you start.
+* **Nothing resident.** No daemon. An optional user timer can open one
+  terminal window for the daily prompt; apps close only inside a run you
+  start or confirm.
 * It restores program files, not app data (see below).
 
 ## What a run does
@@ -67,30 +68,33 @@ twin-update run [--apps cursor,chatgpt] [--dry-run]
    <pkg>=<version>`. Nothing is copied between machines.
 7. **Verify**: dpkg version, `dpkg -V`, and a launch smoke test in the graphical
    session (`systemd-run --user`): stays up `smoke_s` seconds, no crash in the
-   journal, closes gracefully. On failure you are offered a rollback.
+   journal, closes gracefully. On failure you are offered a rollback (the question times out to no).
 8. **Reopen** only the apps that were open before.
 9. **Prune**: exactly one rollback copy per app is kept (the version before the
    latest update). Older copies are removed only after the new version passed
    its checks **and** a grace period (7 days or 2 good launches).
 10. **Report**: `~/.local/state/twin-update/runs/<ts>-run.json` (0600, machine
-    labels only) on both machines, plus a desktop notification such as
+    labels only) on both machines, plus a desktop notice such as
     `Cursor laptop-b 2.4.1→2.5.0 ✓` (via `notify-send`, or `gdbus`
-    when `notify-send` is not installed).
+    when `notify-send` is not installed). Daily update reminders use a
+    terminal window (`twin-update prompt`), not notification buttons.
 
-Apps are only ever closed inside a run you start. There is no daemon, timer,
-watcher or listener; the ssh session to the other machine exists only for the run.
-The run moves itself into its own `systemd-run --user --scope`, so closing the
-app whose terminal launched it does not stop it.
+Apps are only ever closed inside a run you start or confirm. There is no
+resident daemon. An optional user timer may open one prompt window; the ssh
+session to the other machine exists only for the command. The run moves
+itself into its own `systemd-run --user --scope`, so closing the app whose
+terminal launched it does not stop it.
 
 ## Other commands
 
 ```
 twin-update check [--notify] [--json]      # read-only: are updates available? (no sudo)
+twin-update prompt [--test]                # ask Update now? [y/N] (used by check --notify)
 twin-update status [--local-only]          # per machine/app: installed, candidate, running, rollback copy, hold
 twin-update rollback <app> [--machine <label>|both] [--dry-run] [--no-hold]
 twin-update holds
 twin-update unhold <app> [--machine ...] [--dry-run]
-twin-update doctor                         # identity, sudo group, apt idle, locks, session, ssh; exit 4 on problems
+twin-update doctor                         # identity, sudo group, apt idle, locks, session, terminal, timer; exit 4 on problems
 twin-update local --serve                  # per-machine engine; the peer runs this over ssh
 ```
 
@@ -110,10 +114,24 @@ skips the fetch. It never asks for sudo, closes nothing, installs nothing and
 stores no rollback copies. (`twin-update run` still refreshes and installs
 with the system apt, as root.)
 
-With `--notify` it sends a desktop notification **on the machine it runs on**
-when updates are available, or a short "check incomplete" notice when the
-other machine could not be reached or an error occurred. The same notice is
-sent at most once per day (state in `~/.local/state/twin-update/`).
+With `--notify` it opens a **terminal window** on the machine it runs on
+when updates are available (cosmic-term if present, else
+x-terminal-emulator). That window runs `twin-update prompt`: it re-checks,
+lists pending apps and versions, warns that updating closes those apps on
+both machines for about 10 minutes, and asks `Update now? [y/N]`. Only a
+typed `y` starts `twin-update run` in the same window. N, Enter, EOF or
+closing the window does nothing; the window opens again the next day while
+updates remain pending. The timer service is not a graphical session, so
+the window is started with WAYLAND_DISPLAY, DISPLAY, XDG_RUNTIME_DIR and
+DBUS_SESSION_BUS_ADDRESS from the running user session. If no graphical
+session is up, nothing is recorded and the next login retries
+(`Persistent=true`). A lock/pid file keeps a second fire from stacking
+windows. A plain, button-less desktop notice is only an extra reminder
+("Updates waiting: see the Twin Update window"). The same window is opened
+at most once per calendar day (state in `~/.local/state/twin-update/`).
+
+`twin-update prompt --test` opens the same style of window with a fake
+pending list and "Test only, nothing will be updated".
 
 Unreachable machines are reported in plain words: name lookup failed, ssh
 login refused, connection refused, Tailscale SSH asked for an interactive
@@ -123,8 +141,7 @@ Exit codes for `check`: **0** no updates, **10** updates available (also when
 only one machine could be checked), **1** check incomplete (error or other
 machine unreachable, and no updates found), **2** usage or config error.
 
-Example user timer (no root needed; runs while you are logged in, or always
-with lingering enabled):
+The package ships the units (also under `twin_update/systemd/`):
 
 ```ini
 # ~/.config/systemd/user/twin-update-check.service
@@ -133,6 +150,7 @@ Description=Twin Update: daily read-only update check
 
 [Service]
 Type=oneshot
+KillMode=process
 ExecStart=%h/.local/bin/twin-update check --notify
 SuccessExitStatus=10
 TimeoutStartSec=5min
@@ -152,6 +170,10 @@ WantedBy=timers.target
 ```
 
 `systemctl --user daemon-reload && systemctl --user enable --now twin-update-check.timer`
+
+`SuccessExitStatus=10` is required because `check` exits 10 when updates
+are available. `KillMode=process` keeps the prompt window alive after the
+oneshot service finishes.
 
 `rollback` checks the stored copy's sha256, closes the app gracefully, installs
 it with `apt-get install --allow-downgrades ./<deb>`, sets `apt-mark hold`

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "twin-update"
-version = "0.3.0"
+version = "0.4.0"
 description = "Close, update and verify the same apt-packaged desktop apps on two Linux machines in one run, with a verified one-command rollback."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -39,3 +39,6 @@ twin-update = "twin_update.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+twin_update = ["systemd/*.service", "systemd/*.timer"]

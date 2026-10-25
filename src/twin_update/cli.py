@@ -1,4 +1,4 @@
-"""Command line: twin-update status|run|rollback|holds|unhold|doctor|local."""
+"""Command line: twin-update status|run|rollback|holds|unhold|check|prompt|doctor|local."""
 
 from __future__ import annotations
 
@@ -6,11 +6,12 @@ import argparse
 import getpass
 import json
 import os
+import select
 import shutil
 import signal
 import sys
 
-from twin_update import __version__, orchestrator
+from twin_update import __version__, notice, orchestrator
 from twin_update.config import ConfigError, load
 from twin_update.engine import Engine
 from twin_update.peer import LocalPeer, PeerError, SshPeer, serve
@@ -27,13 +28,26 @@ class ConsoleUI:
     def getpass(self, prompt: str) -> str:
         return getpass.getpass(prompt)
 
-    def confirm(self, prompt: str) -> bool:
+    def confirm(self, prompt: str, timeout_s: float | None = None) -> bool:
         if not sys.stdin.isatty():
             return False
         try:
-            return input(prompt + " [y/N] ").strip().lower() in ("y", "yes")
+            if timeout_s is None:
+                return input(prompt + " [y/N] ").strip().lower() in ("y", "yes")
+            print(prompt + " [y/N] ", end="", flush=True)
+            ready, _, _ = select.select([sys.stdin], [], [], timeout_s)
+            if not ready:
+                print("(timed out; defaulting to no)", flush=True)
+                return False
+            return sys.stdin.readline().strip().lower() in ("y", "yes")
         except (EOFError, OSError):
             return False
+
+    def pause(self, msg: str = "Press Enter to close.") -> None:
+        try:
+            input(msg + " ")
+        except (EOFError, OSError):
+            pass
 
 
 def _detach_if_needed(args) -> None:
@@ -112,7 +126,13 @@ def _print(ui, data, as_json: bool) -> None:
                     for path, state in v.items():
                         ui.say(f"{l:8} lock {path}: {state}")
                 elif k == "notify_tool":
-                    ui.say(f"{l:8} notify: {v or 'none (notifications skipped)'}")
+                    ui.say(f"{l:8} notify: {v or 'none (info only)'}")
+                elif k == "terminal_launcher":
+                    ui.say(f"{l:8} terminal: {v or 'NO'}")
+                elif k == "check_timer_next":
+                    ui.say(f"{l:8} timer next: {v or 'unknown'}")
+                elif k == "last_window":
+                    ui.say(f"{l:8} last window: {v or 'none'}")
                 elif k != "locks_ok":
                     ui.say(f"{l:8} {k:18} {'ok' if v else 'NO'}")
         for l, why in data.get("unreachable", {}).items():
@@ -124,6 +144,16 @@ def _print(ui, data, as_json: bool) -> None:
             ui.say(f"{l:8} problems: {'; '.join(ps)}")
         ui.say("result: all checks ok" if data.get("ok") else "result: problems found (exit 4)")
         return
+    if kind == "prompt":
+        if data.get("window"):
+            ui.say(f"window: {data['window']}")
+        if data.get("launcher"):
+            ui.say(f"launcher: {data['launcher']}")
+        if data.get("answer") is not None:
+            ui.say(f"answer: {data['answer']}")
+        elif data.get("opened"):
+            ui.say("answer: given in the Twin Update window")
+        return
     if kind == "check":
         for l, m in data.get("machines", {}).items():
             ui.say(f"{l:8} {_lists_line(m.get('lists'), m.get('apt_lists_age_h'))}")
@@ -133,7 +163,7 @@ def _print(ui, data, as_json: bool) -> None:
             ui.say(f"{l:8} error: {why}")
         n = data.get("notification")
         if n:
-            ui.say(f"notification: {n}")
+            ui.say(f"window: {n}")
         ui.say({"updates": "result: updates available (run: twin-update run)",
                 "none": "result: no updates",
                 "error": "result: check incomplete"}[data["result"]])
@@ -201,8 +231,14 @@ def main(argv=None, ui=None, system=None, peer_factory=SshPeer) -> int:
     p.add_argument("--no-fetch", action="store_true",
                    help="use the system apt lists as they are (no user-level fetch)")
     p.add_argument("--notify", action="store_true",
-                   help="desktop notification on this machine if updates are available "
-                        "(errors: at most one notice per day)")
+                   help="open a terminal prompt on this machine if updates are available")
+    p = sub.add_parser("prompt", help="ask whether to run an update (used by check --notify)")
+    common(p)
+    p.add_argument("--test", action="store_true",
+                   help="open a harmless test window; nothing is updated")
+    p.add_argument("--inside", action="store_true",
+                   help="run the prompt in this terminal (do not open another window)")
+    p.add_argument("--slot", default=None, help=argparse.SUPPRESS)
     p = sub.add_parser("doctor"); common(p)
     p = sub.add_parser("local", help="per-machine engine (used by the peer over ssh)")
     p.add_argument("--serve", action="store_true")
@@ -231,6 +267,15 @@ def main(argv=None, ui=None, system=None, peer_factory=SshPeer) -> int:
                 return 2
             return serve(Engine(cfg, system, me), sys.stdin.buffer, sys.stdout.buffer)
 
+        if args.cmd == "prompt" and args.test and not args.inside:
+            data = _prompt_test_launch(ui, system, args.config)
+            _print(ui, data, getattr(args, "json", False))
+            return 0 if data.get("opened") else 1
+        if args.cmd == "prompt" and args.test and args.inside:
+            data = _prompt_inside(ui, test=True, slot=args.slot, system=system)
+            _print(ui, data, getattr(args, "json", False))
+            return data.get("exit_code", 0)
+
         if args.cmd in ("run", "rollback") and not args.dry_run:
             if getattr(args, "local_only", False):
                 ui.say("--local-only is allowed only with --dry-run")
@@ -257,7 +302,9 @@ def main(argv=None, ui=None, system=None, peer_factory=SshPeer) -> int:
             elif args.cmd == "check":
                 data = orchestrator.check(sess, unreachable, fresh=not args.no_fetch)
                 if args.notify:
-                    data["notification"] = _check_notify(sess, me, data)
+                    data["notification"] = _check_notify(sess, me, data, system, args.config)
+            elif args.cmd == "prompt":
+                data = _prompt_here(args, ui, sess, unreachable, system, peer_factory)
             elif args.cmd == "holds":
                 data = orchestrator.holds(sess)
             elif args.cmd == "unhold":
@@ -276,6 +323,8 @@ def main(argv=None, ui=None, system=None, peer_factory=SshPeer) -> int:
     _print(ui, data, args.json)
     if data.get("kind") == "check":
         return data["exit_code"]
+    if data.get("kind") == "prompt":
+        return data.get("exit_code", 0)
     if data.get("kind") == "doctor":
         return 0 if data.get("ok") else 4
     res = data.get("result")
@@ -307,26 +356,135 @@ def _lists_line(lists: dict | None, age_h) -> str:
     return line
 
 
-def _check_notify(sess, me: str, data: dict) -> str:
-    """Notify on this machine only. Same notice at most once per day."""
+def _check_notify(sess, me: str, data: dict, system, config_path: str | None) -> str:
+    """Open a prompt window on this machine. Same window at most once per day."""
     local = sess.peers[me]
     if data["updates"]:
-        summary = "Twin Update: updates available"
-        body = "\n".join(data["summary"])
-        if data["errors"]:
-            body += "\nNot checked: " + ", ".join(sorted(data["errors"]))
-        body += "\nRun: twin-update run"
-        kind, sig = "updates", body
+        kind, sig = "updates", "\n".join(data["summary"])
     elif data["errors"]:
-        summary = "Twin Update: check incomplete"
+        if not local.call("notice_due", kind="error", signature=",".join(sorted(data["errors"]))):
+            return "already noted today"
         body = "\n".join(f"{l}: {why}" for l, why in sorted(data["errors"].items()))
-        kind, sig = "error", ",".join(sorted(data["errors"]))
+        r = local.call("notify", summary="Twin Update: check incomplete", body=body)
+        if r.get("ok"):
+            local.call("record_notice", kind="error", signature=",".join(sorted(data["errors"])))
+            return "check incomplete (no window)"
+        return f"failed ({r.get('reason') or r.get('tool')})"
     else:
         return "none needed"
     if not local.call("notice_due", kind=kind, signature=sig):
-        return "skipped (same notice already sent today)"
-    r = local.call("notify", summary=summary, body=body)
-    return f"sent via {r.get('tool')}" if r.get("ok") else f"failed ({r.get('reason') or r.get('tool')})"
+        return "already opened a window today"
+    env = notice.graphical_env(system)
+    if not env:
+        return "no graphical session; will retry at next login"
+    slot = notice.window_lock_path(sess.cfg.state_dir)
+    token = notice.try_begin_window(system, slot)
+    if token is None:
+        return "window already open"
+    try:
+        inner = notice.prompt_argv(config_path, test=False, slot=slot)
+        argv = notice.launcher_argv(system.which, inner)
+        if not argv:
+            return "failed (no cosmic-term or x-terminal-emulator)"
+        pid = notice.start_prompt_window(system, argv, env)
+        if pid is None:
+            return "failed (could not start the window)"
+        notice.write_window_pid(system, slot, pid, started=False)
+        if not notice.verify_window(system, slot, pid):
+            return "window exited immediately; not recorded"
+        local.call("record_notice", kind=kind, signature=sig)
+        try:
+            local.call("notify", summary=APP_NAME, body=notice.EXTRA_NOTIFY_BODY)
+        except Exception:
+            pass
+        return "opened a window"
+    finally:
+        system.unlock(token)
+
+
+APP_NAME = notice.APP_NAME
+
+
+def _open_prompt_window(system, config_path: str | None, state_dir: str,
+                        test: bool) -> dict:
+    env = notice.graphical_env(system)
+    if not env:
+        return {"kind": "prompt", "opened": False, "window": "no graphical session",
+                "answer": None}
+    slot = notice.window_lock_path(state_dir)
+    token = notice.try_begin_window(system, slot)
+    if token is None:
+        return {"kind": "prompt", "opened": False, "window": "window already open",
+                "answer": None}
+    try:
+        inner = notice.prompt_argv(config_path, test=test, slot=slot)
+        argv = notice.launcher_argv(system.which, inner)
+        if not argv:
+            return {"kind": "prompt", "opened": False,
+                    "window": "no cosmic-term or x-terminal-emulator", "answer": None}
+        pid = notice.start_prompt_window(system, argv, env)
+        if pid is None:
+            return {"kind": "prompt", "opened": False,
+                    "window": "could not start the window", "answer": None}
+        notice.write_window_pid(system, slot, pid, started=False)
+        opened = notice.verify_window(system, slot, pid)
+        return {"kind": "prompt", "opened": opened, "pid": pid,
+                "window": "opened a window" if opened else "window exited immediately",
+                "answer": None, "launcher": argv[0]}
+    finally:
+        system.unlock(token)
+
+
+def _prompt_test_launch(ui, system, config_path: str | None) -> dict:
+    """Open a test window. Read-only: no check, no run, no record."""
+    try:
+        cfg = load(config_path)
+        state_dir = cfg.state_dir
+    except ConfigError:
+        state_dir = os.path.join(system.home(), ".local/state/twin-update")
+    data = _open_prompt_window(system, config_path, state_dir, test=True)
+    data["test"] = True
+    return data
+
+
+def _prompt_inside(ui, test: bool, slot: str | None, system, items=None,
+                   run_fn=None) -> dict:
+    if slot:
+        notice.mark_started(system, slot, system.own_pid())
+    try:
+        if items is None:
+            items = list(notice.TEST_PENDING) if test else []
+        answer = notice.run_prompt(ui, items, test=test, run_fn=run_fn)
+        return {"kind": "prompt", "answer": answer, "opened": False,
+                "exit_code": 0, "result": answer}
+    finally:
+        if slot:
+            notice.clear_slot(system, slot)
+
+
+def _prompt_here(args, ui, sess, unreachable, system, peer_factory) -> dict:
+    """Re-check, then ask. Does not hold the sync lock while waiting."""
+    if args.slot:
+        notice.mark_started(system, args.slot, system.own_pid())
+    try:
+        data = orchestrator.check(sess, unreachable, fresh=not getattr(args, "no_fetch", False))
+        items = notice.items_from_check(data, sess.cfg.apps)
+        sess.close()
+
+        run_rc = [0]
+
+        def run_fn():
+            extra = ["--config", args.config] if args.config else []
+            run_rc[0] = main([*extra, "run", "--no-detach"], ui=ui, system=system,
+                             peer_factory=peer_factory)
+
+        answer = notice.run_prompt(ui, items, test=False, run_fn=run_fn)
+        return {"kind": "prompt", "answer": answer, "check": data,
+                "result": answer, "summary": data.get("summary") or [],
+                "exit_code": run_rc[0] if answer == "run" else 0}
+    finally:
+        if args.slot:
+            notice.clear_slot(system, args.slot)
 
 
 def _labels(choice: str, me: str, peer: str, sess) -> list[str]:

@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.4.0 (2026-10-25)
+
+- `check --notify` opens a terminal window running `twin-update prompt`
+  (cosmic-term, else x-terminal-emulator) instead of relying on notification
+  buttons. The prompt lists pending apps and versions, warns that updating
+  closes those apps on both machines for about 10 minutes, and asks
+  `Update now? [y/N]`. Only a typed `y` starts `twin-update run` in that
+  window; N, Enter, EOF or closing the window does nothing. The reminder
+  returns the next day while updates remain pending.
+- The timer unit is not a graphical session: the window is launched with
+  WAYLAND_DISPLAY, DISPLAY, XDG_RUNTIME_DIR and DBUS_SESSION_BUS_ADDRESS
+  from `systemctl --user show-environment`. If no graphical session is up,
+  nothing is recorded and the next login (Persistent=true) retries.
+- A single-window lock/pid file prevents stacked windows. The prompt does
+  not hold the sync lock while waiting; only `run` takes it.
+- A plain, button-less desktop notice is only an extra reminder
+  ("Updates waiting: see the Twin Update window").
+- A window is recorded only after launch and a short process check, not
+  when the launch call returns. Wording is "opened a window".
+- `twin-update prompt --test` opens the same style of window with a fake
+  pending list and "Test only, nothing will be updated".
+- `doctor` reports the graphical session, terminal launcher, timer next
+  fire, and last window-opened time. Notification-service state is info
+  only.
+- Smoke treats "transient unit exited and the app is running" as a
+  single-instance hand-off success. Before upgrade and before smoke, a
+  re-opened app is left alone and reported.
+- The rollback question after a failed check times out to no. Ctrl-C or a
+  dropped peer after close reopens the apps that were closed.
+- Package ships `twin-update-check.service` and `.timer` with
+  `SuccessExitStatus=10` and `KillMode=process`.
+
 ## 0.3.0 (2026-10-23)
 
 - Preserve per-app no-launch controls and default Cursor to close/update/stay closed.
