@@ -3,7 +3,7 @@
 ## 0.4.0 (2026-10-25)
 
 - `check --notify` opens a terminal window running `twin-update prompt`
-  (cosmic-term, else x-terminal-emulator) instead of relying on notification
+  (cosmic-term --no-daemon, else x-terminal-emulator) instead of relying on notification
   buttons. The prompt lists pending apps and versions, warns that updating
   closes those apps on both machines for about 10 minutes, and asks
   `Update now? [y/N]`. Only a typed `y` starts `twin-update run` in that
@@ -30,7 +30,8 @@
 - The rollback question after a failed check times out to no. Ctrl-C or a
   dropped peer after close reopens the apps that were closed.
 - Package ships `twin-update-check.service` and `.timer` with
-  `SuccessExitStatus=10` and `KillMode=process`.
+  `SuccessExitStatus=10`. cosmic-term is started with `--no-daemon` so
+  the window's main process stays alive.
 
 ## 0.3.0 (2026-10-23)
 

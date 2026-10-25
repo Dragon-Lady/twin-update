@@ -18,6 +18,7 @@ WINDOW_LOCK = "prompt.window"
 LAUNCH_VERIFY_S = 2.0
 ALREADY_UPDATED = "Nothing is pending (the other machine may already have updated)."
 TEST_ONLY = "Test only, nothing will be updated"
+TEST_NOTHING_RAN = "test only, nothing ran"
 EXTRA_NOTIFY_BODY = "Updates waiting: see the Twin Update window"
 UPDATE_NOW = "Update now?"
 GUI_KEYS = ("WAYLAND_DISPLAY", "DISPLAY", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS")
@@ -61,6 +62,10 @@ def launcher_argv(which: Callable[[str], str | None], inner: list[str]) -> list[
     if not name:
         return None
     script = "exec " + shlex.join(inner)
+    # cosmic-term forks and exits unless --no-daemon is set before -e;
+    # the systemd-run unit then has no living main process.
+    if name == "cosmic-term":
+        return [name, "--no-daemon", "-e", "bash", "-lc", script]
     return [name, "-e", "bash", "-lc", script]
 
 
@@ -235,7 +240,10 @@ def run_prompt(ui, items: list[dict], *, test: bool = False,
     if not yes:
         return "no"
     if test:
-        return "run"
+        ui.say(TEST_NOTHING_RAN)
+        if hasattr(ui, "pause"):
+            ui.pause("Press Enter to close.")
+        return "test"
     if run_fn is not None:
         run_fn()
         if hasattr(ui, "pause"):

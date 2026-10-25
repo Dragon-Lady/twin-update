@@ -3,8 +3,6 @@ Description=Twin Update: daily read-only update check
 
 [Service]
 Type=oneshot
-# The launched prompt window must outlive this oneshot.
-KillMode=process
 ExecStart=%h/.local/bin/twin-update check --notify
 SuccessExitStatus=10
 TimeoutStartSec=5min

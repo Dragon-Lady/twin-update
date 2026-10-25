@@ -149,7 +149,9 @@ def _print(ui, data, as_json: bool) -> None:
             ui.say(f"window: {data['window']}")
         if data.get("launcher"):
             ui.say(f"launcher: {data['launcher']}")
-        if data.get("answer") is not None:
+        if data.get("answer") == "test":
+            ui.say(notice.TEST_NOTHING_RAN)
+        elif data.get("answer") is not None:
             ui.say(f"answer: {data['answer']}")
         elif data.get("opened"):
             ui.say("answer: given in the Twin Update window")
