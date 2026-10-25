@@ -20,9 +20,11 @@
   mid-install, recover with `sudo dpkg --configure -a`. `doctor` warns
   when `/var/lib/dpkg/updates` is not empty.
 - A failed check records that version only and does not upgrade the other
-  machine. A newer candidate is still offered. A failed `apt-mark showhold`
-  does not erase the rejected-version record. A failed hold after a failed
-  check is reported.
+  machine. A hold placed by a rollback also suppresses only the rejected
+  version. A newer candidate is still offered. `twin-update unhold` clears
+  a leftover rejected-version record even when apt reports the package is
+  not held. A failed `apt-mark showhold` does not erase the record. A
+  failed hold after a failed check is reported.
 - Both machines need the same twin-update for a mixed `run` (0.4.1 or
   newer). A peer with no version stops before anything is closed and says
   how to install it. On rollback, an older peer that does not understand
@@ -33,6 +35,18 @@
   window waits for Enter.
 - Broken or unreadable state files (wrong JSON type, a directory in the
   way) are ignored. `doctor` names the file.
+- An unexpected error prints `internal error:` and a `details:` path, and
+  writes `last-error.log` in the state directory.
+- `doctor` also reports how long the update window has been open, a
+  reused slot pid, a failure to record today's prompt, a check-service
+  ExecStart that does not exist, and names an unreachable machine.
+- The prompt lists what will close on each machine (it says both machines
+  only when both need the same apps). If a machine could not be reached,
+  the question says that machine is unreachable and that an update would
+  wait or fail, then `Update now?`.
+- If no graphical session is up, nothing is recorded and the launch is
+  not retried until the next timer run. If a window is already open, the
+  check says since when.
 - The prompt prints `Checking...` and the real per-machine error when a
   check fails. The day is recorded only after the question is shown, not
   when the window launches. Only an explicit N/no closes without waiting
