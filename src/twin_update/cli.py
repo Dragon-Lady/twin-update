@@ -72,6 +72,23 @@ def _without_label(label: str, why: str) -> str:
     return why
 
 
+def _argv_cmd(argv) -> str | None:
+    """First positional token, skipping global flags. Used to hide internal commands."""
+    args = list(argv) if argv is not None else sys.argv[1:]
+    takes_value = {"--config"}
+    i = 0
+    while i < len(args):
+        tok = args[i]
+        if tok in takes_value and i + 1 < len(args):
+            i += 2
+            continue
+        if tok.startswith("-"):
+            i += 1
+            continue
+        return tok
+    return None
+
+
 def _build(args, ui, system=None, peer_factory=SshPeer):
     system = system or System()
     cfg = load(args.config)
@@ -133,6 +150,11 @@ def _print(ui, data, as_json: bool) -> None:
                     ui.say(f"{l:8} timer next: {v or 'unknown'}")
                 elif k == "last_window":
                     ui.say(f"{l:8} last window: {v or 'none'}")
+                elif k == "window_open_since":
+                    if v:
+                        ui.say(f"{l:8} window open since: {v}")
+                elif k in ("locks_ok", "window_stale", "unit_warnings"):
+                    continue
                 elif k != "locks_ok":
                     ui.say(f"{l:8} {k:18} {'ok' if v else 'NO'}")
         for l, why in data.get("unreachable", {}).items():
@@ -245,8 +267,10 @@ def main(argv=None, ui=None, system=None, peer_factory=SshPeer) -> int:
     p = sub.add_parser("local", help="per-machine engine (used by the peer over ssh)")
     p.add_argument("--serve", action="store_true")
     p.add_argument("--as", dest="as_label", default=None)
-    p = sub.add_parser("raft-upload", help=argparse.SUPPRESS)
-    p.add_argument("snapshot")
+    # Hide the internal raft helper from --help (SUPPRESS prints as "==SUPPRESS==").
+    if _argv_cmd(argv) == "raft-upload":
+        p = sub.add_parser("raft-upload")
+        p.add_argument("snapshot")
 
     args = ap.parse_args(argv)
     system = system or System()
@@ -378,14 +402,14 @@ def _check_notify(sess, me: str, data: dict, system, config_path: str | None) ->
         return "already opened a window today"
     env = notice.graphical_env(system)
     if not env:
-        return "no graphical session; will retry at next login"
-    slot = notice.window_lock_path(sess.cfg.state_dir)
+        return "no graphical session; not retried until the next timer run"
+    slot = notice.window_lock_path(sess.cfg.state_dir, test=False)
     token = notice.try_begin_window(system, slot)
     if token is None:
-        return "window already open"
+        return notice.already_open_message(system, slot)
     try:
         inner = notice.prompt_argv(config_path, test=False, slot=slot)
-        argv = notice.launcher_argv(system.which, inner)
+        argv = notice.launcher_argv(system.which, inner, realpath=system.realpath)
         if not argv:
             return "failed (no cosmic-term or x-terminal-emulator)"
         pid = notice.start_prompt_window(system, argv, env)
@@ -393,8 +417,9 @@ def _check_notify(sess, me: str, data: dict, system, config_path: str | None) ->
             return "failed (could not start the window)"
         notice.write_window_pid(system, slot, pid, started=False)
         if not notice.verify_window(system, slot, pid):
+            notice.clear_slot(system, slot)
             return "window exited immediately; not recorded"
-        local.call("record_notice", kind=kind, signature=sig)
+        # The day is recorded inside the window after the question is shown.
         try:
             local.call("notify", summary=APP_NAME, body=notice.EXTRA_NOTIFY_BODY)
         except Exception:
@@ -413,14 +438,15 @@ def _open_prompt_window(system, config_path: str | None, state_dir: str,
     if not env:
         return {"kind": "prompt", "opened": False, "window": "no graphical session",
                 "answer": None}
-    slot = notice.window_lock_path(state_dir)
+    slot = notice.window_lock_path(state_dir, test=test)
     token = notice.try_begin_window(system, slot)
     if token is None:
-        return {"kind": "prompt", "opened": False, "window": "window already open",
+        return {"kind": "prompt", "opened": False,
+                "window": notice.already_open_message(system, slot),
                 "answer": None}
     try:
         inner = notice.prompt_argv(config_path, test=test, slot=slot)
-        argv = notice.launcher_argv(system.which, inner)
+        argv = notice.launcher_argv(system.which, inner, realpath=system.realpath)
         if not argv:
             return {"kind": "prompt", "opened": False,
                     "window": "no cosmic-term or x-terminal-emulator", "answer": None}
@@ -430,6 +456,8 @@ def _open_prompt_window(system, config_path: str | None, state_dir: str,
                     "window": "could not start the window", "answer": None}
         notice.write_window_pid(system, slot, pid, started=False)
         opened = notice.verify_window(system, slot, pid)
+        if not opened:
+            notice.clear_slot(system, slot)
         return {"kind": "prompt", "opened": opened, "pid": pid,
                 "window": "opened a window" if opened else "window exited immediately",
                 "answer": None, "launcher": argv[0]}
@@ -466,24 +494,47 @@ def _prompt_inside(ui, test: bool, slot: str | None, system, items=None,
 
 def _prompt_here(args, ui, sess, unreachable, system, peer_factory) -> dict:
     """Re-check, then ask. Does not hold the sync lock while waiting."""
+    del peer_factory
     if args.slot:
         notice.mark_started(system, args.slot, system.own_pid())
+    ui.say(notice.CHECKING)
+    run_rc = [0]
     try:
-        data = orchestrator.check(sess, unreachable, fresh=not getattr(args, "no_fetch", False))
+        try:
+            data = orchestrator.check(sess, unreachable,
+                                     fresh=not getattr(args, "no_fetch", False))
+        except Exception as exc:
+            ui.say(str(exc))
+            if hasattr(ui, "pause"):
+                ui.pause("Press Enter to close.")
+            return {"kind": "prompt", "answer": "error", "result": "error",
+                    "exit_code": 1, "error": str(exc)}
         items = notice.items_from_check(data, sess.cfg.apps)
+        errors = dict(data.get("errors") or {})
+        sig = "\n".join(data.get("summary") or [])
+        me = sess.order[0] if sess.order else None
+        local = sess.peers.get(me) if me else None
+
+        def on_shown():
+            if local is None:
+                return
+            try:
+                local.call("record_notice", kind="updates", signature=sig)
+            except Exception:
+                pass
+
         sess.close()
 
-        run_rc = [0]
-
         def run_fn():
-            extra = ["--config", args.config] if args.config else []
-            run_rc[0] = main([*extra, "run", "--no-detach"], ui=ui, system=system,
-                             peer_factory=peer_factory)
+            env = notice.graphical_env(system) or system.env()
+            run_rc[0] = notice.start_and_follow_run(
+                system, notice.run_argv(args.config), env, ui)
 
-        answer = notice.run_prompt(ui, items, test=False, run_fn=run_fn)
+        answer = notice.run_prompt(ui, items, test=False, run_fn=run_fn,
+                                   errors=errors, on_shown=on_shown)
         return {"kind": "prompt", "answer": answer, "check": data,
                 "result": answer, "summary": data.get("summary") or [],
-                "exit_code": run_rc[0] if answer == "run" else 0}
+                "exit_code": run_rc[0] if answer == "run" else (1 if answer == "error" else 0)}
     finally:
         if args.slot:
             notice.clear_slot(system, args.slot)

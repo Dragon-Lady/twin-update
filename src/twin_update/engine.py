@@ -17,6 +17,7 @@ import re
 import time
 from typing import Callable
 
+from twin_update import __version__
 from twin_update.config import App, Config
 from twin_update.system import Proc, System
 
@@ -94,7 +95,8 @@ class Engine:
         return {"label": self.label, "user_ok": user == me.user,
                 "machine_id_ok": (not me.machine_id_sha256) or me.machine_id_sha256 == mid,
                 "machine_id_pinned": bool(me.machine_id_sha256), "ok": ok,
-                "groups_sudo": "sudo" in self.sys.groups()}
+                "groups_sudo": "sudo" in self.sys.groups(),
+                "version": __version__}
 
     # ----------------------------------------------------------------- sudo
     def set_password(self, password: str) -> dict:
@@ -287,8 +289,23 @@ class Engine:
                     changed = True
         return own
 
-    def running(self, app_name: str) -> bool:
-        return bool(self.app_tree(self._apps([app_name])[0])["tree"])
+    def _is_main_exe(self, app: App, exe: str) -> bool:
+        """True for the app's real main binary, not a leftover helper under the same root."""
+        names = {app.name.lower(), app.package.lower()}
+        if app.launch:
+            if exe in app.launch:
+                return True
+            names.add(os.path.basename(app.launch[0]).lower())
+        return os.path.basename(exe).lower() in names
+
+    def running(self, app_name: str, main_only: bool = False) -> bool:
+        app = self._apps([app_name])[0]
+        tree = self.app_tree(app)
+        if not main_only:
+            return bool(tree["tree"])
+        procs = tree["procs"]
+        return any(self._is_main_exe(app, procs[pid].exe) for pid in tree["mains"]
+                   if pid in procs)
 
     def close_start(self, apps: list[str], dry: bool) -> dict:
         out = {}
@@ -664,7 +681,7 @@ class Engine:
         return rec.get("date") != today
 
     def record_notice(self, kind: str, signature: str = "") -> dict:
-        """Record that a window was opened (call only after launch+verify)."""
+        """Record that today's prompt question was shown (not merely launched)."""
         seen = self._notice_state()
         today = time.strftime("%Y-%m-%d", time.localtime(self.sys.now()))
         seen[kind] = {"date": today, "sig": signature, "handed_at": int(self.sys.now())}
@@ -762,7 +779,7 @@ class Engine:
         app = self._apps([app_name])[0]
         if app.name in self.cfg.no_launch:
             return {"ok": True, "skipped": "no_launch: never started by twin-update"}
-        if self.running(app_name):
+        if self.running(app_name, main_only=True):
             return {"ok": False,
                     "reason": "app is running again; not killing a user-launched instance"}
         worker_root = os.path.join(self.sys.home(), ".config/Cursor/User/globalStorage/anysphere.cursor-agent-worker")
@@ -779,18 +796,28 @@ class Engine:
         threshold = None
         if app.name == "cursor":
             main = self.sys.run(["systemctl", "--user", "show", unit, "--property=MainPID", "--value"], env=env, timeout=10)
-            p = self.sys.procs().get(int(main.out.strip())) if main.out.strip().isdigit() else None
-            threshold = p.start if p else None
+            raw_pid = main.out.strip()
+            if raw_pid.isdigit() and int(raw_pid) > 0:
+                p = self.sys.procs().get(int(raw_pid))
+                threshold = p.start if p else None
         stayed = True
         waited = 0.0
+        handed = False
         while waited < self.cfg.smoke_s:
             self.sys.sleep(1.0)
             waited += 1.0
             a = self.sys.run(["systemctl", "--user", "is-active", unit], env=env)
-            if a.out.strip() not in ("active", "activating"):
+            active = a.out.strip() in ("active", "activating")
+            if not active:
                 # Single-instance apps often exit the transient unit after
-                # handing off to the already-started process.
-                stayed = self.running(app_name)
+                # handing off to the already-started process. Keep watching
+                # the rest of the interval so a later crash is not missed.
+                if not self.running(app_name):
+                    stayed = False
+                    break
+                handed = True
+            if handed and not self.running(app_name):
+                stayed = False
                 break
         j = self.sys.run(["journalctl", "--user", "-u", unit, "--no-pager", "-o", "cat"], env=env)
         crashed = bool(CRASH_RE.search(j.out))
@@ -798,7 +825,7 @@ class Engine:
         wait = self.close_wait([app.name], self.cfg.close_timeout_s)[app.name]
         ok = stayed and not crashed and wait["closed"]
         res = {"ok": ok, "stayed_up_s": waited if stayed else waited - 1, "crash_in_journal": crashed,
-               "closed_gracefully": wait["closed"]}
+               "closed_gracefully": wait["closed"], "handoff": handed}
         if app.name == "cursor":
             res["stray_reaped"] = []
             if threshold is not None:
@@ -977,4 +1004,22 @@ class Engine:
                 nxt = line.split("=", 1)[1]
         checks["check_timer_next"] = nxt
         checks["last_window"] = self.last_window_opened() or "none"
+        from twin_update import notice
+        slot = notice.window_lock_path(self.cfg.state_dir)
+        stale, since = notice.slot_stale(self.sys, slot)
+        checks["window_stale"] = stale
+        checks["window_open_since"] = since
+        svc_path = os.path.join(self.sys.home(), ".config/systemd/user/twin-update-check.service")
+        tmr_path = os.path.join(self.sys.home(), ".config/systemd/user/twin-update-check.timer")
+        svc_text = self.sys.read_text(svc_path)
+        tmr_text = self.sys.read_text(tmr_path)
+        if svc_text is None:
+            cat = self.sys.run(["systemctl", "--user", "cat", "twin-update-check.service"],
+                               env=env, timeout=15)
+            svc_text = cat.out if cat.ok and cat.out.strip() else None
+        if tmr_text is None:
+            cat = self.sys.run(["systemctl", "--user", "cat", "twin-update-check.timer"],
+                               env=env, timeout=15)
+            tmr_text = cat.out if cat.ok and cat.out.strip() else None
+        checks["unit_warnings"] = notice.unit_drift_warnings(svc_text, tmr_text)
         return checks

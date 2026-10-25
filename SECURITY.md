@@ -64,4 +64,4 @@ uncooperative external process from launching. The snapshot is discarded when
 activity is detected. Background export reads only the captured snapshot.
 Adapters and the configured destination are trusted operator-managed inputs.
 No existing nightly scripts, credentials, live database or remote files are
-modified by the draft build. Cursor remains in the default no-launch list.
+modified by this tool. Cursor remains in the default no-launch list.

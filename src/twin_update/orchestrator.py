@@ -63,6 +63,43 @@ def _identity(s: Session, rep: dict) -> None:
         raise Abort(f"identity check failed on: {', '.join(bad)} (whoami/machine-id vs config)")
 
 
+def _require_same_version(s: Session, rep: dict) -> None:
+    """Stop before any close when known twin-update versions differ."""
+    ids = rep.get("identity") or {}
+    known = {l: (ids.get(l) or {}).get("version") for l in s.order}
+    known = {l: v for l, v in known.items() if v}
+    if len(set(known.values())) > 1:
+        detail = ", ".join(f"{l} {v}" for l, v in known.items())
+        raise Abort(
+            f"twin-update versions differ ({detail}); "
+            "update both machines to the same version before running")
+
+
+def _optional_call(peer, op: str, **kw):
+    """Call a peer op; None if the peer is older and rejects the op."""
+    try:
+        return peer.call(op, **kw)
+    except PeerError as exc:
+        msg = str(exc)
+        if "op not allowed" in msg:
+            return None
+        if "unexpected keyword" in msg or "TypeError" in msg:
+            try:
+                return peer.call(op, **{k: v for k, v in kw.items()
+                                        if k in ("app_name",)})
+            except PeerError as exc2:
+                if "op not allowed" in str(exc2):
+                    return None
+                raise
+        raise
+
+
+def _running_again(peer, app_name: str) -> bool:
+    """True if the app's real main process is up. Older peers: treat as not running."""
+    got = _optional_call(peer, "running", app_name=app_name, main_only=True)
+    return bool(got)
+
+
 def _locks(s: Session, rep: dict, dry: bool, labels=None) -> None:
     res = s.both("acquire_locks", labels=labels, dry=dry, wait_s=0 if dry else s.cfg.lock_wait_s)
     rep["locks"] = res
@@ -226,6 +263,7 @@ def run(s: Session, apps, dry: bool, smoke: bool = True, unreachable=None) -> di
         if unreachable and not dry:
             raise Abort(rep["blockers"][0])
         _identity(s, rep)
+        _require_same_version(s, rep)
         if not dry:
             s.password(labels)
         _locks(s, rep, dry)
@@ -290,7 +328,7 @@ def run(s: Session, apps, dry: bool, smoke: bool = True, unreachable=None) -> di
         try:
             for app, p in todo.items():
                 for l in p["machines"]:
-                    if s.peers[l].call("running", app_name=app):
+                    if _running_again(s.peers[l], app):
                         raise Abort(
                             f"{s.cfg.apps[app].display} on {l} is running again; "
                             "not closing a user-launched instance")
@@ -346,6 +384,7 @@ def rollback(s: Session, app: str, labels, dry: bool, smoke: bool = True,
     rep["blockers"] = []
     try:
         _identity(s, rep)
+        _require_same_version(s, rep)
         targets = s.both("rollback_target", labels=labels, app_name=app)
         rep["targets"] = targets
         bad = [l for l, t in targets.items() if not t["ok"]]
@@ -368,7 +407,7 @@ def rollback(s: Session, app: str, labels, dry: bool, smoke: bool = True,
         res = {}
         try:
             for l in labels:
-                if s.peers[l].call("running", app_name=app):
+                if _running_again(s.peers[l], app):
                     raise Abort(
                         f"{s.cfg.apps[app].display} on {l} is running again; "
                         "not closing a user-launched instance")
@@ -428,7 +467,14 @@ def doctor_findings(checks: dict) -> tuple[list[str], list[str]]:
         elif k == "check_timer":
             if not v:
                 warnings.append("twin-update-check.timer is not enabled")
-        elif k in ("locks_ok", "check_timer_next", "last_window"):
+        elif k == "window_stale":
+            if v:
+                since = checks.get("window_open_since") or "an unknown time"
+                warnings.append(f"prompt window has been open since {since} (over 24 hours)")
+        elif k == "unit_warnings":
+            warnings.extend(v or [])
+        elif k in ("locks_ok", "check_timer_next", "last_window",
+                   "window_open_since"):
             continue
         elif k != "locks_ok" and isinstance(v, bool) and not v:
             problems.append(k)

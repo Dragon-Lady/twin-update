@@ -109,6 +109,15 @@ class FakeSystem(System):
         self.fresh_cands = {}     # pkg -> candidate seen by a fresh user-level fetch
         self.fresh_fail = None    # apt-get update error text, or None
         self.fetched = False
+        self.mainpid_zero_first = False
+        self._mainpid_reads = {}
+        self._lockfiles = set()
+        self.launcher_target = None  # realpath of x-terminal-emulator
+        self.smoke_crash_after = {}  # app -> seconds after start when a hand-off crashes
+        self._smoke_started_at = {}
+        self.journal_crash = set()
+        self.unit_files = {}  # name -> text for systemctl cat
+        self.run_units = []   # started twin-update-run-* units
 
     # identity
     def whoami(self): return self.user
@@ -170,18 +179,37 @@ class FakeSystem(System):
         return 42
 
     def try_lockfile(self, path):
-        if self.window_flock:
+        if self.window_flock or path in self._lockfiles:
             return None
         if not os.path.exists(path):
             os.makedirs(os.path.dirname(path), exist_ok=True)
             open(path, "w").close()
-        return 99
+        self._lockfiles.add(path)
+        return ("lockfile", path)
+
+    def realpath(self, path):
+        if self.launcher_target and str(path).endswith("x-terminal-emulator"):
+            return self.launcher_target
+        return os.path.realpath(path) if os.path.exists(path) else path
 
     def pid_alive(self, pid):
         return pid in self.alive_pids
 
+    def _maybe_smoke_crash(self, app):
+        after = self.smoke_crash_after.get(app)
+        started = self._smoke_started_at.get(app)
+        if after is None or started is None:
+            return
+        if self.clock.t - started >= after:
+            self.journal_crash.add(app)
+            doomed = [pid for pid, p in self.proc_table.items()
+                      if app in p.exe or os.path.basename(p.exe).lower() == app]
+            for pid in doomed:
+                self.proc_table.pop(pid, None)
+
     def unlock(self, fd):
-        pass
+        if isinstance(fd, tuple) and fd[0] == "lockfile":
+            self._lockfiles.discard(fd[1])
 
     # debs
     def make_deb(self, d, pkg, ver, arch="amd64", md5="m-"):
@@ -285,10 +313,17 @@ class FakeSystem(System):
                 if not self.spawn_dies_immediately:
                     self.alive_pids.add(pid)
                 return Result(0)
+            if unit.startswith("twin-update-run-"):
+                inner = argv[argv.index("--") + 1:] if "--" in argv else argv
+                self.run_units.append((unit, inner))
+                self.spawned.append((inner, None, None))
+                self.events.append((self.user, "RUN-UNIT", unit))
+                return Result(0)
             self.events.append((self.user, "LAUNCH", unit))
             if unit.startswith("twin-smoke-"):
                 app = unit[len("twin-smoke-"):].rsplit("-", 1)[0]
-                if app in self.smoke_handoff:
+                self._smoke_started_at[app] = self.clock.t
+                if app in self.smoke_handoff or app in self.smoke_crash_after:
                     exe = (self.files.get(app) or ["/usr/share/cursor/cursor"])[0]
                     self.add_app_procs(exe)
             return Result(0)
@@ -296,9 +331,12 @@ class FakeSystem(System):
             unit = argv[3] if len(argv) > 3 else ""
             if unit.startswith("twin-smoke-"):
                 app = unit[len("twin-smoke-"):].rsplit("-", 1)[0]
-                if app in self.smoke_handoff:
+                self._maybe_smoke_crash(app)
+                if app in self.smoke_handoff or app in self.smoke_crash_after:
                     return Result(3, "inactive")
                 return Result(0, "failed" if app in self.smoke_dies else "active")
+            if unit.startswith("twin-update-run-"):
+                return Result(3, "inactive")
             return Result(3, "inactive")
         if argv[:3] == ["systemctl", "--user", "is-enabled"]:
             return Result(0, "enabled\n")
@@ -306,15 +344,39 @@ class FakeSystem(System):
             if self.no_graphical:
                 return Result(0, "LANG=C\n")
             return Result(0, "WAYLAND_DISPLAY=wayland-1\nDISPLAY=:0\n")
+        if argv[:3] == ["systemctl", "--user", "cat"]:
+            name = argv[3] if len(argv) > 3 else ""
+            if name in self.unit_files:
+                return Result(0, self.unit_files[name])
+            return Result(1, "", "No files found")
         if argv[:3] == ["systemctl", "--user", "show"]:
             if any("twin-update-check.timer" in a for a in argv):
                 return Result(0, "UnitFileState=enabled\nActiveState=active\n"
                               "NextElapseUSecRealtime=Mon 2026-10-26 09:13:00 UTC\n")
-            for a in argv:
-                if a in self.prompt_pids:
-                    return Result(0, str(self.prompt_pids[a]) + "\n")
+            unit = next((a for a in argv[3:] if not a.startswith("--")), "")
+            if unit in self.prompt_pids:
+                n = self._mainpid_reads.get(unit, 0)
+                self._mainpid_reads[unit] = n + 1
+                pid = self.prompt_pids[unit]
+                if self.mainpid_zero_first and n == 0:
+                    pid = 0
+                return Result(0, f"MainPID={pid}\nActiveState=active\n")
+            if unit.startswith("twin-update-run-"):
+                return Result(0, "Result=success\nExecMainStatus=0\nActiveState=inactive\n")
             return Result(127, "", f"fake: unknown {argv}")
-        if cmd in ("journalctl", "notify-send", "gdbus"):
+        if cmd == "journalctl":
+            unit = ""
+            if "-u" in argv:
+                unit = argv[argv.index("-u") + 1]
+            app = ""
+            if unit.startswith("twin-smoke-"):
+                app = unit[len("twin-smoke-"):].rsplit("-", 1)[0]
+            if app in self.journal_crash or app in self.smoke_crash_after:
+                self._maybe_smoke_crash(app)
+                if app in self.journal_crash:
+                    return Result(0, "segmentation fault\n")
+            return Result(0, "")
+        if cmd in ("notify-send", "gdbus"):
             return Result(0, "")
         return Result(127, "", f"fake: unknown {argv}")
 

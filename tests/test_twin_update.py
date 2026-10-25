@@ -265,7 +265,16 @@ class RunFlow(unittest.TestCase):
         t.sys["machine-a"].smoke_handoff.add("chatgpt")
         res = t.eng["machine-a"].smoke("chatgpt")
         self.assertTrue(res["ok"], res)
+        self.assertTrue(res.get("handoff"))
+        self.assertGreaterEqual(res["stayed_up_s"], t.cfg.smoke_s - 1)
         self.assertFalse(t.eng["machine-a"].running("chatgpt"))
+
+    def test_smoke_handoff_then_crash_is_not_success(self):
+        t = Twin(); standard(t)
+        t.sys["machine-a"].smoke_crash_after["chatgpt"] = 2
+        res = t.eng["machine-a"].smoke("chatgpt")
+        self.assertFalse(res["ok"], res)
+        self.assertTrue(res.get("crash_in_journal") or not res.get("stayed_up_s"))
 
     def test_smoke_refuses_to_kill_a_user_launched_instance(self):
         t = Twin(); standard(t)
@@ -274,6 +283,62 @@ class RunFlow(unittest.TestCase):
         self.assertFalse(res["ok"])
         self.assertIn("user-launched", res["reason"])
         self.assertTrue(t.eng["machine-a"].running("chatgpt"))
+
+    def test_smoke_helper_is_not_a_user_relaunched_app(self):
+        t = Twin(); standard(t)
+        t.sys["machine-a"].proc_table[5000] = Proc(
+            5000, 1, "/usr/lib/chatgpt/resources/codex", "codex", 9)
+        res = t.eng["machine-a"].smoke("chatgpt")
+        self.assertTrue(res["ok"], res)
+
+    def test_mixed_versions_abort_before_close(self):
+        from twin_update.peer import PeerError
+        t = Twin(); standard(t)
+        t.sys["machine-a"].add_app_procs(CUR)
+        real = t.peers["machine-b"]
+
+        class Old:
+            def call(self, op, **kw):
+                if op == "identity":
+                    r = dict(real.call(op, **kw))
+                    r["version"] = "0.3.0"
+                    return r
+                if op == "running":
+                    raise PeerError("machine-b: op not allowed: running")
+                return real.call(op, **kw)
+
+            def close(self):
+                real.close()
+
+        t.peers["machine-b"] = Old()
+        rep = orchestrator.run(t.session(FakeUI()), ["cursor"], dry=False, smoke=False)
+        self.assertEqual(rep["result"], "aborted")
+        self.assertIn("versions differ", rep["error"])
+        self.assertEqual(kinds(t, "TERM"), [])
+        self.assertEqual(kinds(t, "INSTALL"), [])
+
+    def test_older_peer_without_running_still_updates(self):
+        from twin_update.peer import PeerError
+        t = Twin(); standard(t)
+        real = t.peers["machine-b"]
+
+        class Old:
+            def call(self, op, **kw):
+                if op == "identity":
+                    r = dict(real.call(op, **kw))
+                    r.pop("version", None)
+                    return r
+                if op == "running":
+                    raise PeerError("machine-b: op not allowed: running")
+                return real.call(op, **kw)
+
+            def close(self):
+                real.close()
+
+        t.peers["machine-b"] = Old()
+        rep = orchestrator.run(t.session(FakeUI()), ["cursor"], dry=False, smoke=False)
+        self.assertEqual(rep["result"], "ok")
+        self.assertTrue(kinds(t, "INSTALL"))
 
     def test_identity_mismatch_aborts(self):
         t = Twin(); standard(t)
@@ -757,9 +822,10 @@ class Check(unittest.TestCase):
         self.assertEqual(self._notifies(t, "machine-b"), [])
         rc, out = self._cli(t, ["--notify"])
         self.assertEqual(rc, 10)
-        self.assertIn("already opened a window today", out)
+        self.assertIn("window already open since", out)
         self.assertEqual(len(self._notifies(t)), 1)
         self.assertEqual(len(t.sys["machine-a"].spawned), 1)
+        self.assertTrue(t.eng["machine-a"].notice_due("updates", "x"))
         t.clock.t += 86400
         t.sys["machine-a"].alive_pids.clear()  # yesterday's window has closed
         self._cli(t, ["--notify"])

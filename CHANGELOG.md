@@ -1,5 +1,45 @@
 # Changelog
 
+## Unreleased
+
+- Test prompt windows use their own slot (`prompt.window.test`) so a leftover
+  test window cannot block the real daily window. `check --notify` says since
+  when a real window is already open. `doctor` warns if that real window has
+  been open for more than 24 hours. The slot file is written in place so the
+  flock is not dropped; a dead pid does not block a new window, and two
+  launchers cannot both start one.
+- The prompt prints "Checking..." before the re-check. A check error shows
+  the real per-machine error and waits for Enter; it never claims nothing is
+  pending. "Nothing pending" also waits for Enter. Only an explicit N closes
+  without a pause. The day is recorded after the question is shown, not when
+  the window is launched. If one machine is unreachable, the question names
+  that machine.
+- Window text lists closures per machine and only says "both machines" when
+  both need the update. Version jumps are joined with " / " like `check`.
+- A failed window launch is not retried until the next timer run.
+  `Persistent=true` only catches up a missed timer run.
+- `systemd-run --no-block` reporting MainPID 0 is treated as "still
+  starting" and polled briefly; only an inactive or failed unit is a launch
+  failure.
+- Smoke keeps watching for the rest of the interval after a single-instance
+  hand-off, so a later crash is not missed. The "app is running again" guard
+  matches the app's main process only, not leftover helpers.
+- `run` and `rollback` compare twin-update versions before closing anything
+  and stop if they differ. An older peer that rejects the `running` op is
+  tolerated (the old behaviour). Confirming `y` starts `run` in its own
+  user unit so closing the window cannot stop the update; the window follows
+  the unit and says so. Apps still reopen at the end of `run`.
+- Terminal fallback flags depend on the resolved launcher (gnome-terminal
+  style uses `--`). `doctor` warns when the installed check units lack
+  `SuccessExitStatus=10` or differ from the shipped units in a way that
+  matters. `twin-update --help` no longer shows a hidden `raft-upload`
+  line. The zipapp build is reproducible (fixed timestamps, honours
+  `SOURCE_DATE_EPOCH`).
+- Known limits: real visible windows, real systemd scope behaviour on a
+  desktop, and the first real timer run were not exercised here. Main-process
+  matching uses the launch binary and the app/package name; an unusual vendor
+  layout could still need a closer look.
+
 ## 0.4.0 (2026-10-25)
 
 - `check --notify` opens a terminal window running `twin-update prompt`
@@ -12,7 +52,8 @@
 - The timer unit is not a graphical session: the window is launched with
   WAYLAND_DISPLAY, DISPLAY, XDG_RUNTIME_DIR and DBUS_SESSION_BUS_ADDRESS
   from `systemctl --user show-environment`. If no graphical session is up,
-  nothing is recorded and the next login (Persistent=true) retries.
+  nothing is recorded; a failed launch is not retried until the next timer
+  run. Persistent=true only catches up a missed timer run.
 - A single-window lock/pid file prevents stacked windows. The prompt does
   not hold the sync lock while waiting; only `run` takes it.
 - A plain, button-less desktop notice is only an extra reminder

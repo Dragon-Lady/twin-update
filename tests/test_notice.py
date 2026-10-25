@@ -19,9 +19,41 @@ class Launcher(unittest.TestCase):
         argv = notice.launcher_argv(which, ["twin-update", "prompt"])
         self.assertEqual(argv[0], "x-terminal-emulator")
         self.assertNotIn("--no-daemon", argv)
+        self.assertEqual(argv[1], "-e")
+
+    def test_gnome_terminal_uses_double_dash(self):
+        which = lambda n: "/usr/bin/" + n if n == "x-terminal-emulator" else None
+        argv = notice.launcher_argv(which, ["twin-update", "prompt"],
+                                    realpath=lambda p: "/usr/bin/gnome-terminal")
+        self.assertEqual(argv[:3], ["x-terminal-emulator", "--", "bash"])
+        self.assertNotIn("-e", argv)
+
+    def test_terminal_flags_table(self):
+        expected = {
+            "cosmic-term": ["--no-daemon", "-e"],
+            "gnome-terminal": ["--"],
+            "gnome-terminal.wrapper": ["--"],
+            "kgx": ["--"],
+            "ptyxis": ["--"],
+            "xfce4-terminal": ["-x"],
+            "konsole": ["-e"],
+            "xterm": ["-e"],
+            "x-terminal-emulator": ["-e"],
+        }
+        for name, flags in expected.items():
+            self.assertEqual(notice.terminal_flags(name), flags)
 
     def test_none_when_no_launcher(self):
         self.assertIsNone(notice.launcher_argv(lambda n: None, ["twin-update"]))
+
+    def test_mainpid_zero_then_pid_is_success(self):
+        t = Twin(); s = t.sys["machine-a"]
+        s.mainpid_zero_first = True
+        env = notice.graphical_env(s)
+        argv = notice.launcher_argv(s.which, ["twin-update", "prompt"])
+        pid = notice.start_prompt_window(s, argv, env)
+        self.assertIsNotNone(pid)
+        self.assertGreater(pid, 0)
 
     def test_daemonized_launcher_is_not_a_successful_window(self):
         """Main pid exits at once while a child window pid lives; that is not success."""
@@ -82,6 +114,40 @@ class WindowLock(unittest.TestCase):
         path = notice.window_lock_path(t.cfg.state_dir)
         self.assertIsNone(notice.try_begin_window(s, path))
 
+    def test_inplace_write_keeps_flock(self):
+        t = Twin(); s = t.sys["machine-a"]
+        path = notice.window_lock_path(t.cfg.state_dir)
+        first = notice.try_begin_window(s, path)
+        self.assertIsNotNone(first)
+        notice.write_window_pid(s, path, 4001, started=False)
+        self.assertIsNone(notice.try_begin_window(s, path))
+        s.unlock(first)
+        s.alive_pids.discard(4001)
+        self.assertIsNotNone(notice.try_begin_window(s, path))
+
+    def test_dead_pid_does_not_block(self):
+        t = Twin(); s = t.sys["machine-a"]
+        path = notice.window_lock_path(t.cfg.state_dir)
+        notice.write_window_pid(s, path, 4242, started=True)
+        self.assertFalse(s.pid_alive(4242))
+        self.assertIsNotNone(notice.try_begin_window(s, path))
+
+    def test_real_flock_survives_inplace_write(self):
+        import tempfile
+        from twin_update.system import System
+        s = System()
+        tmpd = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, tmpd, True)
+        path = os.path.join(tmpd, "prompt.window")
+        fd = notice.try_begin_window(s, path)
+        self.assertIsNotNone(fd)
+        notice.write_window_pid(s, path, 1, started=False)
+        self.assertIsNone(s.try_lockfile(path))
+        s.unlock(fd)
+        second = s.try_lockfile(path)
+        self.assertIsNotNone(second)
+        s.unlock(second)
+
 
 class PromptAnswers(unittest.TestCase):
     def _items(self):
@@ -95,6 +161,44 @@ class PromptAnswers(unittest.TestCase):
         self.assertEqual(ans, "already-updated")
         self.assertIn(notice.ALREADY_UPDATED, ui.lines)
         self.assertEqual(ran, [])
+        self.assertTrue(any("Press Enter" in l for l in ui.lines))
+
+    def test_check_error_shows_real_text_and_pauses(self):
+        ui = FakeUI()
+        ran = []
+        ans = notice.run_prompt(ui, [], errors={"laptop": "timed out: the machine may be off"},
+                                run_fn=lambda: ran.append("run"))
+        self.assertEqual(ans, "error")
+        self.assertTrue(any("laptop: timed out" in l for l in ui.lines))
+        self.assertNotIn(notice.ALREADY_UPDATED, ui.lines)
+        self.assertEqual(ran, [])
+        self.assertTrue(any("Press Enter" in l for l in ui.lines))
+
+    def test_unreachable_status_in_question(self):
+        ui = FakeUI(confirm=False)
+        items = [{"display": "Cursor", "jump": "1\u21922", "where": "machine-a",
+                  "machines": ["machine-a"]}]
+        notice.run_prompt(ui, items, errors={"machine-b": "timed out: asleep"})
+        self.assertTrue(any("machine-b: unreachable" in p for p in ui.prompts))
+        self.assertTrue(any("Update now?" in p for p in ui.prompts))
+
+    def test_record_after_question_shown(self):
+        ui = FakeUI(confirm=False)
+        shown = []
+        notice.run_prompt(ui, self._items(), on_shown=lambda: shown.append(1))
+        self.assertEqual(shown, [1])
+
+    def test_no_record_when_nothing_pending(self):
+        ui = FakeUI()
+        shown = []
+        notice.run_prompt(ui, [], on_shown=lambda: shown.append(1))
+        self.assertEqual(shown, [])
+
+    def test_no_record_when_only_errors(self):
+        ui = FakeUI()
+        shown = []
+        notice.run_prompt(ui, [], errors={"x": "down"}, on_shown=lambda: shown.append(1))
+        self.assertEqual(shown, [])
 
     def test_yes_runs(self):
         ui = FakeUI(confirm=True)
@@ -102,8 +206,26 @@ class PromptAnswers(unittest.TestCase):
         ans = notice.run_prompt(ui, self._items(), run_fn=lambda: ran.append("run"))
         self.assertEqual(ans, "run")
         self.assertEqual(ran, ["run"])
-        self.assertTrue(any("BOTH machines" in l for l in ui.lines))
+        self.assertTrue(any("both machines" in l for l in ui.lines))
         self.assertTrue(any("Press Enter" in l for l in ui.lines))
+        self.assertIn(notice.CLOSE_DOES_NOT_STOP, ui.lines)
+
+    def test_version_jumps_joined_like_check(self):
+        items = notice.items_from_check(
+            {"updates": [{"app": "cursor",
+                          "machines": {"machine-a": {"installed": "1", "candidate": "2"},
+                                       "machine-b": {"installed": "1.1", "candidate": "2"}}}]},
+            type("C", (), {"__contains__": lambda self, k: False})())
+        self.assertEqual(items[0]["jump"], "1.1\u21922 / 1\u21922")
+        self.assertEqual(items[0]["where"], "both machines")
+        lines = notice.pending_lines(items)
+        self.assertIn("1.1\u21922 / 1\u21922", lines[0])
+
+    def test_warning_lists_closures_per_machine(self):
+        items = [{"display": "Cursor", "where": "machine-a", "machines": ["machine-a"]}]
+        line = notice.warning_line(items)
+        self.assertIn("machine-a", line)
+        self.assertNotIn("both machines", line)
 
     def test_no_does_nothing(self):
         ui = FakeUI(confirm=False)
@@ -111,6 +233,7 @@ class PromptAnswers(unittest.TestCase):
         self.assertEqual(notice.run_prompt(ui, self._items(), run_fn=lambda: ran.append("x")),
                          "no")
         self.assertEqual(ran, [])
+        self.assertFalse(any("Press Enter" in l for l in ui.lines))
 
     def test_eof_does_nothing(self):
         ui = FakeUI(eof=True)
@@ -159,7 +282,7 @@ class RecordAfterLaunch(unittest.TestCase):
         t.sys["machine-a"].no_graphical = True
         rc, out = Check._cli(Check(), t, ["--notify"])
         self.assertEqual(rc, 10)
-        self.assertIn("no graphical session; will retry at next login", out)
+        self.assertIn("no graphical session; not retried until the next timer run", out)
         self.assertEqual(t.sys["machine-a"].spawned, [])
         self.assertTrue(t.eng["machine-a"].notice_due("updates", "x"))
 
@@ -197,6 +320,8 @@ class PromptCli(unittest.TestCase):
         inner = launched[-1]
         self.assertIn("--test", inner)
         self.assertIn("--inside", inner)
+        self.assertIn("prompt.window.test", inner)
+        self.assertNotIn("prompt.window ", inner + " ")
         self.assertEqual(t.eng["machine-a"].notice_due("updates", ""), True)
 
     def test_prompt_inside_test_prints_answer(self):
@@ -229,6 +354,56 @@ class PromptCli(unittest.TestCase):
         self.assertNotIn("answer: run", out)
         self.assertTrue(any("Press Enter" in l for l in ui.lines))
 
+    def test_prompt_inside_error_shows_text_and_pauses(self):
+        from twin_update.peer import PeerError
+        t = Twin()
+        t.setup("cursor", "3.24.9-1", "3.24.9-1")
+        t.setup("chatgpt", "26.1007.21434", "26.1007.21434")
+        t.setup("grok-bot", "0.68.1", "0.68.1")
+
+        def down(label, target, cmd):
+            raise PeerError(f"{label}: timed out: the machine may be off, asleep or offline")
+
+        rc, out, ui = self._run_factory(t, ["prompt", "--inside"], down)
+        self.assertEqual(rc, 1)
+        self.assertIn("Checking...", out)
+        self.assertIn("timed out", out)
+        self.assertNotIn(notice.ALREADY_UPDATED, out)
+        self.assertTrue(any("Press Enter" in l for l in ui.lines))
+
+    def test_prompt_inside_records_only_after_question(self):
+        t = Twin(); standard(t)
+        rc, out, ui = self._run(t, ["prompt", "--inside"])
+        self.assertEqual(rc, 0)
+        self.assertIn("Checking...", out)
+        self.assertIn("Update now?", " ".join(ui.prompts))
+        self.assertFalse(t.eng["machine-a"].notice_due("updates", "x"))
+
+    def test_launch_does_not_record_the_day(self):
+        t = Twin(); standard(t)
+        rc, out = Check._cli(Check(), t, ["--notify"])
+        self.assertEqual(rc, 10)
+        self.assertIn("opened a window", out)
+        self.assertTrue(t.eng["machine-a"].notice_due("updates", "x"))
+
+    def _run_factory(self, t, args, factory):
+        import contextlib
+        import io
+        import tempfile
+        from fakes import patched_paths
+        from twin_update import cli
+        tmpd = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, tmpd, True)
+        cfgp = os.path.join(tmpd, "c.toml")
+        with open(cfgp, "w") as fh:
+            fh.write(CONFIG.format(keep="[]", fallback="[]"))
+        buf = io.StringIO()
+        ui = FakeUI(confirm=False)
+        with contextlib.redirect_stdout(buf), patched_paths(t):
+            rc = cli.main(["--config", cfgp, *args], ui=ui, system=t.sys["machine-a"],
+                          peer_factory=factory)
+        return rc, buf.getvalue() + "\n".join(ui.lines), ui
+
 
 class DoctorNotice(unittest.TestCase):
     def test_doctor_reports_terminal_and_timer(self):
@@ -247,3 +422,101 @@ class DoctorNotice(unittest.TestCase):
         d = t.eng["machine-a"].doctor()
         problems, _ = doctor_findings(d)
         self.assertIn("terminal_launcher", problems)
+
+    def test_stale_real_window_is_a_warning(self):
+        from twin_update.orchestrator import doctor_findings
+        t = Twin(); standard(t)
+        s = t.sys["machine-a"]
+        path = notice.window_lock_path(t.cfg.state_dir, test=False)
+        notice.write_window_pid(s, path, 4000, started=True, opened_at=s.now() - 90000)
+        s.alive_pids.add(4000)
+        d = t.eng["machine-a"].doctor()
+        self.assertTrue(d["window_stale"])
+        _, warnings = doctor_findings(d)
+        self.assertTrue(any("over 24 hours" in w for w in warnings))
+
+    def test_unit_missing_success_exit_is_a_warning(self):
+        from twin_update.orchestrator import doctor_findings
+        t = Twin(); standard(t)
+        home = t.sys["machine-a"].home()
+        unit_dir = os.path.join(home, ".config/systemd/user")
+        os.makedirs(unit_dir, exist_ok=True)
+        with open(os.path.join(unit_dir, "twin-update-check.service"), "w") as fh:
+            fh.write("[Service]\nType=oneshot\nExecStart=/bin/twin-update check --notify\n")
+        with open(os.path.join(unit_dir, "twin-update-check.timer"), "w") as fh:
+            fh.write("[Timer]\nOnCalendar=*-*-* 09:13:00\n")
+        d = t.eng["machine-a"].doctor()
+        _, warnings = doctor_findings(d)
+        self.assertTrue(any("SuccessExitStatus=10" in w for w in warnings))
+        self.assertTrue(any("Persistent=true" in w for w in warnings))
+
+
+class TestSlotDoesNotBlockReal(unittest.TestCase):
+    def test_live_test_slot_does_not_block_notify(self):
+        t = Twin(); standard(t)
+        s = t.sys["machine-a"]
+        test_slot = notice.window_lock_path(t.cfg.state_dir, test=True)
+        notice.write_window_pid(s, test_slot, 4111, started=True)
+        s.alive_pids.add(4111)
+        rc, out = Check._cli(Check(), t, ["--notify"])
+        self.assertEqual(rc, 10)
+        self.assertIn("opened a window", out)
+        inner = s.spawned[0][0][-1]
+        self.assertNotIn("prompt.window.test", inner)
+
+    def test_already_open_says_since_when(self):
+        t = Twin(); standard(t)
+        s = t.sys["machine-a"]
+        slot = notice.window_lock_path(t.cfg.state_dir, test=False)
+        notice.write_window_pid(s, slot, 4222, started=True, opened_at=s.now())
+        s.alive_pids.add(4222)
+        rc, out = Check._cli(Check(), t, ["--notify"])
+        self.assertEqual(rc, 10)
+        self.assertIn("window already open since", out)
+
+
+class DetachedRun(unittest.TestCase):
+    def test_yes_starts_a_run_unit(self):
+        import contextlib
+        import io
+        import tempfile
+        from fakes import patched_paths
+        from twin_update import cli
+        t = Twin(); standard(t)
+        tmpd = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, tmpd, True)
+        cfgp = os.path.join(tmpd, "c.toml")
+        with open(cfgp, "w") as fh:
+            fh.write(CONFIG.format(keep="[]", fallback="[]"))
+        ui = FakeUI(confirm=True)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), patched_paths(t):
+            rc = cli.main(["--config", cfgp, "prompt", "--inside"],
+                          ui=ui, system=t.sys["machine-a"],
+                          peer_factory=lambda label, target, cmd: t.peers[label])
+        out = buf.getvalue() + "\n".join(ui.lines)
+        self.assertIn(notice.CHECKING, ui.lines)
+        self.assertIn(notice.CLOSE_DOES_NOT_STOP, ui.lines)
+        self.assertTrue(t.sys["machine-a"].run_units)
+        unit, inner = t.sys["machine-a"].run_units[0]
+        self.assertTrue(unit.startswith("twin-update-run-"))
+        self.assertIn("run", inner)
+        self.assertIn("--no-detach", inner)
+        self.assertEqual(rc, 0)
+        self.assertIn("Checking...", out)
+
+
+class HelpHidesRaft(unittest.TestCase):
+    def test_help_has_no_suppress_or_raft_upload(self):
+        import contextlib
+        import io
+        from twin_update import cli
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            try:
+                cli.main(["--help"])
+            except SystemExit as exc:
+                self.assertEqual(exc.code, 0)
+        text = buf.getvalue()
+        self.assertNotIn("==SUPPRESS==", text)
+        self.assertNotIn("raft-upload", text)

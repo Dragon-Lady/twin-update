@@ -81,9 +81,9 @@ twin-update run [--apps cursor,chatgpt] [--dry-run]
 
 Apps are only ever closed inside a run you start or confirm. There is no
 resident daemon. An optional user timer may open one prompt window; the ssh
-session to the other machine exists only for the command. The run moves
-itself into its own `systemd-run --user --scope`, so closing the app whose
-terminal launched it does not stop it.
+session to the other machine exists only for the command. A `run` you start from a terminal, or confirm with `y` in the prompt
+window, runs in its own `systemd-run --user` unit/scope, so closing that
+terminal or window does not stop the update.
 
 ## Other commands
 
@@ -117,18 +117,24 @@ with the system apt, as root.)
 With `--notify` it opens a **terminal window** on the machine it runs on
 when updates are available (`cosmic-term --no-daemon` if present, else
 x-terminal-emulator). That window runs `twin-update prompt`: it re-checks,
-lists pending apps and versions, warns that updating closes those apps on
-both machines for about 10 minutes, and asks `Update now? [y/N]`. Only a
-typed `y` starts `twin-update run` in the same window. N, Enter, EOF or
-closing the window does nothing; the window opens again the next day while
-updates remain pending. The timer service is not a graphical session, so
-the window is started with WAYLAND_DISPLAY, DISPLAY, XDG_RUNTIME_DIR and
-DBUS_SESSION_BUS_ADDRESS from the running user session. If no graphical
-session is up, nothing is recorded and the next login retries
-(`Persistent=true`). A lock/pid file keeps a second fire from stacking
-windows. A plain, button-less desktop notice is only an extra reminder
-("Updates waiting: see the Twin Update window"). The same window is opened
-at most once per calendar day (state in `~/.local/state/twin-update/`).
+lists pending apps and versions (each machine's own version jump, joined
+with ` / ` when they differ), warns which machines would close those apps
+for about 10 minutes (it says "both machines" only when both need the
+update), and asks `Update now? [y/N]`. If one machine could not be reached,
+that status is in the question. Only a typed `y` starts `twin-update run`
+in its own user unit; closing the prompt window does not stop the update,
+and the window follows the run's progress. N or Enter declines without
+starting a run. The question is recorded for the calendar day only after
+it has been shown (closing a still-blank window does not use up the day).
+The timer service is not a graphical session, so the window is started
+with WAYLAND_DISPLAY, DISPLAY, XDG_RUNTIME_DIR and DBUS_SESSION_BUS_ADDRESS
+from the running user session. If no graphical session is up, or the window
+fails to start, nothing is recorded and the launch is not retried until the
+next timer run. `Persistent=true` only catches up a missed timer run (for
+example if the machine was off at 09:13). A lock/pid file keeps a second
+fire from stacking windows (`prompt --test` uses a separate test slot).
+A plain, button-less desktop notice is only an extra reminder
+("Updates waiting: see the Twin Update window").
 
 `twin-update prompt --test` opens the same style of window with a fake
 pending list and "Test only, nothing will be updated".
@@ -256,14 +262,14 @@ sync lock is only a warning), 1 failed, 2 usage or config,
 
 Apache License 2.0. See [LICENSE](LICENSE).
 
-## Cursor launch policy and optional life-raft (0.3.0 draft)
+## Cursor launch policy and optional life-raft
 
 Cursor is in `apps.no_launch` by default. If it is open when an update or rollback
 needs to close it, it is closed gracefully and updated, then left closed. Neither
 the smoke check nor reopen starts it. The opt-in raft hook never overrides this
 policy. Existing per-app no-launch lists are preserved. Other apps retain their
-configured launch behavior. No installed tool or machine configuration changes
-as part of this draft.
+configured launch behavior. No installed tool or machine configuration is
+changed by this policy.
 
 The optional `[raft]` hook applies only when Cursor reopening is explicitly
 permitted, a real smoke check passed, and the machine is allowed. It takes the

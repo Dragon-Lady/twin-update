@@ -249,6 +249,22 @@ class System:
         os.chmod(tmp, 0o600)
         os.replace(tmp, path)
 
+    def write_inplace(self, path: str, text: str) -> None:
+        """Write without replacing the inode, so an flock on this file survives."""
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, mode=0o700, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, text.encode("utf-8"))
+            os.fsync(fd)
+            os.fchmod(fd, 0o600)
+        finally:
+            os.close(fd)
+
+    def realpath(self, path: str) -> str:
+        return os.path.realpath(path)
+
     def makedirs(self, path: str) -> None:
         os.makedirs(path, mode=0o700, exist_ok=True)
 
