@@ -30,8 +30,11 @@ close timeout aborts the run on both machines before any update.
 
 ## Network
 
-No listener, daemon or timer. The ssh session (BatchMode, host keys checked)
-exists only while a command runs.
+No resident daemon. The ssh session (BatchMode, host keys checked) exists
+only while a command runs. An optional user timer may run
+`twin-update check --notify` and open one terminal window for the daily
+prompt; that window is a normal user process and exits when the prompt
+does. Notification actions are not used.
 
 ## Trust boundaries
 

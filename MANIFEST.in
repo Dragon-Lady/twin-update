@@ -1,3 +1,4 @@
 include README.md CHANGELOG.md SECURITY.md LICENSE config.example.toml
 recursive-include tests *.py
 include tools/build_zipapp.py
+recursive-include src/twin_update/systemd *

@@ -1,0 +1,9 @@
+[Unit]
+Description=Twin Update: daily update check
+
+[Timer]
+OnCalendar=*-*-* 09:13:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

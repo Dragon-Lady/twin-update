@@ -184,6 +184,97 @@ class RunFlow(unittest.TestCase):
         self.assertEqual(rep["result"], "failed")
         self.assertEqual(kinds(t, "DOWNGRADE"), [])
 
+    def test_rollback_prompt_timeout_defaults_to_no(self):
+        t = Twin(); standard(t)
+        t.sys["machine-b"].smoke_dies.add("cursor")
+        ui = FakeUI(confirm_timeout=True)
+        rep = orchestrator.run(t.session(ui), ["cursor"], dry=False)
+        self.assertEqual(rep["result"], "failed")
+        self.assertEqual(kinds(t, "DOWNGRADE"), [])
+        self.assertEqual(t.sys["machine-b"].pkgs["cursor"], "3.24.9-1")
+        self.assertTrue(ui.timeouts and ui.timeouts[0] == t.cfg.rollback_prompt_s)
+
+    def test_interrupt_after_close_reopens_apps(self):
+        t = Twin(); standard(t)
+        t.sys["machine-a"].add_app_procs(CUR)
+        real = t.peers["machine-a"]
+
+        class Boom:
+            def call(self, op, **kw):
+                if op == "upgrade":
+                    raise KeyboardInterrupt
+                return real.call(op, **kw)
+
+            def close(self):
+                real.close()
+
+        t.peers["machine-a"] = Boom()
+        rep = orchestrator.run(t.session(FakeUI()), ["cursor"], dry=False, smoke=False)
+        self.assertEqual(rep["result"], "aborted")
+        self.assertIn("interrupted after close", rep["error"])
+        self.assertIn("cursor", rep.get("reopen", {}).get("machine-a", {}))
+
+    def test_peer_drop_after_close_reopens_apps(self):
+        from twin_update.peer import PeerError
+        t = Twin(); standard(t)
+        t.sys["machine-a"].add_app_procs(CUR)
+        real = t.peers["machine-a"]
+
+        class Drop:
+            def call(self, op, **kw):
+                if op == "upgrade":
+                    raise PeerError("machine-a: timed out: the machine may be off, asleep or offline")
+                return real.call(op, **kw)
+
+            def close(self):
+                real.close()
+
+        t.peers["machine-a"] = Drop()
+        rep = orchestrator.run(t.session(FakeUI()), ["cursor"], dry=False, smoke=False)
+        self.assertEqual(rep["result"], "aborted")
+        self.assertIn("cursor", rep.get("reopen", {}).get("machine-a", {}))
+
+    def test_user_relaunched_app_is_not_killed_before_upgrade(self):
+        t = Twin(); standard(t)
+        real = t.peers["machine-a"]
+
+        class AfterClose:
+            def __init__(self):
+                self.closed = False
+
+            def call(self, op, **kw):
+                if op == "close_wait":
+                    r = real.call(op, **kw)
+                    self.closed = True
+                    return r
+                if op == "running" and self.closed:
+                    return True
+                return real.call(op, **kw)
+
+            def close(self):
+                real.close()
+
+        t.peers["machine-a"] = AfterClose()
+        rep = orchestrator.run(t.session(FakeUI()), ["cursor"], dry=False, smoke=False)
+        self.assertEqual(rep["result"], "aborted")
+        self.assertIn("running again", rep["error"])
+        self.assertEqual(kinds(t, "INSTALL"), [])
+
+    def test_smoke_handoff_when_unit_exits_and_app_is_running(self):
+        t = Twin(); standard(t)
+        t.sys["machine-a"].smoke_handoff.add("chatgpt")
+        res = t.eng["machine-a"].smoke("chatgpt")
+        self.assertTrue(res["ok"], res)
+        self.assertFalse(t.eng["machine-a"].running("chatgpt"))
+
+    def test_smoke_refuses_to_kill_a_user_launched_instance(self):
+        t = Twin(); standard(t)
+        t.sys["machine-a"].add_app_procs(GPT)
+        res = t.eng["machine-a"].smoke("chatgpt")
+        self.assertFalse(res["ok"])
+        self.assertIn("user-launched", res["reason"])
+        self.assertTrue(t.eng["machine-a"].running("chatgpt"))
+
     def test_identity_mismatch_aborts(self):
         t = Twin(); standard(t)
         t.sys["machine-b"].user = "mallory"
@@ -626,6 +717,10 @@ class Check(unittest.TestCase):
             cache = s.home() + "/.cache/twin-update/apt"
             for argv, stdin, _env in s.calls:
                 self.assertIsNone(stdin)                          # nothing on stdin, no password
+                if argv[0] == "systemd-run":
+                    self.assertTrue(any(a.startswith("--unit=twin-update-prompt-") for a in argv),
+                                    argv)
+                    continue
                 self.assertNotIn(argv[0], ("sudo", "systemd-run", "pkexec"))
                 self.assertNotEqual(argv[:2], ["apt-mark", "hold"])
                 self.assertNotEqual(argv[:2], ["apt-mark", "unhold"])
@@ -643,7 +738,7 @@ class Check(unittest.TestCase):
     def _notifies(self, t, label="machine-a"):
         return [c[0] for c in t.sys[label].calls if c[0][0] in ("notify-send", "gdbus")]
 
-    def test_updates_available_exit_10_and_notify_once_per_day(self):
+    def test_updates_available_exit_10_and_window_once_per_day(self):
         t = Twin(); standard(t)
         t.sys["machine-a"].add_app_procs(CUR)
         rc, out = self._cli(t, ["--notify"])
@@ -652,18 +747,23 @@ class Check(unittest.TestCase):
         self.assertIn("ChatGPT 26.1002.52244\u219226.1007.21434 on both machines", out)
         self.assertEqual(out.count("package lists: fetched fresh 0 min ago for chatgpt, cursor, grok-bot"), 2)
         self.assertIn("user cache ~/.cache/twin-update/apt", out)
-        self.assertIn("notification: sent via notify-send", out)
+        self.assertIn("window: opened a window", out)
         self.assertNotIn("Grok Bot", out)
+        self.assertEqual(len(t.sys["machine-a"].spawned), 1)
+        self.assertEqual(t.sys["machine-a"].spawned[0][0][0], "cosmic-term")
         n = self._notifies(t)
         self.assertEqual(len(n), 1)
-        self.assertIn("Run: twin-update run", n[0][-1])
-        self.assertEqual(self._notifies(t, "machine-b"), [])     # other machine never notified
-        rc, out = self._cli(t, ["--notify"])                      # same day, same updates
+        self.assertIn("Updates waiting: see the Twin Update window", n[0][-1])
+        self.assertEqual(self._notifies(t, "machine-b"), [])
+        rc, out = self._cli(t, ["--notify"])
         self.assertEqual(rc, 10)
-        self.assertIn("already sent today", out)
+        self.assertIn("already opened a window today", out)
         self.assertEqual(len(self._notifies(t)), 1)
-        t.clock.t += 86400                                        # next day: notify again
+        self.assertEqual(len(t.sys["machine-a"].spawned), 1)
+        t.clock.t += 86400
+        t.sys["machine-a"].alive_pids.clear()  # yesterday's window has closed
         self._cli(t, ["--notify"])
+        self.assertEqual(len(t.sys["machine-a"].spawned), 2)
         self.assertEqual(len(self._notifies(t)), 2)
         self._assert_read_only(t)
 
@@ -699,11 +799,13 @@ class Check(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("machine-b error: timed out: the machine may be off, asleep or offline", out)
         self.assertIn("result: check incomplete", out)
+        self.assertIn("check incomplete (no window)", out)
         self.assertEqual(len(self._notifies(t)), 1)
         self.assertIn("check incomplete", self._notifies(t)[0][-2])
+        self.assertEqual(t.sys["machine-a"].spawned, [])
         rc, out = self._cli(t, ["--notify"], factory=down)
         self.assertEqual(rc, 1)
-        self.assertEqual(len(self._notifies(t)), 1)                # at most once a day
+        self.assertEqual(len(self._notifies(t)), 1)
         self._assert_read_only(t)
 
     def test_unreachable_peer_but_local_updates_exit_10(self):
@@ -715,7 +817,8 @@ class Check(unittest.TestCase):
         rc, out = self._cli(t, ["--notify"], factory=down)
         self.assertEqual(rc, 10)
         self.assertIn("on machine-a", out)
-        self.assertIn("Not checked: machine-b", self._notifies(t)[0][-1])
+        self.assertIn("window: opened a window", out)
+        self.assertIn("Updates waiting: see the Twin Update window", self._notifies(t)[0][-1])
 
     def test_local_only_is_not_an_error(self):
         t = Twin()

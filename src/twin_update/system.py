@@ -42,6 +42,30 @@ class Proc:
 class System:
     """Real implementation. Methods are small on purpose."""
 
+    def pid_alive(self, pid: int) -> bool:
+        if not isinstance(pid, int) or pid <= 0:
+            return False
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return False
+        return True
+
+    def try_lockfile(self, path: str):
+        """Exclusive flock on a lockfile, created if needed. None if busy."""
+        import fcntl
+        os.makedirs(os.path.dirname(path) or ".", mode=0o700, exist_ok=True)
+        try:
+            fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        except OSError:
+            return None
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            return None
+        return fd
+
     def run(self, argv, input: bytes | None = None, timeout: float | None = None,
             env: dict | None = None, cwd: str | None = None) -> Result:
         try:

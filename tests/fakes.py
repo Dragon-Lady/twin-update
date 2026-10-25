@@ -94,10 +94,18 @@ class FakeSystem(System):
         self.calls = []           # (argv, input, env)
         self.fail_install = set()
         self.smoke_dies = set()
+        self.smoke_handoff = set()
         self.apt_busy_flag = False
         self.locked = False
+        self.window_flock = False
         self.pid = 999999
         self.missing_tools = set()
+        self.no_graphical = False
+        self.spawned = []
+        self.next_spawn_pid = 4000
+        self.alive_pids = set()
+        self.prompt_pids = {}
+        self.spawn_dies_immediately = False
         self.fresh_cands = {}     # pkg -> candidate seen by a fresh user-level fetch
         self.fresh_fail = None    # apt-get update error text, or None
         self.fetched = False
@@ -160,6 +168,17 @@ class FakeSystem(System):
         if self.locked or not os.path.exists(path):
             return None
         return 42
+
+    def try_lockfile(self, path):
+        if self.window_flock:
+            return None
+        if not os.path.exists(path):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            open(path, "w").close()
+        return 99
+
+    def pid_alive(self, pid):
+        return pid in self.alive_pids
 
     def unlock(self, fd):
         pass
@@ -257,13 +276,44 @@ class FakeSystem(System):
             return Result(0)
         if cmd == "systemd-run":
             unit = [a for a in argv if a.startswith("--unit=")][0][7:]
+            if unit.startswith("twin-update-prompt-"):
+                inner = argv[argv.index("--") + 1:] if "--" in argv else argv
+                pid = self.next_spawn_pid
+                self.next_spawn_pid += 1
+                self.spawned.append((inner, None, pid))
+                self.prompt_pids[unit] = pid
+                if not self.spawn_dies_immediately:
+                    self.alive_pids.add(pid)
+                return Result(0)
             self.events.append((self.user, "LAUNCH", unit))
+            if unit.startswith("twin-smoke-"):
+                app = unit[len("twin-smoke-"):].rsplit("-", 1)[0]
+                if app in self.smoke_handoff:
+                    exe = (self.files.get(app) or ["/usr/share/cursor/cursor"])[0]
+                    self.add_app_procs(exe)
             return Result(0)
         if argv[:3] == ["systemctl", "--user", "is-active"]:
-            app = argv[3].split("-")[2]
-            return Result(0, "failed" if app in self.smoke_dies else "active")
+            unit = argv[3] if len(argv) > 3 else ""
+            if unit.startswith("twin-smoke-"):
+                app = unit[len("twin-smoke-"):].rsplit("-", 1)[0]
+                if app in self.smoke_handoff:
+                    return Result(3, "inactive")
+                return Result(0, "failed" if app in self.smoke_dies else "active")
+            return Result(3, "inactive")
+        if argv[:3] == ["systemctl", "--user", "is-enabled"]:
+            return Result(0, "enabled\n")
         if argv[:3] == ["systemctl", "--user", "show-environment"]:
-            return Result(0, "WAYLAND_DISPLAY=wayland-1\n")
+            if self.no_graphical:
+                return Result(0, "LANG=C\n")
+            return Result(0, "WAYLAND_DISPLAY=wayland-1\nDISPLAY=:0\n")
+        if argv[:3] == ["systemctl", "--user", "show"]:
+            if any("twin-update-check.timer" in a for a in argv):
+                return Result(0, "UnitFileState=enabled\nActiveState=active\n"
+                              "NextElapseUSecRealtime=Mon 2026-10-26 09:13:00 UTC\n")
+            for a in argv:
+                if a in self.prompt_pids:
+                    return Result(0, str(self.prompt_pids[a]) + "\n")
+            return Result(127, "", f"fake: unknown {argv}")
         if cmd in ("journalctl", "notify-send", "gdbus"):
             return Result(0, "")
         return Result(127, "", f"fake: unknown {argv}")
@@ -302,11 +352,14 @@ class FakeSystem(System):
 
 
 class FakeUI:
-    def __init__(self, password=PW, confirm=False):
+    def __init__(self, password=PW, confirm=False, eof=False, confirm_timeout=False):
         self.password = password
         self.answer = confirm
+        self.eof = eof
+        self.confirm_timeout = confirm_timeout
         self.lines = []
         self.prompts = []
+        self.timeouts = []
 
     def say(self, msg):
         self.lines.append(msg)
@@ -315,9 +368,17 @@ class FakeUI:
         self.prompts.append(prompt)
         return self.password
 
-    def confirm(self, prompt):
+    def confirm(self, prompt, timeout_s=None):
         self.prompts.append(prompt)
+        self.timeouts.append(timeout_s)
+        if self.eof:
+            raise EOFError
+        if self.confirm_timeout:
+            return False
         return self.answer
+
+    def pause(self, msg="Press Enter to close."):
+        self.lines.append(msg)
 
 
 class Twin:

@@ -207,6 +207,17 @@ def _reopen(s, rep, was_open, results):
     return reopened
 
 
+def _reopen_after_interrupt(s: Session, rep: dict, was_open: dict, results: dict) -> None:
+    """Reopen apps closed for the run after Ctrl-C or a dropped peer."""
+    if not was_open or rep.get("reopen"):
+        return
+    try:
+        rep["reopen"] = _reopen(s, rep, was_open, results or {})
+        rep["summary"].append("apps reopened after the run was interrupted")
+    except Exception as exc:
+        rep["summary"].append(f"could not reopen apps: {exc}")
+
+
 def run(s: Session, apps, dry: bool, smoke: bool = True, unreachable=None) -> dict:
     rep = _new_report("run", dry, apps, s.order, unreachable or {})
     rep["blockers"] = [f"{l} unreachable: {why}" for l, why in (unreachable or {}).items()]
@@ -276,39 +287,52 @@ def run(s: Session, apps, dry: bool, smoke: bool = True, unreachable=None) -> di
             return _finish(s, rep, dry)
 
         results = {}
-        for app, p in todo.items():
-            for l in p["machines"]:
-                up = s.peers[l].call("upgrade", app_name=app, version=p["target"])
-                ver = s.peers[l].call("verify", app_name=app, version=p["target"], smoke=smoke) \
-                    if up["ok"] else {"ok": False}
-                r = {"upgrade": up, "verify": ver}
-                if not ver["ok"]:
-                    if s.ui.confirm(f"{s.cfg.apps[app].display} {p['target']} failed its check on "
-                                    f"{l}. Roll back to {up.get('before')}?"):
-                        rb = s.peers[l].call("rollback_install", app_name=app, hold=True)
-                        r["rollback"] = rb
-                        if rb.get("ok"):
-                            r["rollback_verify"] = s.peers[l].call(
-                                "verify", app_name=app, version=rb["to"], smoke=smoke)
-                results.setdefault(app, {})[l] = r
-                mark = ver["ok"]
-                txt = f"{s.cfg.apps[app].display} {l} {up.get('before')}\u2192{up.get('after')} {_ok(mark)}"
-                if "rollback" in r:
-                    txt += f" (rolled back to {r['rollback'].get('to')})"
-                rep["summary"].append(txt)
-        rep["results"] = results
-        finals = {}
-        for app in todo:
-            vs = {l: s.both("status", apps=[app])[l]["apps"][app]["installed"] for l in labels}
-            finals[app] = vs
-            if len(set(vs.values())) != 1:
-                rep["summary"].append(f"{s.cfg.apps[app].display}: versions differ now "
-                                      + ", ".join(f"{l}={v}" for l, v in vs.items()))
-        rep["final_versions"] = finals
-        rep["reopen"] = _reopen(s, rep, was_open, results)
-        rep["prune"] = {l: s.peers[l].call("prune", apps=list(todo), dry=False) for l in labels}
-        all_ok = all(r["verify"]["ok"] for m in results.values() for r in m.values())
-        rep["result"] = "ok" if all_ok else "failed"
+        try:
+            for app, p in todo.items():
+                for l in p["machines"]:
+                    if s.peers[l].call("running", app_name=app):
+                        raise Abort(
+                            f"{s.cfg.apps[app].display} on {l} is running again; "
+                            "not closing a user-launched instance")
+                    up = s.peers[l].call("upgrade", app_name=app, version=p["target"])
+                    ver = s.peers[l].call("verify", app_name=app, version=p["target"],
+                                          smoke=smoke) if up["ok"] else {"ok": False}
+                    r = {"upgrade": up, "verify": ver}
+                    if not ver["ok"]:
+                        if s.ui.confirm(
+                                f"{s.cfg.apps[app].display} {p['target']} failed its check on "
+                                f"{l}. Roll back to {up.get('before')}?",
+                                timeout_s=s.cfg.rollback_prompt_s):
+                            rb = s.peers[l].call("rollback_install", app_name=app, hold=True)
+                            r["rollback"] = rb
+                            if rb.get("ok"):
+                                r["rollback_verify"] = s.peers[l].call(
+                                    "verify", app_name=app, version=rb["to"], smoke=smoke)
+                    results.setdefault(app, {})[l] = r
+                    mark = ver["ok"]
+                    txt = (f"{s.cfg.apps[app].display} {l} {up.get('before')}\u2192"
+                           f"{up.get('after')} {_ok(mark)}")
+                    if "rollback" in r:
+                        txt += f" (rolled back to {r['rollback'].get('to')})"
+                    rep["summary"].append(txt)
+            rep["results"] = results
+            finals = {}
+            for app in todo:
+                vs = {l: s.both("status", apps=[app])[l]["apps"][app]["installed"] for l in labels}
+                finals[app] = vs
+                if len(set(vs.values())) != 1:
+                    rep["summary"].append(f"{s.cfg.apps[app].display}: versions differ now "
+                                          + ", ".join(f"{l}={v}" for l, v in vs.items()))
+            rep["final_versions"] = finals
+            rep["reopen"] = _reopen(s, rep, was_open, results)
+            rep["prune"] = {l: s.peers[l].call("prune", apps=list(todo), dry=False) for l in labels}
+            all_ok = all(r["verify"]["ok"] for m in results.values() for r in m.values())
+            rep["result"] = "ok" if all_ok else "failed"
+        except (Abort, PeerError, KeyboardInterrupt) as exc:
+            _reopen_after_interrupt(s, rep, was_open, results)
+            if isinstance(exc, KeyboardInterrupt):
+                raise Abort("interrupted after close; apps reopened") from exc
+            raise
     except (Abort, PeerError) as exc:
         rep["result"] = "aborted"
         rep["error"] = str(exc)
@@ -342,18 +366,29 @@ def rollback(s: Session, app: str, labels, dry: bool, smoke: bool = True,
             _raft_dry(s, rep, was_open)
             return _finish(s, rep, dry)
         res = {}
-        for l in labels:
-            rb = s.peers[l].call("rollback_install", app_name=app, hold=hold)
-            ver = s.peers[l].call("verify", app_name=app, version=rb.get("to") or "",
-                                  smoke=smoke) if rb.get("ok") else {"ok": False}
-            res[l] = {"rollback": rb, "verify": ver}
-            rep["summary"].append(f"{s.cfg.apps[app].display} {l} rollback "
-                                  f"{rb.get('from')}\u2192{rb.get('to')} {_ok(ver['ok'])}"
-                                  + (" hold set" if rb.get("hold") else ""))
-        rep["results"] = res
-        # Rollback verification is the final verification on this path.
-        rep["reopen"] = _reopen(s, rep, was_open, {app: {l: {"verify": r["verify"]} for l, r in res.items()}})
-        rep["result"] = "ok" if all(r["verify"]["ok"] for r in res.values()) else "failed"
+        try:
+            for l in labels:
+                if s.peers[l].call("running", app_name=app):
+                    raise Abort(
+                        f"{s.cfg.apps[app].display} on {l} is running again; "
+                        "not closing a user-launched instance")
+                rb = s.peers[l].call("rollback_install", app_name=app, hold=hold)
+                ver = s.peers[l].call("verify", app_name=app, version=rb.get("to") or "",
+                                      smoke=smoke) if rb.get("ok") else {"ok": False}
+                res[l] = {"rollback": rb, "verify": ver}
+                rep["summary"].append(f"{s.cfg.apps[app].display} {l} rollback "
+                                      f"{rb.get('from')}\u2192{rb.get('to')} {_ok(ver['ok'])}"
+                                      + (" hold set" if rb.get("hold") else ""))
+            rep["results"] = res
+            # Rollback verification is the final verification on this path.
+            rep["reopen"] = _reopen(s, rep, was_open,
+                                    {app: {l: {"verify": r["verify"]} for l, r in res.items()}})
+            rep["result"] = "ok" if all(r["verify"]["ok"] for r in res.values()) else "failed"
+        except (Abort, PeerError, KeyboardInterrupt) as exc:
+            _reopen_after_interrupt(s, rep, was_open, {app: res} if res else {})
+            if isinstance(exc, KeyboardInterrupt):
+                raise Abort("interrupted after close; apps reopened") from exc
+            raise
     except (Abort, PeerError) as exc:
         rep["result"] = "aborted"
         rep["error"] = str(exc)
@@ -386,8 +421,15 @@ def doctor_findings(checks: dict) -> tuple[list[str], list[str]]:
                 elif state == "busy":
                     warnings.append(f"lock {path} busy right now (a run waits for it)")
         elif k == "notify_tool":
+            continue  # extra reminder only; never a doctor failure
+        elif k == "terminal_launcher":
             if not v:
-                warnings.append("no notify-send or gdbus: notifications are skipped")
+                problems.append("terminal_launcher")
+        elif k == "check_timer":
+            if not v:
+                warnings.append("twin-update-check.timer is not enabled")
+        elif k in ("locks_ok", "check_timer_next", "last_window"):
+            continue
         elif k != "locks_ok" and isinstance(v, bool) and not v:
             problems.append(k)
     return problems, warnings
