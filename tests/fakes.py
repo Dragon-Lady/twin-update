@@ -95,6 +95,9 @@ class FakeSystem(System):
         self.fail_install = set()
         self.smoke_dies = set()
         self.smoke_handoff = set()
+        self.smoke_late = set()
+        self._smoke_spawned = set()
+        self.showhold_fail = False
         self.apt_busy_flag = False
         self.locked = False
         self.window_flock = False
@@ -106,9 +109,23 @@ class FakeSystem(System):
         self.alive_pids = set()
         self.prompt_pids = {}
         self.spawn_dies_immediately = False
+        self.spawn_forks = False  # client pid exits; unit stays activating
         self.fresh_cands = {}     # pkg -> candidate seen by a fresh user-level fetch
         self.fresh_fail = None    # apt-get update error text, or None
         self.fetched = False
+        self.mainpid_zero_first = False
+        self._mainpid_reads = {}
+        self._lockfiles = set()
+        self.launcher_target = None  # realpath of x-terminal-emulator
+        self.smoke_crash_after = {}  # app -> seconds after start when a hand-off crashes
+        self._smoke_started_at = {}
+        self.journal_crash = set()
+        self.unit_files = {}  # name -> text for systemctl cat
+        self.run_units = []   # started twin-update-run-* units
+        self.pid_starts = {}  # pid -> starttime ticks (slot identity)
+        self.follow_script = None  # list of {active, show} snapshots
+        self.follow_idx = 0
+        self.cleaned_units = []  # ("reset-failed"|"stop", unit)
 
     # identity
     def whoami(self): return self.user
@@ -169,19 +186,63 @@ class FakeSystem(System):
             return None
         return 42
 
-    def try_lockfile(self, path):
-        if self.window_flock:
+    def try_lockfile(self, path, blocking=False):
+        if self.window_flock or path in self._lockfiles:
             return None
         if not os.path.exists(path):
             os.makedirs(os.path.dirname(path), exist_ok=True)
             open(path, "w").close()
-        return 99
+        self._lockfiles.add(path)
+        return ("lockfile", path)
+
+    def realpath(self, path):
+        if self.launcher_target and str(path).endswith("x-terminal-emulator"):
+            return self.launcher_target
+        return os.path.realpath(path) if os.path.exists(path) else path
 
     def pid_alive(self, pid):
         return pid in self.alive_pids
 
+    def pid_start(self, pid):
+        if pid in self.proc_table:
+            return self.proc_table[pid].start
+        return self.pid_starts.get(pid)
+
+    def _run_snap(self, consume=False):
+        script = self.follow_script
+        if script is None:
+            script = [
+                {"active": "activating",
+                 "show": "Result=\nExecMainStatus=0\nActiveState=activating\nLoadState=loaded\n"},
+                {"active": "inactive",
+                 "show": "Result=success\nExecMainStatus=0\nActiveState=inactive\nLoadState=loaded\n"},
+            ]
+        i = self.follow_idx
+        if i >= len(script):
+            i = len(script) - 1
+        snap = script[i]
+        if consume and self.follow_idx < len(script):
+            self.follow_idx += 1
+        return snap
+
+    def _maybe_smoke_crash(self, app):
+        after = self.smoke_crash_after.get(app)
+        started = self._smoke_started_at.get(app)
+        if after is None or started is None:
+            return
+        if self.clock.t - started >= after:
+            self.journal_crash.add(app)
+            doomed = [pid for pid, p in self.proc_table.items()
+                      if app in p.exe or os.path.basename(p.exe).lower() == app]
+            for pid in doomed:
+                self.proc_table.pop(pid, None)
+
+    def run_inherit(self, argv, timeout=None, env=None, cwd=None, wait_after_s=3600):
+        return self.run(argv, timeout=timeout, env=env, cwd=cwd)
+
     def unlock(self, fd):
-        pass
+        if isinstance(fd, tuple) and fd[0] == "lockfile":
+            self._lockfiles.discard(fd[1])
 
     # debs
     def make_deb(self, d, pkg, ver, arch="amd64", md5="m-"):
@@ -214,7 +275,10 @@ class FakeSystem(System):
             fh.write("m-" + pkg + ver)
 
     # subprocess
-    def run(self, argv, input=None, timeout=None, env=None, cwd=None):
+    def run_inherit(self, argv, timeout=None, env=None, cwd=None):
+        return self.run(argv, input=None, timeout=timeout, env=env, cwd=cwd)
+
+    def run(self, argv, input=None, timeout=None, env=None, cwd=None, **_kw):
         argv = list(argv)
         self.calls.append((argv, input, env))
         if argv[:1] == ["sudo"]:
@@ -248,6 +312,8 @@ class FakeSystem(System):
             return Result(0, "".join(f" {argv[2]} | {v} | http://repo stable/main amd64 Packages\n"
                                      for v in self.repo.get(argv[2], [])))
         if argv[:2] == ["apt-mark", "showhold"]:
+            if self.showhold_fail:
+                return Result(1, "", "apt-mark: could not get lock")
             return Result(0, "".join(h + "\n" for h in sorted(self.held)))
         if argv[:2] == ["dpkg", "--compare-versions"]:
             a, op, b = argv[2:5]
@@ -282,13 +348,22 @@ class FakeSystem(System):
                 self.next_spawn_pid += 1
                 self.spawned.append((inner, None, pid))
                 self.prompt_pids[unit] = pid
-                if not self.spawn_dies_immediately:
+                if not self.spawn_dies_immediately and not self.spawn_forks:
                     self.alive_pids.add(pid)
+                return Result(0)
+            if unit.startswith("twin-update-run-"):
+                inner = argv[argv.index("--") + 1:] if "--" in argv else argv
+                self.run_units.append((unit, inner))
+                self.spawned.append((inner, None, None))
+                self.events.append((self.user, "RUN-UNIT", unit))
                 return Result(0)
             self.events.append((self.user, "LAUNCH", unit))
             if unit.startswith("twin-smoke-"):
                 app = unit[len("twin-smoke-"):].rsplit("-", 1)[0]
-                if app in self.smoke_handoff:
+                self._smoke_started_at[app] = self.clock.t
+                if app in self.smoke_late:
+                    return Result(0)
+                if app in self.smoke_handoff or app in self.smoke_crash_after:
                     exe = (self.files.get(app) or ["/usr/share/cursor/cursor"])[0]
                     self.add_app_procs(exe)
             return Result(0)
@@ -296,25 +371,76 @@ class FakeSystem(System):
             unit = argv[3] if len(argv) > 3 else ""
             if unit.startswith("twin-smoke-"):
                 app = unit[len("twin-smoke-"):].rsplit("-", 1)[0]
-                if app in self.smoke_handoff:
+                if app in self.smoke_late and app not in self._smoke_spawned:
+                    exe = (self.files.get(app) or ["/usr/share/cursor/cursor"])[0]
+                    self.add_app_procs(exe)
+                    self._smoke_spawned.add(app)
+                self._maybe_smoke_crash(app)
+                if app in self.smoke_handoff or app in self.smoke_crash_after:
                     return Result(3, "inactive")
                 return Result(0, "failed" if app in self.smoke_dies else "active")
+            if unit.startswith("twin-update-run-"):
+                snap = self._run_snap(consume=False)
+                state = snap.get("active", "inactive")
+                return Result(0 if state == "active" else 3, state)
             return Result(3, "inactive")
+        if argv[:3] == ["systemctl", "--user", "reset-failed"]:
+            unit = argv[3] if len(argv) > 3 else ""
+            self.cleaned_units.append(("reset-failed", unit))
+            return Result(0)
+        if argv[:3] == ["systemctl", "--user", "stop"]:
+            unit = argv[3] if len(argv) > 3 else ""
+            self.cleaned_units.append(("stop", unit))
+            return Result(0)
         if argv[:3] == ["systemctl", "--user", "is-enabled"]:
             return Result(0, "enabled\n")
         if argv[:3] == ["systemctl", "--user", "show-environment"]:
             if self.no_graphical:
                 return Result(0, "LANG=C\n")
             return Result(0, "WAYLAND_DISPLAY=wayland-1\nDISPLAY=:0\n")
+        if argv[:3] == ["systemctl", "--user", "cat"]:
+            name = argv[3] if len(argv) > 3 else ""
+            if name in self.unit_files:
+                return Result(0, self.unit_files[name])
+            return Result(1, "", "No files found")
         if argv[:3] == ["systemctl", "--user", "show"]:
             if any("twin-update-check.timer" in a for a in argv):
                 return Result(0, "UnitFileState=enabled\nActiveState=active\n"
                               "NextElapseUSecRealtime=Mon 2026-10-26 09:13:00 UTC\n")
-            for a in argv:
-                if a in self.prompt_pids:
-                    return Result(0, str(self.prompt_pids[a]) + "\n")
+            unit = next((a for a in argv[3:] if not a.startswith("--")), "")
+            if unit in self.prompt_pids:
+                n = self._mainpid_reads.get(unit, 0)
+                self._mainpid_reads[unit] = n + 1
+                pid = self.prompt_pids[unit]
+                if self.mainpid_zero_first and n == 0:
+                    pid = 0
+                if self.spawn_dies_immediately:
+                    state = "inactive"
+                elif self.spawn_forks:
+                    state = "activating"
+                else:
+                    state = "active"
+                return Result(0, f"MainPID={pid}\nActiveState={state}\nLoadState=loaded\n")
+            if unit.startswith("twin-update-run-"):
+                snap = self._run_snap(consume=True)
+                text = snap.get("show", "")
+                return Result(snap.get("rc", 0), text)
+            if unit.startswith("twin-smoke-"):
+                return Result(0, "MainPID=0\nActiveState=active\n")
             return Result(127, "", f"fake: unknown {argv}")
-        if cmd in ("journalctl", "notify-send", "gdbus"):
+        if cmd == "journalctl":
+            unit = ""
+            if "-u" in argv:
+                unit = argv[argv.index("-u") + 1]
+            app = ""
+            if unit.startswith("twin-smoke-"):
+                app = unit[len("twin-smoke-"):].rsplit("-", 1)[0]
+            if app in self.journal_crash or app in self.smoke_crash_after:
+                self._maybe_smoke_crash(app)
+                if app in self.journal_crash:
+                    return Result(0, "segmentation fault\n")
+            return Result(0, "")
+        if cmd in ("notify-send", "gdbus"):
             return Result(0, "")
         return Result(127, "", f"fake: unknown {argv}")
 
@@ -352,11 +478,13 @@ class FakeSystem(System):
 
 
 class FakeUI:
-    def __init__(self, password=PW, confirm=False, eof=False, confirm_timeout=False):
+    def __init__(self, password=PW, confirm=False, eof=False, confirm_timeout=False,
+                 can_prompt=True):
         self.password = password
         self.answer = confirm
         self.eof = eof
         self.confirm_timeout = confirm_timeout
+        self._can_prompt = can_prompt
         self.lines = []
         self.prompts = []
         self.timeouts = []
@@ -364,8 +492,13 @@ class FakeUI:
     def say(self, msg):
         self.lines.append(msg)
 
+    def can_prompt(self):
+        return self._can_prompt
+
     def getpass(self, prompt):
         self.prompts.append(prompt)
+        if self.eof:
+            raise EOFError
         return self.password
 
     def confirm(self, prompt, timeout_s=None):
@@ -397,6 +530,8 @@ class Twin:
             cfg = load(text=text, home=s.home())
             e = Engine(cfg, s, label, log=self.logs.append)
             e.archives, e.dpkg_info = s.archives_dir, s.info_dir
+            e.dpkg_updates = os.path.join(s.root, "dpkg-updates")
+            os.makedirs(e.dpkg_updates)
             e.apt_lists = os.path.join(s.root, "lists")
             os.makedirs(os.path.join(e.apt_lists, "partial"))
             ago = self.clock.t - 7200                      # system lists refreshed 2 h ago

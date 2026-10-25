@@ -51,7 +51,19 @@ class System:
             return False
         return True
 
-    def try_lockfile(self, path: str):
+    def pid_start(self, pid: int) -> int | None:
+        """Starttime ticks for a live pid, used to reject PID reuse in the slot."""
+        if not isinstance(pid, int) or pid <= 0:
+            return None
+        try:
+            with open(f"/proc/{pid}/stat", "rb") as fh:
+                raw = fh.read().decode("utf-8", "replace")
+            fields = raw[raw.rindex(")") + 2:].split()
+            return int(fields[19])
+        except (OSError, ValueError, IndexError):
+            return None
+
+    def try_lockfile(self, path: str, blocking: bool = False):
         """Exclusive flock on a lockfile, created if needed. None if busy."""
         import fcntl
         os.makedirs(os.path.dirname(path) or ".", mode=0o700, exist_ok=True)
@@ -59,8 +71,9 @@ class System:
             fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
         except OSError:
             return None
+        flags = fcntl.LOCK_EX if blocking else fcntl.LOCK_EX | fcntl.LOCK_NB
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd, flags)
         except OSError:
             os.close(fd)
             return None
@@ -68,16 +81,79 @@ class System:
 
     def run(self, argv, input: bytes | None = None, timeout: float | None = None,
             env: dict | None = None, cwd: str | None = None) -> Result:
+        """Run a command. Never SIGKILL the child on interrupt or timeout.
+
+        KeyboardInterrupt waits for the child to finish, then is re-raised
+        so apt/dpkg/sudo can complete or fail on their own.
+        """
         try:
-            cp = subprocess.run(list(argv), input=input, capture_output=True,
-                                timeout=timeout, env=env, cwd=cwd,
-                                stdin=None if input is not None else subprocess.DEVNULL)
+            proc = subprocess.Popen(
+                list(argv),
+                stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                env=env, cwd=cwd)
         except FileNotFoundError as exc:
             return Result(127, "", str(exc))
+        interrupted = False
+        try:
+            out, err = proc.communicate(input=input, timeout=timeout)
+        except KeyboardInterrupt:
+            interrupted = True
+            try:
+                out, err = proc.communicate(timeout=3600)
+            except subprocess.TimeoutExpired:
+                raise KeyboardInterrupt
         except subprocess.TimeoutExpired:
-            return Result(124, "", "timeout")
-        return Result(cp.returncode, cp.stdout.decode("utf-8", "replace"),
-                      cp.stderr.decode("utf-8", "replace"))
+            try:
+                out, err = proc.communicate(timeout=60)
+            except subprocess.TimeoutExpired:
+                return Result(124, "", "timeout")
+        result = Result(proc.returncode if proc.returncode is not None else 1,
+                        out.decode("utf-8", "replace"),
+                        err.decode("utf-8", "replace"))
+        if interrupted:
+            raise KeyboardInterrupt
+        return result
+
+    def run_inherit(self, argv, timeout: float | None = None,
+                    env: dict | None = None, cwd: str | None = None,
+                    wait_after_s: float = 3600) -> Result:
+        """Run without capturing stdio so a window tty stays attached.
+
+        The child is in its own session so Ctrl-C in this window does not hit
+        it. SIGINT/SIGHUP are ignored here while it exists. The child is
+        never SIGKILL'd: a timeout waits further, then reports that it is
+        still running.
+        """
+        prev = {}
+        for sig in (signal.SIGINT, signal.SIGHUP):
+            try:
+                prev[sig] = signal.signal(sig, signal.SIG_IGN)
+            except (ValueError, OSError):
+                pass
+        try:
+            try:
+                proc = subprocess.Popen(list(argv), env=env, cwd=cwd,
+                                        start_new_session=True)
+            except FileNotFoundError as exc:
+                return Result(127, "", str(exc))
+            try:
+                rc = proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                try:
+                    rc = proc.wait(timeout=wait_after_s)
+                except subprocess.TimeoutExpired:
+                    return Result(
+                        124, "",
+                        "the update is still running; cancel with "
+                        "systemctl --user stop <the update unit>")
+            return Result(rc if rc is not None else 1, "", "")
+        finally:
+            for sig, old in prev.items():
+                try:
+                    signal.signal(sig, old)
+                except (ValueError, OSError):
+                    pass
 
     # identity -----------------------------------------------------------
     def whoami(self) -> str:
@@ -240,14 +316,46 @@ class System:
         except OSError:
             return None
 
-    def write_private(self, path: str, text: str) -> None:
-        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
-        tmp = path + ".tmp"
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(text)
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, path)
+    def write_private(self, path: str, text: str) -> bool:
+        tmp = None
+        try:
+            parent = os.path.dirname(path)
+            if parent:
+                os.makedirs(parent, mode=0o700, exist_ok=True)
+            tmp = path + f".tmp.{os.getpid()}.{time.monotonic_ns()}"
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(text)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, path)
+            return True
+        except OSError:
+            if tmp:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+            return False
+
+    def write_inplace(self, path: str, text: str) -> bool:
+        """Write without replacing the inode, so an flock on this file survives."""
+        try:
+            parent = os.path.dirname(path)
+            if parent:
+                os.makedirs(parent, mode=0o700, exist_ok=True)
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                os.write(fd, text.encode("utf-8"))
+                os.fsync(fd)
+                os.fchmod(fd, 0o600)
+            finally:
+                os.close(fd)
+            return True
+        except OSError:
+            return False
+
+    def realpath(self, path: str) -> str:
+        return os.path.realpath(path)
 
     def makedirs(self, path: str) -> None:
         os.makedirs(path, mode=0o700, exist_ok=True)

@@ -10,6 +10,7 @@ import select
 import shutil
 import signal
 import sys
+import time
 
 from twin_update import __version__, notice, orchestrator
 from twin_update.config import ConfigError, load
@@ -25,22 +26,55 @@ class ConsoleUI:
         except OSError:  # terminal went away (e.g. the app hosting it was closed)
             pass
 
+    def can_prompt(self) -> bool:
+        return sys.stdin.isatty()
+
     def getpass(self, prompt: str) -> str:
-        return getpass.getpass(prompt)
+        if not sys.stdin.isatty():
+            raise EOFError(notice.SUDO_NEEDED)
+        # Read this process's stdin (echo off). getpass() uses /dev/tty and
+        # would miss a systemd-run --scope that inherited the window tty.
+        fd = sys.stdin.fileno()
+        try:
+            import termios
+            old = termios.tcgetattr(fd)
+            cfg = list(old)
+            cfg[3] &= ~termios.ECHO
+            termios.tcsetattr(fd, termios.TCSADRAIN, cfg)
+            try:
+                print(prompt, end="", flush=True)
+                line = sys.stdin.readline()
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old)
+                print(flush=True)
+        except (OSError, AttributeError):
+            try:
+                return getpass.getpass(prompt)
+            except (EOFError, OSError):
+                raise EOFError(notice.SUDO_NEEDED) from None
+        if not line:
+            raise EOFError(notice.SUDO_NEEDED)
+        return line.rstrip("\n")
 
     def confirm(self, prompt: str, timeout_s: float | None = None) -> bool:
         if not sys.stdin.isatty():
-            return False
+            raise EOFError("no terminal for confirm")
         try:
-            if timeout_s is None:
-                return input(prompt + " [y/N] ").strip().lower() in ("y", "yes")
+            # Read inherited stdin (same fd as getpass). input() would use
+            # the process tty and miss a systemd-run --scope window.
             print(prompt + " [y/N] ", end="", flush=True)
-            ready, _, _ = select.select([sys.stdin], [], [], timeout_s)
-            if not ready:
-                print("(timed out; defaulting to no)", flush=True)
-                return False
-            return sys.stdin.readline().strip().lower() in ("y", "yes")
-        except (EOFError, OSError):
+            if timeout_s is not None:
+                ready, _, _ = select.select([sys.stdin], [], [], timeout_s)
+                if not ready:
+                    print("(timed out; defaulting to no)", flush=True)
+                    return False
+            line = sys.stdin.readline()
+            if not line:
+                raise EOFError("no terminal for confirm")
+            return line.strip().lower() in ("y", "yes")
+        except (EOFError, OSError) as exc:
+            if isinstance(exc, EOFError):
+                raise
             return False
 
     def pause(self, msg: str = "Press Enter to close.") -> None:
@@ -54,12 +88,16 @@ def _detach_if_needed(args) -> None:
     """Re-exec in its own systemd user scope so closing the app that hosts our
     terminal (e.g. Grok Bot) does not kill the run. The scope ends with us."""
     if args.no_detach or os.environ.get("TWIN_UPDATE_SCOPE") == "1":
+        # Closing the prompt window sends SIGHUP; ignore it so apt continues.
+        # SIGTERM (systemctl --user stop) is handled in the orchestrator.
         signal.signal(signal.SIGHUP, signal.SIG_IGN)
         return
     if not shutil.which("systemd-run"):
         signal.signal(signal.SIGHUP, signal.SIG_IGN)
         return
-    argv = ["systemd-run", "--user", "--scope", "--quiet", "--collect", "--",
+    unit = f"twin-update-run-{int(time.time())}-{os.getpid()}-{os.urandom(2).hex()}"
+    argv = ["systemd-run", "--user", "--scope", "--quiet", f"--unit={unit}",
+            "-p", "TimeoutStopSec=5400", "--",
             "env", "TWIN_UPDATE_SCOPE=1", sys.executable, *sys.argv]
     os.execvp(argv[0], argv)
 
@@ -70,6 +108,23 @@ def _without_label(label: str, why: str) -> str:
     while why.startswith(prefix):
         why = why[len(prefix):]
     return why
+
+
+def _argv_cmd(argv) -> str | None:
+    """First positional token, skipping global flags. Used to hide internal commands."""
+    args = list(argv) if argv is not None else sys.argv[1:]
+    takes_value = {"--config"}
+    i = 0
+    while i < len(args):
+        tok = args[i]
+        if tok in takes_value and i + 1 < len(args):
+            i += 2
+            continue
+        if tok.startswith("-"):
+            i += 1
+            continue
+        return tok
+    return None
 
 
 def _build(args, ui, system=None, peer_factory=SshPeer):
@@ -133,6 +188,26 @@ def _print(ui, data, as_json: bool) -> None:
                     ui.say(f"{l:8} timer next: {v or 'unknown'}")
                 elif k == "last_window":
                     ui.say(f"{l:8} last window: {v or 'none'}")
+                elif k == "window_open_since":
+                    if v:
+                        ui.say(f"{l:8} window open since: {v}")
+                elif k == "rollback_holds":
+                    if v:
+                        ui.say(f"{l:8} rollback holds: {'; '.join(v)}")
+                elif k == "slot_pid_reused":
+                    if v:
+                        ui.say(f"{l:8} slot pid reused: yes")
+                elif k == "record_notice_error":
+                    if v:
+                        ui.say(f"{l:8} record notice: {v}")
+                elif k == "dpkg_interrupted":
+                    if v:
+                        ui.say(f"{l:8} dpkg interrupted: run sudo dpkg --configure -a")
+                elif k == "bad_state":
+                    for item in (v or []):
+                        ui.say(f"{l:8} state file: {item}")
+                elif k in ("locks_ok", "window_stale", "unit_warnings"):
+                    continue
                 elif k != "locks_ok":
                     ui.say(f"{l:8} {k:18} {'ok' if v else 'NO'}")
         for l, why in data.get("unreachable", {}).items():
@@ -245,8 +320,10 @@ def main(argv=None, ui=None, system=None, peer_factory=SshPeer) -> int:
     p = sub.add_parser("local", help="per-machine engine (used by the peer over ssh)")
     p.add_argument("--serve", action="store_true")
     p.add_argument("--as", dest="as_label", default=None)
-    p = sub.add_parser("raft-upload", help=argparse.SUPPRESS)
-    p.add_argument("snapshot")
+    # Hide the internal raft helper from --help (SUPPRESS prints as "==SUPPRESS==").
+    if _argv_cmd(argv) == "raft-upload":
+        p = sub.add_parser("raft-upload")
+        p.add_argument("snapshot")
 
     args = ap.parse_args(argv)
     system = system or System()
@@ -284,6 +361,10 @@ def main(argv=None, ui=None, system=None, peer_factory=SshPeer) -> int:
                 return 2
             _detach_if_needed(args)
 
+        if args.cmd == "prompt":
+            ui.say(notice.CHECKING)
+            if getattr(args, "slot", None):
+                notice.mark_started(system, args.slot, system.own_pid())
         cfg, sess, unreachable, me, peer = _build(args, ui, system, peer_factory)
         try:
             if args.cmd == "status":
@@ -318,9 +399,36 @@ def main(argv=None, ui=None, system=None, peer_factory=SshPeer) -> int:
             sess.close()
     except ConfigError as exc:
         ui.say(f"config error: {exc}")
+        if getattr(args, "cmd", None) == "prompt" and hasattr(ui, "pause"):
+            ui.pause("Press Enter to close.")
         return 2
     except PeerError as exc:
         ui.say(f"error: {exc}")
+        if getattr(args, "cmd", None) == "prompt" and hasattr(ui, "pause"):
+            ui.pause("Press Enter to close.")
+        return 1
+    except EOFError as exc:
+        ui.say(str(exc) if str(exc) else notice.SUDO_NEEDED)
+        return 1
+    except KeyboardInterrupt:
+        ui.say("stopped")
+        return 1
+    except Exception as exc:
+        import traceback
+        text = traceback.format_exc()
+        log_path = None
+        try:
+            home = system.home()
+            state = os.path.join(home, ".local/state/twin-update")
+            log_path = os.path.join(state, "last-error.log")
+            system.write_private(log_path, text)
+        except Exception:
+            log_path = None
+        ui.say(f"internal error: {exc}")
+        if log_path:
+            ui.say(f"details: {log_path}")
+        if getattr(args, "cmd", None) == "prompt" and hasattr(ui, "pause"):
+            ui.pause("Press Enter to close.")
         return 1
     _print(ui, data, args.json)
     if data.get("kind") == "check":
@@ -330,7 +438,13 @@ def main(argv=None, ui=None, system=None, peer_factory=SshPeer) -> int:
     if data.get("kind") == "doctor":
         return 0 if data.get("ok") else 4
     res = data.get("result")
-    return 0 if res in (None, "ok", "dry-run") else (3 if res == "aborted" else 1)
+    if res in (None, "ok", "dry-run"):
+        return 0
+    if data.get("interrupted"):
+        return 3
+    if res == "aborted":
+        return 5
+    return 1
 
 
 def _age(h) -> str:
@@ -378,23 +492,22 @@ def _check_notify(sess, me: str, data: dict, system, config_path: str | None) ->
         return "already opened a window today"
     env = notice.graphical_env(system)
     if not env:
-        return "no graphical session; will retry at next login"
-    slot = notice.window_lock_path(sess.cfg.state_dir)
+        return "no graphical session; not retried until the next timer run"
+    slot = notice.window_lock_path(sess.cfg.state_dir, test=False)
     token = notice.try_begin_window(system, slot)
     if token is None:
-        return "window already open"
+        return notice.already_open_message(system, slot)
     try:
         inner = notice.prompt_argv(config_path, test=False, slot=slot)
-        argv = notice.launcher_argv(system.which, inner)
+        argv = notice.launcher_argv(system.which, inner, realpath=system.realpath)
         if not argv:
             return "failed (no cosmic-term or x-terminal-emulator)"
-        pid = notice.start_prompt_window(system, argv, env)
+        pid, unit = notice.start_prompt_window(system, argv, env)
         if pid is None:
             return "failed (could not start the window)"
-        notice.write_window_pid(system, slot, pid, started=False)
-        if not notice.verify_window(system, slot, pid):
+        if not _keep_launched_window(system, slot, pid, unit, env):
             return "window exited immediately; not recorded"
-        local.call("record_notice", kind=kind, signature=sig)
+        # The day is recorded inside the window after the question is shown.
         try:
             local.call("notify", summary=APP_NAME, body=notice.EXTRA_NOTIFY_BODY)
         except Exception:
@@ -407,29 +520,42 @@ def _check_notify(sess, me: str, data: dict, system, config_path: str | None) ->
 APP_NAME = notice.APP_NAME
 
 
+def _keep_launched_window(system, slot: str, pid: int | None, unit: str | None,
+                          env: dict | None) -> bool:
+    """Record the launch. Do not clear a pid-0 slot while the unit is still up."""
+    notice.write_window_pid(system, slot, pid if isinstance(pid, int) else 0,
+                            started=False, unit=unit, already_locked=True)
+    if notice.verify_window(system, slot, pid if isinstance(pid, int) else 0):
+        return True
+    if notice.unit_still_up(system, unit, env):
+        return True
+    notice.clear_slot(system, slot)
+    return False
+
+
 def _open_prompt_window(system, config_path: str | None, state_dir: str,
                         test: bool) -> dict:
     env = notice.graphical_env(system)
     if not env:
         return {"kind": "prompt", "opened": False, "window": "no graphical session",
                 "answer": None}
-    slot = notice.window_lock_path(state_dir)
+    slot = notice.window_lock_path(state_dir, test=test)
     token = notice.try_begin_window(system, slot)
     if token is None:
-        return {"kind": "prompt", "opened": False, "window": "window already open",
+        return {"kind": "prompt", "opened": False,
+                "window": notice.already_open_message(system, slot),
                 "answer": None}
     try:
         inner = notice.prompt_argv(config_path, test=test, slot=slot)
-        argv = notice.launcher_argv(system.which, inner)
+        argv = notice.launcher_argv(system.which, inner, realpath=system.realpath)
         if not argv:
             return {"kind": "prompt", "opened": False,
                     "window": "no cosmic-term or x-terminal-emulator", "answer": None}
-        pid = notice.start_prompt_window(system, argv, env)
+        pid, unit = notice.start_prompt_window(system, argv, env)
         if pid is None:
             return {"kind": "prompt", "opened": False,
                     "window": "could not start the window", "answer": None}
-        notice.write_window_pid(system, slot, pid, started=False)
-        opened = notice.verify_window(system, slot, pid)
+        opened = _keep_launched_window(system, slot, pid, unit, env)
         return {"kind": "prompt", "opened": opened, "pid": pid,
                 "window": "opened a window" if opened else "window exited immediately",
                 "answer": None, "launcher": argv[0]}
@@ -466,24 +592,47 @@ def _prompt_inside(ui, test: bool, slot: str | None, system, items=None,
 
 def _prompt_here(args, ui, sess, unreachable, system, peer_factory) -> dict:
     """Re-check, then ask. Does not hold the sync lock while waiting."""
+    del peer_factory
     if args.slot:
         notice.mark_started(system, args.slot, system.own_pid())
+    run_rc = [0]
     try:
-        data = orchestrator.check(sess, unreachable, fresh=not getattr(args, "no_fetch", False))
+        try:
+            data = orchestrator.check(sess, unreachable,
+                                     fresh=not getattr(args, "no_fetch", False))
+        except Exception as exc:
+            ui.say(str(exc))
+            if hasattr(ui, "pause"):
+                ui.pause("Press Enter to close.")
+            return {"kind": "prompt", "answer": "error", "result": "error",
+                    "exit_code": 1, "error": str(exc)}
         items = notice.items_from_check(data, sess.cfg.apps)
+        errors = dict(data.get("errors") or {})
+        sig = "\n".join(data.get("summary") or [])
+        me = sess.order[0] if sess.order else None
+        local = sess.peers.get(me) if me else None
+
+        def on_shown():
+            if local is None:
+                return
+            try:
+                local.call("record_notice", kind="updates", signature=sig)
+            except Exception as exc:
+                ui.say(f"warning: could not record today's prompt ({exc})")
+                notice.note_record_failure(system, sess.cfg.state_dir, str(exc))
+
         sess.close()
 
-        run_rc = [0]
-
         def run_fn():
-            extra = ["--config", args.config] if args.config else []
-            run_rc[0] = main([*extra, "run", "--no-detach"], ui=ui, system=system,
-                             peer_factory=peer_factory)
+            env = notice.graphical_env(system) or system.env()
+            run_rc[0] = notice.start_and_follow_run(
+                system, notice.run_argv(args.config), env, ui)
 
-        answer = notice.run_prompt(ui, items, test=False, run_fn=run_fn)
+        answer = notice.run_prompt(ui, items, test=False, run_fn=run_fn,
+                                   errors=errors, on_shown=on_shown)
         return {"kind": "prompt", "answer": answer, "check": data,
                 "result": answer, "summary": data.get("summary") or [],
-                "exit_code": run_rc[0] if answer == "run" else 0}
+                "exit_code": run_rc[0] if answer == "run" else (1 if answer == "error" else 0)}
     finally:
         if args.slot:
             notice.clear_slot(system, args.slot)

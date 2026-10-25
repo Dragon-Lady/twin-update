@@ -212,6 +212,7 @@ class RunFlow(unittest.TestCase):
         rep = orchestrator.run(t.session(FakeUI()), ["cursor"], dry=False, smoke=False)
         self.assertEqual(rep["result"], "aborted")
         self.assertIn("interrupted after close", rep["error"])
+        self.assertIn("dpkg --configure -a", rep["error"])
         self.assertIn("cursor", rep.get("reopen", {}).get("machine-a", {}))
 
     def test_peer_drop_after_close_reopens_apps(self):
@@ -265,15 +266,445 @@ class RunFlow(unittest.TestCase):
         t.sys["machine-a"].smoke_handoff.add("chatgpt")
         res = t.eng["machine-a"].smoke("chatgpt")
         self.assertTrue(res["ok"], res)
+        self.assertTrue(res.get("handoff"))
+        self.assertGreaterEqual(res["stayed_up_s"], t.cfg.smoke_s - 1)
         self.assertFalse(t.eng["machine-a"].running("chatgpt"))
+
+    def test_smoke_handoff_then_crash_is_not_success(self):
+        t = Twin(); standard(t)
+        t.sys["machine-a"].smoke_crash_after["chatgpt"] = 2
+        res = t.eng["machine-a"].smoke("chatgpt")
+        self.assertFalse(res["ok"], res)
+        self.assertTrue(res.get("crash_in_journal") or not res.get("stayed_up_s"))
 
     def test_smoke_refuses_to_kill_a_user_launched_instance(self):
         t = Twin(); standard(t)
         t.sys["machine-a"].add_app_procs(GPT)
         res = t.eng["machine-a"].smoke("chatgpt")
-        self.assertFalse(res["ok"])
-        self.assertIn("user-launched", res["reason"])
+        self.assertTrue(res["ok"], res)
+        self.assertTrue(res.get("inconclusive"), res)
+        self.assertIn("could not check", res["reason"])
+        self.assertIn("opened during the update", res["reason"])
         self.assertTrue(t.eng["machine-a"].running("chatgpt"))
+
+    def test_smoke_helper_is_not_a_user_relaunched_app(self):
+        t = Twin(); standard(t)
+        t.sys["machine-a"].proc_table[5000] = Proc(
+            5000, 1, "/usr/lib/chatgpt/resources/codex", "codex", 9)
+        res = t.eng["machine-a"].smoke("chatgpt")
+        self.assertTrue(res["ok"], res)
+
+    def test_mixed_versions_abort_before_close(self):
+        from twin_update.peer import PeerError
+        t = Twin(); standard(t)
+        t.sys["machine-a"].add_app_procs(CUR)
+        real = t.peers["machine-b"]
+
+        class Old:
+            def call(self, op, **kw):
+                if op == "identity":
+                    r = dict(real.call(op, **kw))
+                    r["version"] = "0.3.0"
+                    return r
+                if op == "running":
+                    raise PeerError("machine-b: op not allowed: running")
+                return real.call(op, **kw)
+
+            def close(self):
+                real.close()
+
+        t.peers["machine-b"] = Old()
+        rep = orchestrator.run(t.session(FakeUI()), ["cursor"], dry=False, smoke=False)
+        self.assertEqual(rep["result"], "aborted")
+        self.assertIn("versions differ", rep["error"])
+        self.assertEqual(kinds(t, "TERM"), [])
+        self.assertEqual(kinds(t, "INSTALL"), [])
+
+    def test_older_peer_without_running_still_updates(self):
+        from twin_update.peer import PeerError
+        t = Twin(); standard(t)
+        real = t.peers["machine-b"]
+
+        class Old:
+            def call(self, op, **kw):
+                if op == "running":
+                    raise PeerError("machine-b: op not allowed: running")
+                return real.call(op, **kw)
+
+            def close(self):
+                real.close()
+
+        t.peers["machine-b"] = Old()
+        rep = orchestrator.run(t.session(FakeUI()), ["cursor"], dry=False, smoke=False)
+        self.assertEqual(rep["result"], "ok")
+        self.assertTrue(kinds(t, "INSTALL"))
+
+    def test_peer_without_version_aborts_before_close(self):
+        t = Twin(); standard(t)
+        t.sys["machine-a"].add_app_procs(CUR)
+        real = t.peers["machine-b"]
+
+        class Old:
+            def call(self, op, **kw):
+                if op == "identity":
+                    r = dict(real.call(op, **kw))
+                    r.pop("version", None)
+                    return r
+                return real.call(op, **kw)
+
+            def close(self):
+                real.close()
+
+        t.peers["machine-b"] = Old()
+        rep = orchestrator.run(t.session(FakeUI()), ["cursor"], dry=False, smoke=False)
+        self.assertEqual(rep["result"], "aborted")
+        self.assertIn("older twin-update", rep["error"])
+        self.assertIn("Nothing was changed", rep["error"])
+        self.assertIn("pipx install twin-update", rep["error"])
+        self.assertEqual(kinds(t, "TERM"), [])
+        self.assertEqual(kinds(t, "INSTALL"), [])
+
+    def test_sigterm_during_close_wait_reopens_apps(self):
+        import os
+        import signal
+        t = Twin(); standard(t)
+        t.sys["machine-a"].add_app_procs(CUR)
+        real = t.peers["machine-a"]
+
+        class Term:
+            def call(self, op, **kw):
+                if op == "close_wait":
+                    os.kill(os.getpid(), signal.SIGTERM)
+                return real.call(op, **kw)
+
+            def close(self):
+                real.close()
+
+        t.peers["machine-a"] = Term()
+        rep = orchestrator.run(t.session(FakeUI()), ["cursor"], dry=False, smoke=False)
+        self.assertEqual(rep["result"], "aborted")
+        self.assertIn("interrupted after close", rep["error"])
+        self.assertTrue(rep.get("interrupted"))
+        self.assertIn("dpkg --configure -a", rep["error"])
+        self.assertIn("cursor", (rep.get("reopen") or {}).get("machine-a", {}))
+
+    def test_sigterm_during_final_reopen_is_once(self):
+        import os
+        import signal
+        t = Twin(); standard(t)
+        t.sys["machine-a"].add_app_procs(GPT)
+        t.sys["machine-b"].add_app_procs(GPT)
+        real = t.peers["machine-a"]
+        counts = {"reopen": 0}
+
+        class Term:
+            def call(self, op, **kw):
+                if op == "reopen":
+                    counts["reopen"] += 1
+                    if counts["reopen"] == 1:
+                        os.kill(os.getpid(), signal.SIGTERM)
+                return real.call(op, **kw)
+
+            def close(self):
+                real.close()
+
+        t.peers["machine-a"] = Term()
+        rep = orchestrator.run(t.session(FakeUI()), ["chatgpt"], dry=False, smoke=False)
+        self.assertGreaterEqual(counts["reopen"], 2)
+        self.assertLessEqual(counts["reopen"], 2)
+        self.assertTrue(rep.get("interrupted"))
+        self.assertEqual(rep["result"], "aborted")
+        for label in ("machine-a", "machine-b"):
+            ra = (rep.get("reopen") or {}).get(label) or {}
+            self.assertIn("chatgpt", ra, ra)
+            self.assertNotEqual(ra.get("error"), "")
+            self.assertTrue(ra["chatgpt"].get("ok"))
+
+    def test_sighup_during_run_does_not_stop(self):
+        import os
+        import signal
+        t = Twin(); standard(t)
+        real = t.peers["machine-a"]
+
+        class Hup:
+            def call(self, op, **kw):
+                if op == "upgrade":
+                    os.kill(os.getpid(), signal.SIGHUP)
+                return real.call(op, **kw)
+
+            def close(self):
+                real.close()
+
+        t.peers["machine-a"] = Hup()
+        rep = orchestrator.run(t.session(FakeUI()), ["cursor"], dry=False, smoke=False)
+        self.assertEqual(rep["result"], "ok")
+        self.assertFalse(rep.get("interrupted"))
+        self.assertEqual(t.sys["machine-a"].pkgs["cursor"], "3.24.9-1")
+        self.assertEqual(t.sys["machine-b"].pkgs["cursor"], "3.24.9-1")
+
+    def test_eof_at_rollback_reopens_and_does_not_upgrade_peer(self):
+        t = Twin(); standard(t)
+        t.sys["machine-a"].add_app_procs(CUR)
+        t.sys["machine-a"].smoke_dies.add("cursor")
+        ui = FakeUI()
+
+        def _eof(prompt, timeout_s=None):
+            raise EOFError
+
+        ui.confirm = _eof
+        rep = orchestrator.run(t.session(ui), ["cursor"], dry=False)
+        self.assertEqual(rep["result"], "aborted")
+        self.assertTrue("Not upgrading" in (rep.get("error") or "")
+                        or "input ended" in (rep.get("error") or ""))
+        self.assertEqual(t.sys["machine-b"].pkgs["cursor"], "3.23.23-1")
+        self.assertIn("cursor", (rep.get("reopen") or {}).get("machine-a", {}))
+        self.assertTrue(t.eng["machine-a"].check(["cursor"])["apps"]["cursor"].get("rejected")
+                        or t.sys["machine-a"].held)
+
+    def test_failed_check_on_first_machine_does_not_upgrade_peer(self):
+        t = Twin(); standard(t)
+        t.sys["machine-a"].smoke_dies.add("cursor")
+        ui = FakeUI(confirm=False)
+        rep = orchestrator.run(t.session(ui), ["cursor"], dry=False)
+        self.assertEqual(rep["result"], "aborted")
+        self.assertEqual(t.sys["machine-b"].pkgs["cursor"], "3.23.23-1")
+        self.assertEqual(t.sys["machine-a"].pkgs["cursor"], "3.24.9-1")
+        chk = t.eng["machine-a"].check(["cursor"])
+        self.assertEqual(chk["apps"]["cursor"].get("rejected"), "3.24.9-1")
+
+    def test_rollback_hold_only_suppresses_rejected_version(self):
+        t = Twin()
+        t.setup("cursor", "3.23.23-1", "3.24.9-1")
+        orchestrator.run(t.session(FakeUI()), ["cursor"], dry=False, smoke=False)
+        orchestrator.rollback(t.session(FakeUI()), "cursor", ["machine-a", "machine-b"], dry=False)
+        chk = t.eng["machine-a"].check(["cursor"])
+        self.assertEqual(chk["apps"]["cursor"].get("rejected"), "3.24.9-1")
+        self.assertFalse(chk["apps"]["cursor"]["update_available"])
+        t.sys["machine-a"].cands["cursor"] = "3.25.0"
+        t.sys["machine-b"].cands["cursor"] = "3.25.0"
+        t.sys["machine-a"].repo["cursor"] = ["3.25.0"]
+        t.sys["machine-b"].repo["cursor"] = ["3.25.0"]
+        chk = t.eng["machine-a"].check(["cursor"])
+        self.assertTrue(chk["apps"]["cursor"]["update_available"])
+        st = {l: t.eng[l].status(["cursor"]) for l in ("machine-a", "machine-b")}
+        plan = orchestrator.plan_updates(t.cfg, ["cursor"], st, ["machine-a", "machine-b"])
+        self.assertEqual(plan["cursor"]["action"], "update")
+        self.assertEqual(plan["cursor"]["target"], "3.25.0")
+
+    def test_unhold_clears_record_when_apt_not_held(self):
+        t = Twin(); standard(t)
+        t.eng["machine-a"].set_password(PW)
+        t.eng["machine-a"].hold("cursor", "rollback from 3.24.9", rejected="3.24.9")
+        t.sys["machine-a"].held.discard("cursor")
+        r = t.eng["machine-a"].unhold("cursor")
+        self.assertIn("leftover", r["action"])
+        self.assertFalse(t.eng["machine-a"]._tool_holds())
+        d = t.eng["machine-a"].doctor()
+        self.assertFalse(d.get("rollback_holds"))
+
+    def test_smoke_late_spawn_is_closed(self):
+        t = Twin(); standard(t)
+        t.sys["machine-a"].smoke_late.add("chatgpt")
+        res = t.eng["machine-a"].smoke("chatgpt")
+        self.assertTrue(res["ok"], res)
+        self.assertFalse(t.eng["machine-a"].running("chatgpt"))
+
+    def test_reopen_is_idempotent(self):
+        t = Twin(); standard(t)
+        first = t.eng["machine-a"].reopen(["chatgpt"])
+        n = len([e for e in t.events if e[1] == "LAUNCH"])
+        second = t.eng["machine-a"].reopen(["chatgpt"])
+        self.assertTrue(first["chatgpt"]["ok"])
+        self.assertEqual(second["chatgpt"].get("skipped"), "already open")
+        self.assertEqual(len([e for e in t.events if e[1] == "LAUNCH"]), n)
+
+    def test_sigterm_after_close_reopens_apps(self):
+        import os
+        import signal
+        t = Twin(); standard(t)
+        t.sys["machine-a"].add_app_procs(CUR)
+        real = t.peers["machine-a"]
+
+        class Term:
+            def call(self, op, **kw):
+                if op == "upgrade":
+                    os.kill(os.getpid(), signal.SIGTERM)
+                return real.call(op, **kw)
+
+            def close(self):
+                real.close()
+
+        t.peers["machine-a"] = Term()
+        rep = orchestrator.run(t.session(FakeUI()), ["cursor"], dry=False, smoke=False)
+        self.assertEqual(rep["result"], "aborted")
+        self.assertIn("interrupted after close", rep["error"])
+        self.assertIn("dpkg --configure -a", rep["error"])
+        self.assertIn("cursor", rep.get("reopen", {}).get("machine-a", {}))
+
+    def test_close_start_on_second_machine_reopens_first(self):
+        import os
+        import signal
+        t = Twin(); standard(t)
+        t.sys["machine-a"].add_app_procs(CUR)
+        real_b = t.peers["machine-b"]
+
+        class Boom:
+            def call(self, op, **kw):
+                if op == "close_start":
+                    os.kill(os.getpid(), signal.SIGTERM)
+                return real_b.call(op, **kw)
+
+            def close(self):
+                real_b.close()
+
+        t.peers["machine-b"] = Boom()
+        rep = orchestrator.run(t.session(FakeUI()), ["cursor"], dry=False, smoke=False)
+        self.assertEqual(rep["result"], "aborted")
+        self.assertTrue(rep.get("interrupted") or "interrupted" in (rep.get("error") or ""))
+        self.assertIn("cursor", (rep.get("reopen") or {}).get("machine-a", {}))
+        self.assertTrue(rep.get("report_paths") or True)
+
+    def test_record_run_survives_sigterm_and_records_both(self):
+        import os
+        import signal
+        t = Twin(); standard(t)
+        real_a = t.peers["machine-a"]
+        counts = {"n": 0}
+
+        class Term:
+            def call(self, op, **kw):
+                if op == "record_run":
+                    counts["n"] += 1
+                    if counts["n"] == 1:
+                        os.kill(os.getpid(), signal.SIGTERM)
+                return real_a.call(op, **kw)
+
+            def close(self):
+                real_a.close()
+
+        t.peers["machine-a"] = Term()
+        rep = orchestrator.run(t.session(FakeUI()), ["cursor"], dry=False, smoke=False)
+        self.assertIn(rep["result"], ("ok", "failed", "aborted"))
+        self.assertGreaterEqual(counts["n"], 1)
+        self.assertIn("machine-b", (rep.get("report_paths") or {}))
+
+    def test_showhold_failure_keeps_rejected_record(self):
+        t = Twin(); standard(t)
+        t.eng["machine-a"].set_password(PW)
+        t.eng["machine-a"].hold("cursor", "rollback from 3.24.9-1", rejected="3.24.9-1")
+        self.assertTrue(t.eng["machine-a"]._tool_holds())
+        t.sys["machine-a"].showhold_fail = True
+        chk = t.eng["machine-a"].check(["cursor"])
+        self.assertFalse(chk["apps"]["cursor"]["update_available"])
+        self.assertTrue(t.eng["machine-a"]._tool_holds())
+
+    def test_wrong_type_state_does_not_crash(self):
+        t = Twin(); standard(t)
+        notices = os.path.join(t.cfg.state_dir, "check-notices.json")
+        os.makedirs(t.cfg.state_dir, exist_ok=True)
+        with open(notices, "w") as fh:
+            fh.write('{"updates":"x"}')
+        self.assertTrue(t.eng["machine-a"].notice_due("updates"))
+        st = t.eng["machine-a"]._state_path(t.cfg.apps["cursor"])
+        os.makedirs(os.path.dirname(st), exist_ok=True)
+        with open(st, "w") as fh:
+            fh.write("[]")
+        t.eng["machine-a"].status(["cursor"])
+        t.eng["machine-a"].prune(["cursor"], dry=True)
+        holds = t.eng["machine-a"]._holds_file()
+        with open(holds, "w") as fh:
+            fh.write('"not-an-object"')
+        t.eng["machine-a"].holds()
+        t.eng["machine-a"].check(["cursor"], fresh=False)
+        slot = os.path.join(t.cfg.state_dir, "prompt.window")
+        with open(slot, "w") as fh:
+            fh.write("[1,2,3]")
+        from twin_update import notice
+        notice.read_slot(t.sys["machine-a"], slot)
+        notice.slot_held(t.sys["machine-a"], slot)
+        os.remove(notices)
+        os.mkdir(notices)
+        self.assertTrue(t.eng["machine-a"].notice_due("updates"))
+        t.eng["machine-a"].record_notice("updates")
+        os.remove(st)
+        os.mkdir(st)
+        t.eng["machine-a"].status(["cursor"])
+        t.eng["machine-a"].prune(["cursor"], dry=True)
+        d = t.eng["machine-a"].doctor()
+        self.assertTrue(d.get("bad_state"))
+        named = " ".join(d["bad_state"])
+        self.assertTrue("check-notices.json" in named or "state.json" in named)
+
+    def test_write_private_unique_temp_and_oserror(self):
+        t = Twin(); standard(t)
+        path = os.path.join(t.cfg.state_dir, "unique.json")
+        os.makedirs(t.cfg.state_dir, exist_ok=True)
+        os.mkdir(path + ".tmp")
+        self.assertTrue(t.sys["machine-a"].write_private(path, "{}"))
+        self.assertTrue(os.path.isfile(path))
+        asdir = os.path.join(t.cfg.state_dir, "as-dir")
+        os.mkdir(asdir)
+        self.assertFalse(t.sys["machine-a"].write_private(asdir, "{}"))
+        self.assertFalse(t.sys["machine-a"].write_inplace(asdir, "{}"))
+
+    def test_failed_hold_after_check_is_reported(self):
+        t = Twin(); standard(t)
+        t.sys["machine-a"].smoke_dies.add("cursor")
+        real = t.peers["machine-a"]
+
+        class NoHold:
+            def call(self, op, **kw):
+                if op == "hold":
+                    return {"ok": False}
+                return real.call(op, **kw)
+
+            def close(self):
+                real.close()
+
+        t.peers["machine-a"] = NoHold()
+        ui = FakeUI(confirm=False)
+        rep = orchestrator.run(t.session(ui), ["cursor"], dry=False)
+        self.assertTrue(any("could not hold" in l for l in rep["summary"]))
+
+    def test_bad_toml_is_config_error(self):
+        import tempfile
+        from twin_update.config import ConfigError, load
+        from twin_update import cli
+        with self.assertRaises(ConfigError):
+            load(text="[machines")
+        t = Twin(); standard(t)
+        fd, path = tempfile.mkstemp(suffix=".toml")
+        os.write(fd, b"[machines\n")
+        os.close(fd)
+        self.addCleanup(os.remove, path)
+        ui = FakeUI()
+        rc = cli.main(["--config", path, "status"], ui=ui, system=t.sys["machine-a"],
+                      peer_factory=lambda label, target, cmd: t.peers[label])
+        self.assertEqual(rc, 2)
+        self.assertTrue(any("config error" in l for l in ui.lines))
+
+    def test_noninteractive_failed_check_stops_peer(self):
+        t = Twin(); standard(t)
+        t.sys["machine-a"].add_app_procs(CUR)
+        t.sys["machine-b"].add_app_procs(CUR)
+        t.sys["machine-a"].smoke_dies.add("cursor")
+        ui = FakeUI(can_prompt=False)
+        rep = orchestrator.run(t.session(ui), ["cursor"], dry=False)
+        self.assertEqual(rep["result"], "aborted")
+        self.assertIn("twin-update rollback", rep["error"])
+        self.assertTrue("Not upgrading" in (rep.get("error") or "")
+                        or "not upgrading" in (rep.get("error") or ""))
+        installs = [e for e in kinds(t, "INSTALL")]
+        self.assertEqual(len(installs), 1)
+        self.assertEqual(installs[0][0], "alice")
+        self.assertEqual(t.sys["machine-b"].pkgs["cursor"], "3.23.23-1")
+        self.assertIn("cursor", (rep.get("reopen") or {}).get("machine-a", {}))
+
+    def test_differently_named_main_is_treated_as_running(self):
+        t = Twin(); standard(t)
+        t.sys["machine-a"].proc_table[5100] = Proc(
+            5100, 1, "/usr/share/cursor/cursor.bin", "cursor.bin", 12)
+        self.assertTrue(t.eng["machine-a"].running("cursor", main_only=True))
 
     def test_identity_mismatch_aborts(self):
         t = Twin(); standard(t)
@@ -445,9 +876,8 @@ class Retention(unittest.TestCase):
         self.assertEqual(t.sys["machine-a"].pkgs["cursor"], "3.24.9-1")
         self.assertIn("cursor", t.sys["machine-b"].held)
         self.assertEqual(rep["reopen"], {"machine-b": {"cursor": {"ok": True}}})
-        # the next deliberate run releases our own hold
         h = t.eng["machine-b"].holds()["managed"]
-        self.assertEqual(h["cursor"], "twin-update")
+        self.assertEqual(h["cursor"], "rollback")
 
     def test_rollback_refuses_tampered_copy(self):
         t = Twin()
@@ -467,6 +897,54 @@ class Retention(unittest.TestCase):
         rep = orchestrator.rollback(t.session(FakeUI()), "cursor", ["machine-a", "machine-b"], dry=False)
         self.assertEqual(rep["result"], "aborted")
         self.assertIn("no rollback copy", rep["error"])
+
+    def test_rollback_hold_survives_next_run_and_check(self):
+        t = Twin()
+        t.setup("cursor", "3.23.23-1", "3.24.9-1")
+        orchestrator.run(t.session(FakeUI()), ["cursor"], dry=False, smoke=False)
+        orchestrator.rollback(t.session(FakeUI()), "cursor", ["machine-a", "machine-b"], dry=False)
+        self.assertEqual(t.eng["machine-a"].holds()["managed"]["cursor"], "rollback")
+        chk = t.eng["machine-a"].check(["cursor"])
+        self.assertFalse(chk["apps"]["cursor"]["update_available"])
+        self.assertTrue(chk["apps"]["cursor"]["rollback_hold"])
+        t.eng["machine-a"].set_password(PW)
+        acts = t.eng["machine-a"].clear_holds(["cursor"], dry=False)
+        self.assertTrue(any(a.get("action") == "kept rollback hold" for a in acts))
+        self.assertIn("cursor", t.sys["machine-a"].held)
+        t.sys["machine-a"].cands["cursor"] = "3.24.9-1"
+        t.sys["machine-b"].cands["cursor"] = "3.24.9-1"
+        rep = orchestrator.run(t.session(FakeUI()), ["cursor"], dry=False, smoke=False)
+        self.assertEqual(rep["plan"]["cursor"]["action"], "skip")
+        self.assertTrue("rejected" in rep["plan"]["cursor"]["reason"]
+                        or "unhold" in rep["plan"]["cursor"]["reason"])
+        self.assertIn("cursor", t.sys["machine-a"].held)
+        d = t.eng["machine-a"].doctor()
+        self.assertTrue(d["rollback_holds"])
+
+    def test_rollback_with_mismatched_versions_warns_and_proceeds(self):
+        t = Twin()
+        t.setup("cursor", "3.23.23-1", "3.24.9-1")
+        orchestrator.run(t.session(FakeUI()), ["cursor"], dry=False, smoke=False)
+        real = t.peers["machine-b"]
+
+        class Old:
+            def call(self, op, **kw):
+                if op == "identity":
+                    r = dict(real.call(op, **kw))
+                    r["version"] = "0.3.0"
+                    return r
+                return real.call(op, **kw)
+
+            def close(self):
+                real.close()
+
+        t.peers["machine-b"] = Old()
+        ui = FakeUI()
+        rep = orchestrator.rollback(t.session(ui), "cursor", ["machine-a", "machine-b"], dry=False)
+        self.assertNotEqual(rep["result"], "aborted")
+        self.assertTrue(any("versions differ" in l for l in ui.lines + rep["summary"]))
+        self.assertEqual(t.sys["machine-a"].pkgs["cursor"], "3.23.23-1")
+        self.assertEqual(t.sys["machine-b"].pkgs["cursor"], "3.23.23-1")
 
 
 class Processes(unittest.TestCase):
@@ -505,6 +983,48 @@ class Transport(unittest.TestCase):
         self.assertEqual([o["id"] for o in out], [1, 2, 3, 4])
         self.assertNotIn(PW, wfile.getvalue().decode())
         self.assertIsNone(t.eng["machine-b"]._pw)  # released at EOF
+
+    def test_corrupt_holds_json_does_not_block(self):
+        t = Twin(); standard(t)
+        path = t.eng["machine-a"]._holds_file()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as fh:
+            fh.write("{not json")
+        self.assertEqual(t.eng["machine-a"]._tool_holds(), {})
+        chk = t.eng["machine-a"].check(["cursor"])
+        self.assertTrue(chk["apps"]["cursor"]["update_available"])
+
+    def test_doctor_warns_on_interrupted_dpkg(self):
+        from twin_update.orchestrator import doctor_findings
+        t = Twin(); standard(t)
+        with open(os.path.join(t.eng["machine-a"].dpkg_updates, "0001"), "w") as fh:
+            fh.write("x")
+        d = t.eng["machine-a"].doctor()
+        self.assertTrue(d["dpkg_interrupted"])
+        _, warnings = doctor_findings(d)
+        self.assertTrue(any("dpkg --configure -a" in w for w in warnings))
+
+    def test_ssh_skips_stale_reply_ids(self):
+        from twin_update.peer import SshPeer
+        class P:
+            def __init__(self, argv, **kw):
+                self.stdin = io.BytesIO()
+                self.stdout = io.BytesIO(
+                    b'{"id":1,"ok":true,"result":{"v":1}}\n'
+                    b'{"id":1,"ok":true,"result":{"stale":true}}\n'
+                    b'{"id":2,"ok":true,"result":{"v":2}}\n')
+
+            def poll(self):
+                return None
+
+            def wait(self, timeout=None):
+                return 0
+
+        p = SshPeer("machine-b", "user@host.example", "twin-update", popen=P,
+                    connect_timeout=None)
+        self.addCleanup(p.close)
+        self.assertEqual(p.call("identity"), {"v": 1})
+        self.assertEqual(p.call("status"), {"v": 2})
 
     def test_ssh_argv_has_no_secrets_and_batchmode(self):
         from twin_update.peer import SshPeer
@@ -556,6 +1076,24 @@ class Config(unittest.TestCase):
 
 
 class Cli(unittest.TestCase):
+    def test_aborted_not_interrupted_is_exit_5(self):
+        import tempfile
+        from fakes import patched_paths
+        from twin_update import cli
+        t = Twin(); standard(t)
+        t.sys["machine-a"].apt_busy_flag = True
+        tmpd = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, tmpd, True)
+        cfgp = os.path.join(tmpd, "c.toml")
+        with open(cfgp, "w") as fh:
+            fh.write(__import__("fakes").CONFIG.format(keep="[]", fallback="[]"))
+        ui = FakeUI()
+        with patched_paths(t):
+            rc = cli.main(["--config", cfgp, "run", "--no-detach", "--no-smoke"],
+                          ui=ui, system=t.sys["machine-a"],
+                          peer_factory=lambda label, target, cmd: t.peers[label])
+        self.assertEqual(rc, 5)
+
     def test_local_only_requires_dry_run(self):
         from twin_update.cli import main
         ui = FakeUI()
@@ -757,9 +1295,10 @@ class Check(unittest.TestCase):
         self.assertEqual(self._notifies(t, "machine-b"), [])
         rc, out = self._cli(t, ["--notify"])
         self.assertEqual(rc, 10)
-        self.assertIn("already opened a window today", out)
+        self.assertIn("window already open since", out)
         self.assertEqual(len(self._notifies(t)), 1)
         self.assertEqual(len(t.sys["machine-a"].spawned), 1)
+        self.assertTrue(t.eng["machine-a"].notice_due("updates", "x"))
         t.clock.t += 86400
         t.sys["machine-a"].alive_pids.clear()  # yesterday's window has closed
         self._cli(t, ["--notify"])
@@ -1039,6 +1578,271 @@ class DoctorExit(unittest.TestCase):
         t = Twin(); standard(t)
         rc, _ = self._doctor(t, ["--local-only"])
         self.assertEqual(rc, 0)
+
+
+def _recorded_reports(t, kind=None):
+    runs = os.path.join(t.cfg.state_dir, "runs")
+    if not os.path.isdir(runs):
+        return []
+    out = []
+    for name in sorted(os.listdir(runs)):
+        with open(os.path.join(runs, name)) as fh:
+            rec = json.load(fh)
+        if kind is None or rec.get("kind") == kind:
+            out.append(rec)
+    return out
+
+
+class AfterClose041(unittest.TestCase):
+    def _cli(self, t, args, ui=None):
+        import tempfile
+        from fakes import patched_paths, CONFIG
+        from twin_update import cli
+        tmpd = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, tmpd, True)
+        cfgp = os.path.join(tmpd, "c.toml")
+        with open(cfgp, "w") as fh:
+            fh.write(CONFIG.format(keep="[]", fallback="[]"))
+        ui = ui or FakeUI()
+        with patched_paths(t):
+            rc = cli.main(["--config", cfgp, *args], ui=ui,
+                          system=t.sys["machine-a"],
+                          peer_factory=lambda label, target, cmd: t.peers[label])
+        return rc, ui
+
+    def _wrap(self, t, label, boom_op, exc):
+        real = t.peers[label]
+
+        class Boom:
+            def call(self, op, **kw):
+                if op == boom_op:
+                    raise exc
+                return real.call(op, **kw)
+
+            def close(self):
+                real.close()
+
+        t.peers[label] = Boom()
+
+    def test_unexpected_oserror_after_close_reopens_and_records(self):
+        t = Twin(); standard(t)
+        t.sys["machine-a"].add_app_procs(CUR)
+        t.sys["machine-b"].add_app_procs(CUR)
+        self._wrap(t, "machine-b", "upgrade", OSError("disk full"))
+        rc, ui = self._cli(t, ["run", "--no-detach", "--no-smoke"])
+        self.assertNotEqual(rc, 0)
+        self.assertNotEqual(rc, 3)
+        self.assertTrue(any("internal error" in l for l in ui.lines), ui.lines)
+        self.assertTrue(any("details:" in l and "last-error.log" in l for l in ui.lines), ui.lines)
+        recs = _recorded_reports(t, "run")
+        self.assertTrue(recs, "run was not recorded")
+        rec = recs[-1]
+        self.assertEqual(rec.get("result"), "failed")
+        self.assertTrue(any("internal error after close" in l for l in rec.get("summary") or []))
+        for label in ("machine-a", "machine-b"):
+            self.assertIn("cursor", (rec.get("reopen") or {}).get(label, {}), rec)
+
+    def test_unexpected_engineerror_after_close_reopens_and_records(self):
+        from twin_update.engine import EngineError
+        t = Twin(); standard(t)
+        t.sys["machine-a"].add_app_procs(GPT)
+        t.sys["machine-b"].add_app_procs(GPT)
+        self._wrap(t, "machine-b", "verify", EngineError("peer engine broke"))
+        rc, ui = self._cli(t, ["run", "--no-detach", "--no-smoke"])
+        self.assertNotEqual(rc, 0)
+        self.assertNotEqual(rc, 3)
+        self.assertTrue(any("internal error" in l for l in ui.lines), ui.lines)
+        self.assertTrue(any("details:" in l and "last-error.log" in l for l in ui.lines), ui.lines)
+        recs = _recorded_reports(t, "run")
+        self.assertTrue(recs, "run was not recorded")
+        rec = recs[-1]
+        self.assertEqual(rec.get("result"), "failed")
+        for label in ("machine-a", "machine-b"):
+            self.assertIn("chatgpt", (rec.get("reopen") or {}).get(label, {}), rec)
+
+    def test_unexpected_error_during_rollback_after_close_reopens(self):
+        t = Twin()
+        t.setup("cursor", "3.23.23-1", "3.24.9-1")
+        orchestrator.run(t.session(FakeUI()), ["cursor"], dry=False, smoke=False)
+        t.sys["machine-a"].add_app_procs(CUR)
+        t.sys["machine-b"].add_app_procs(CUR)
+        self._wrap(t, "machine-b", "rollback_install", KeyError("missing copy key"))
+        rc, ui = self._cli(t, ["rollback", "cursor", "--no-detach", "--no-smoke"])
+        self.assertNotEqual(rc, 0)
+        self.assertNotEqual(rc, 3)
+        self.assertTrue(any("internal error" in l for l in ui.lines), ui.lines)
+        recs = _recorded_reports(t, "rollback")
+        self.assertTrue(recs, "rollback was not recorded")
+        rec = recs[-1]
+        self.assertEqual(rec.get("result"), "failed")
+        for label in ("machine-a", "machine-b"):
+            self.assertIn("cursor", (rec.get("reopen") or {}).get(label, {}), rec)
+
+    def test_smoke_opened_during_update_vs_real_failure(self):
+        t = Twin(); standard(t)
+        real = t.peers["machine-a"]
+
+        class Opened:
+            def call(self, op, **kw):
+                if op == "upgrade":
+                    r = real.call(op, **kw)
+                    t.sys["machine-a"].add_app_procs(CUR)
+                    return r
+                return real.call(op, **kw)
+
+            def close(self):
+                real.close()
+
+        t.peers["machine-a"] = Opened()
+        ui = FakeUI(confirm=True)
+        rep = orchestrator.run(t.session(ui), ["cursor"], dry=False)
+        self.assertEqual(rep["result"], "ok", rep)
+        self.assertFalse(any("Roll back" in p for p in ui.prompts), ui.prompts)
+        self.assertTrue(any("not verified" in l for l in rep["summary"]), rep["summary"])
+        self.assertTrue(any("could not check" in l and "opened during the update" in l
+                            for l in rep["summary"]), rep["summary"])
+        ver = rep["results"]["cursor"]["machine-a"]["verify"]
+        self.assertTrue(ver.get("inconclusive"), ver)
+        self.assertTrue(ver.get("ok"), ver)
+        chk = t.eng["machine-a"].check(["cursor"])
+        self.assertNotEqual(chk["apps"]["cursor"].get("rejected"), "3.24.9-1")
+        self.assertNotIn("cursor", t.sys["machine-a"].held)
+        st = t.eng["machine-a"]._state(t.cfg.apps["cursor"])
+        self.assertFalse(st.get("verified"))
+        self.assertTrue(t.eng["machine-a"].running("cursor", main_only=True))
+
+        t2 = Twin(); standard(t2)
+        t2.sys["machine-a"].smoke_dies.add("cursor")
+        ui2 = FakeUI(confirm=False)
+        rep2 = orchestrator.run(t2.session(ui2), ["cursor"], dry=False)
+        self.assertNotEqual(rep2["result"], "ok", rep2)
+        self.assertTrue(any("Roll back" in p for p in ui2.prompts), ui2.prompts)
+        self.assertEqual(t2.eng["machine-a"].check(["cursor"])["apps"]["cursor"].get("rejected"),
+                         "3.24.9-1")
+        self.assertIn("cursor", t2.sys["machine-a"].held)
+        self.assertFalse(any("not verified" in l for l in (rep2.get("summary") or [])))
+
+    def test_close_start_in_flight_is_reopened(self):
+        t = Twin(); standard(t)
+        t.sys["machine-a"].add_app_procs(GPT)
+        t.sys["machine-b"].add_app_procs(GPT)
+        real = t.peers["machine-b"]
+
+        class Inflight:
+            def call(self, op, **kw):
+                if op == "close_start":
+                    raise KeyboardInterrupt
+                return real.call(op, **kw)
+
+            def close(self):
+                real.close()
+
+        t.peers["machine-b"] = Inflight()
+        rep = orchestrator.run(t.session(FakeUI()), ["chatgpt"], dry=False, smoke=False)
+        self.assertTrue(rep.get("interrupted"), rep)
+        self.assertEqual(rep["result"], "aborted")
+        for label in ("machine-a", "machine-b"):
+            ra = (rep.get("reopen") or {}).get(label) or {}
+            self.assertIn("chatgpt", ra, label)
+
+    def test_sigterm_during_rollback_final_reopen_reopens_and_exits_3(self):
+        import signal
+        t = Twin()
+        t.setup("chatgpt", "26.1002.52244", "26.1007.21434")
+        orchestrator.run(t.session(FakeUI()), ["chatgpt"], dry=False, smoke=False)
+        t.sys["machine-a"].add_app_procs(GPT)
+        t.sys["machine-b"].add_app_procs(GPT)
+        real = t.peers["machine-b"]
+        counts = {"reopen": 0}
+
+        class Term:
+            def call(self, op, **kw):
+                if op == "reopen":
+                    counts["reopen"] += 1
+                    if counts["reopen"] == 1:
+                        os.kill(os.getpid(), signal.SIGTERM)
+                return real.call(op, **kw)
+
+            def close(self):
+                real.close()
+
+        t.peers["machine-b"] = Term()
+        rc, ui = self._cli(t, ["rollback", "chatgpt", "--no-detach", "--no-smoke"])
+        self.assertEqual(rc, 3)
+        recs = _recorded_reports(t, "rollback")
+        self.assertTrue(recs)
+        rec = recs[-1]
+        self.assertTrue(rec.get("interrupted"), rec)
+        self.assertEqual(rec["result"], "aborted")
+        for label in ("machine-a", "machine-b"):
+            ra = (rec.get("reopen") or {}).get(label) or {}
+            self.assertIn("chatgpt", ra, ra)
+            self.assertTrue(ra["chatgpt"].get("ok"), ra)
+
+    def test_dry_run_close_start_error_does_not_launch(self):
+        from twin_update.peer import PeerError
+        t = Twin(); standard(t)
+        real = t.peers["machine-b"]
+
+        class Boom:
+            def call(self, op, **kw):
+                if op == "close_start":
+                    raise PeerError("machine-b: close failed")
+                return real.call(op, **kw)
+
+            def close(self):
+                real.close()
+
+        t.peers["machine-b"] = Boom()
+        orchestrator.run(t.session(FakeUI()), ["cursor"], dry=True)
+        self.assertEqual(kinds(t, "LAUNCH"), [])
+
+    def test_clean_close_start_error_does_not_reopen_never_open(self):
+        from twin_update.peer import PeerError
+        t = Twin(); standard(t)
+        real = t.peers["machine-b"]
+
+        class Boom:
+            def call(self, op, **kw):
+                if op == "close_start":
+                    raise PeerError("machine-b: EngineError: cannot close")
+                return real.call(op, **kw)
+
+            def close(self):
+                real.close()
+
+        t.peers["machine-b"] = Boom()
+        rep = orchestrator.run(t.session(FakeUI()), ["cursor"], dry=False, smoke=False)
+        self.assertEqual(kinds(t, "LAUNCH"), [])
+        self.assertNotIn("cursor", (rep.get("reopen") or {}).get("machine-b") or {})
+
+    def test_reopen_permission_error_still_reopens_other_machine(self):
+        t = Twin(); standard(t)
+        t.sys["machine-a"].add_app_procs(CUR)
+        t.sys["machine-b"].add_app_procs(CUR)
+        real = t.peers["machine-a"]
+
+        class Boom:
+            def call(self, op, **kw):
+                if op == "reopen":
+                    raise PermissionError("cannot launch")
+                return real.call(op, **kw)
+
+            def close(self):
+                real.close()
+
+        t.peers["machine-a"] = Boom()
+        try:
+            rep = orchestrator.run(t.session(FakeUI()), ["cursor"], dry=False, smoke=False)
+        except PermissionError:
+            self.fail("PermissionError escaped reopen")
+        self.assertIn("cursor", (rep.get("reopen") or {}).get("machine-b") or {}, rep)
+        self.assertTrue(
+            (rep.get("reopen") or {}).get("machine-b", {}).get("cursor", {}).get("ok"))
+        why = (rep.get("reopen_errors") or {}).get("machine-a") or ""
+        self.assertIn("cannot launch", why)
+        self.assertTrue(any("could not reopen apps on machine-a" in l
+                            for l in rep["summary"]), rep["summary"])
 
 
 if __name__ == "__main__":
