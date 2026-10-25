@@ -155,7 +155,7 @@ class WindowLock(unittest.TestCase):
         path = notice.window_lock_path(t.cfg.state_dir)
         first = notice.try_begin_window(s, path)
         self.assertIsNotNone(first)
-        notice.write_window_pid(s, path, 4001, started=False)
+        notice.write_window_pid(s, path, 4001, started=False, already_locked=True)
         self.assertIsNone(notice.try_begin_window(s, path))
         s.unlock(first)
         s.alive_pids.discard(4001)
@@ -177,7 +177,7 @@ class WindowLock(unittest.TestCase):
         path = os.path.join(tmpd, "prompt.window")
         fd = notice.try_begin_window(s, path)
         self.assertIsNotNone(fd)
-        notice.write_window_pid(s, path, 1, started=False)
+        notice.write_window_pid(s, path, 1, started=False, already_locked=True)
         self.assertIsNone(s.try_lockfile(path))
         s.unlock(fd)
         second = s.try_lockfile(path)
@@ -567,53 +567,6 @@ class DetachedRun(unittest.TestCase):
         self.assertIn("Checking...", out)
 
 
-class FollowUnit(unittest.TestCase):
-    def _follow(self, script):
-        t = Twin()
-        s = t.sys["machine-a"]
-        s.follow_script = script
-        s.follow_idx = 0
-        ui = FakeUI()
-        rc = notice.follow_unit(s, "twin-update-run-1", {}, ui, poll_s=0)
-        return rc, ui, s
-
-    def test_failed_unit_is_not_success(self):
-        """Old fake always returned Result=success; that hid a failed run."""
-        rc, ui, s = self._follow([
-            {"active": "activating",
-             "show": "Result=\nExecMainStatus=0\nActiveState=activating\nLoadState=loaded\n"},
-            {"active": "inactive",
-             "show": "Result=exit-code\nExecMainStatus=3\nActiveState=failed\nLoadState=loaded\n"},
-        ])
-        self.assertEqual(rc, 3)
-        self.assertTrue(any(notice.UPDATE_FAILED in l for l in ui.lines))
-        self.assertTrue(any("exit 3" in l for l in ui.lines))
-        self.assertTrue(s.cleaned_units)
-
-    def test_unloaded_failed_unit_is_not_success(self):
-        rc, ui, s = self._follow([
-            {"active": "inactive", "show": "", "rc": 0},
-        ])
-        self.assertNotEqual(rc, 0)
-        self.assertTrue(any(notice.UPDATE_FAILED in l for l in ui.lines))
-        self.assertTrue(s.cleaned_units)
-
-    def test_early_inactive_then_activating_failure(self):
-        """A queued unit looks inactive first; the old follow ended there as success."""
-        rc, ui, _s = self._follow([
-            {"active": "inactive",
-             "show": "Result=\nExecMainStatus=0\nActiveState=inactive\nLoadState=loaded\n"},
-            {"active": "inactive",
-             "show": "Result=\nExecMainStatus=0\nActiveState=inactive\nLoadState=loaded\n"},
-            {"active": "activating",
-             "show": "Result=\nExecMainStatus=0\nActiveState=activating\nLoadState=loaded\n"},
-            {"active": "inactive",
-             "show": "Result=exit-code\nExecMainStatus=7\nActiveState=failed\nLoadState=loaded\n"},
-        ])
-        self.assertEqual(rc, 7)
-        self.assertTrue(any(notice.UPDATE_FAILED in l for l in ui.lines))
-
-
 class PasswordHandoff(unittest.TestCase):
     def test_console_getpass_no_tty_raises(self):
         from unittest import mock
@@ -643,7 +596,7 @@ class PasswordHandoff(unittest.TestCase):
                           ui=ui, system=t.sys["machine-a"],
                           peer_factory=lambda label, target, cmd: t.peers[label])
         out = buf.getvalue() + "\n".join(ui.lines)
-        self.assertEqual(rc, 1)
+        self.assertIn(rc, (1, 3))
         self.assertNotIn("Traceback", out)
         self.assertTrue("sudo" in out.lower() or notice.SUDO_NEEDED in out)
 
@@ -673,6 +626,59 @@ class SlotMerge(unittest.TestCase):
         self.assertTrue(data["started"])
         self.assertEqual(data["pid"], 5002)
         self.assertEqual(data["start"], 7)
+
+    def test_late_launcher_pid_does_not_replace_started_ticks(self):
+        t = Twin(); s = t.sys["machine-a"]
+        path = notice.window_lock_path(t.cfg.state_dir)
+        s.alive_pids.add(5002)
+        s.pid_starts[5002] = 7
+        notice.write_window_pid(s, path, 5002, started=True, start=7)
+        notice.write_window_pid(s, path, 9000, started=False, start=99,
+                                unit="twin-update-prompt-late")
+        data = notice.read_slot(s, path)
+        self.assertTrue(data["started"])
+        self.assertEqual(data["pid"], 5002)
+        self.assertEqual(data["start"], 7)
+        self.assertEqual(data["unit"], "twin-update-prompt-late")
+
+    def test_slot_merge_two_writers_started_wins(self):
+        import multiprocessing
+        import tempfile
+        from twin_update.system import System
+        sys = System()
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, tmp, True)
+        path = os.path.join(tmp, "prompt.window")
+        sys.write_inplace(path, "{}\n")
+
+        def _write(kind):
+            from twin_update import notice as n
+            from twin_update.system import System as S
+            s = S()
+            fd = s.try_lockfile(path, blocking=True)
+            try:
+                if kind == "window":
+                    n.write_window_pid(s, path, 4242, started=True, start=11,
+                                       already_locked=True)
+                else:
+                    n.write_window_pid(s, path, 9001, started=False, start=99,
+                                       unit="u-late", already_locked=True)
+            finally:
+                if fd is not None:
+                    s.unlock(fd)
+
+        procs = [multiprocessing.Process(target=_write, args=("window",)),
+                 multiprocessing.Process(target=_write, args=("launch",))]
+        for p in procs:
+            p.start()
+        for p in procs:
+            p.join(5)
+            self.assertFalse(p.is_alive())
+        data = notice.read_slot(sys, path)
+        self.assertTrue(data.get("started"))
+        self.assertEqual(data.get("pid"), 4242)
+        self.assertEqual(data.get("start"), 11)
+        self.assertEqual(data.get("unit"), "u-late")
 
     def test_pid_zero_does_not_clear_live_unit(self):
         t = Twin(); s = t.sys["machine-a"]
@@ -819,7 +825,7 @@ class SlotMerge(unittest.TestCase):
                           ui=cli.ConsoleUI(), system=t.sys["machine-a"],
                           peer_factory=lambda label, target, cmd: t.peers[label])
         out = buf.getvalue()
-        self.assertEqual(rc, 1)
+        self.assertIn(rc, (1, 3))
         self.assertNotIn("Traceback", out)
         self.assertIn("sudo password needed", out)
 

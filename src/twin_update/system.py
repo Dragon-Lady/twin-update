@@ -63,7 +63,7 @@ class System:
         except (OSError, ValueError, IndexError):
             return None
 
-    def try_lockfile(self, path: str):
+    def try_lockfile(self, path: str, blocking: bool = False):
         """Exclusive flock on a lockfile, created if needed. None if busy."""
         import fcntl
         os.makedirs(os.path.dirname(path) or ".", mode=0o700, exist_ok=True)
@@ -71,8 +71,9 @@ class System:
             fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
         except OSError:
             return None
+        flags = fcntl.LOCK_EX if blocking else fcntl.LOCK_EX | fcntl.LOCK_NB
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd, flags)
         except OSError:
             os.close(fd)
             return None
@@ -92,15 +93,44 @@ class System:
                       cp.stderr.decode("utf-8", "replace"))
 
     def run_inherit(self, argv, timeout: float | None = None,
-                    env: dict | None = None, cwd: str | None = None) -> Result:
-        """Run without capturing stdio so a window tty stays attached."""
+                    env: dict | None = None, cwd: str | None = None,
+                    wait_after_s: float = 3600) -> Result:
+        """Run without capturing stdio so a window tty stays attached.
+
+        The child is in its own session so Ctrl-C in this window does not hit
+        it. SIGINT/SIGHUP are ignored here while it exists. The child is
+        never SIGKILL'd: a timeout waits further, then reports that it is
+        still running.
+        """
+        prev = {}
+        for sig in (signal.SIGINT, signal.SIGHUP):
+            try:
+                prev[sig] = signal.signal(sig, signal.SIG_IGN)
+            except (ValueError, OSError):
+                pass
         try:
-            cp = subprocess.run(list(argv), timeout=timeout, env=env, cwd=cwd)
-        except FileNotFoundError as exc:
-            return Result(127, "", str(exc))
-        except subprocess.TimeoutExpired:
-            return Result(124, "", "timeout")
-        return Result(cp.returncode, "", "")
+            try:
+                proc = subprocess.Popen(list(argv), env=env, cwd=cwd,
+                                        start_new_session=True)
+            except FileNotFoundError as exc:
+                return Result(127, "", str(exc))
+            try:
+                rc = proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                try:
+                    rc = proc.wait(timeout=wait_after_s)
+                except subprocess.TimeoutExpired:
+                    return Result(
+                        124, "",
+                        "the update is still running; cancel with "
+                        "systemctl --user stop <the update unit>")
+            return Result(rc if rc is not None else 1, "", "")
+        finally:
+            for sig, old in prev.items():
+                try:
+                    signal.signal(sig, old)
+                except (ValueError, OSError):
+                    pass
 
     # identity -----------------------------------------------------------
     def whoami(self) -> str:

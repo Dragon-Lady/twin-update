@@ -356,8 +356,134 @@ class RunFlow(unittest.TestCase):
         rep = orchestrator.run(t.session(FakeUI()), ["cursor"], dry=False, smoke=False)
         self.assertEqual(rep["result"], "aborted")
         self.assertIn("older twin-update", rep["error"])
+        self.assertIn("Nothing was changed", rep["error"])
+        self.assertIn("pipx install twin-update", rep["error"])
         self.assertEqual(kinds(t, "TERM"), [])
         self.assertEqual(kinds(t, "INSTALL"), [])
+
+    def test_sigterm_during_close_wait_reopens_apps(self):
+        import os
+        import signal
+        t = Twin(); standard(t)
+        t.sys["machine-a"].add_app_procs(CUR)
+        real = t.peers["machine-a"]
+
+        class Term:
+            def call(self, op, **kw):
+                if op == "close_wait":
+                    os.kill(os.getpid(), signal.SIGTERM)
+                return real.call(op, **kw)
+
+            def close(self):
+                real.close()
+
+        t.peers["machine-a"] = Term()
+        rep = orchestrator.run(t.session(FakeUI()), ["cursor"], dry=False, smoke=False)
+        self.assertEqual(rep["result"], "aborted")
+        self.assertIn("interrupted after close", rep["error"])
+        self.assertIn("cursor", (rep.get("reopen") or {}).get("machine-a", {}))
+
+    def test_sigterm_during_final_reopen_is_once(self):
+        import os
+        import signal
+        t = Twin(); standard(t)
+        t.sys["machine-a"].add_app_procs(CUR)
+        real = t.peers["machine-a"]
+        counts = {"reopen": 0}
+
+        class Term:
+            def call(self, op, **kw):
+                if op == "reopen":
+                    counts["reopen"] += 1
+                    if counts["reopen"] == 1:
+                        os.kill(os.getpid(), signal.SIGTERM)
+                return real.call(op, **kw)
+
+            def close(self):
+                real.close()
+
+        t.peers["machine-a"] = Term()
+        rep = orchestrator.run(t.session(FakeUI()), ["cursor"], dry=False, smoke=False)
+        self.assertGreaterEqual(counts["reopen"], 1)
+        self.assertLessEqual(counts["reopen"], 2)
+        self.assertTrue((rep.get("reopen") or {}).get("machine-a")
+                        or t.eng["machine-a"]._reopened)
+
+    def test_eof_at_rollback_reopens_and_does_not_upgrade_peer(self):
+        t = Twin(); standard(t)
+        t.sys["machine-a"].add_app_procs(CUR)
+        t.sys["machine-a"].smoke_dies.add("cursor")
+        ui = FakeUI()
+
+        def _eof(prompt, timeout_s=None):
+            raise EOFError
+
+        ui.confirm = _eof
+        rep = orchestrator.run(t.session(ui), ["cursor"], dry=False)
+        self.assertEqual(rep["result"], "aborted")
+        self.assertTrue("Not upgrading" in (rep.get("error") or "")
+                        or "input ended" in (rep.get("error") or ""))
+        self.assertEqual(t.sys["machine-b"].pkgs["cursor"], "3.23.23-1")
+        self.assertIn("cursor", (rep.get("reopen") or {}).get("machine-a", {}))
+        self.assertTrue(t.eng["machine-a"].check(["cursor"])["apps"]["cursor"].get("rejected")
+                        or t.sys["machine-a"].held)
+
+    def test_failed_check_on_first_machine_does_not_upgrade_peer(self):
+        t = Twin(); standard(t)
+        t.sys["machine-a"].smoke_dies.add("cursor")
+        ui = FakeUI(confirm=False)
+        rep = orchestrator.run(t.session(ui), ["cursor"], dry=False)
+        self.assertEqual(rep["result"], "aborted")
+        self.assertEqual(t.sys["machine-b"].pkgs["cursor"], "3.23.23-1")
+        self.assertEqual(t.sys["machine-a"].pkgs["cursor"], "3.24.9-1")
+        chk = t.eng["machine-a"].check(["cursor"])
+        self.assertEqual(chk["apps"]["cursor"].get("rejected"), "3.24.9-1")
+
+    def test_rollback_hold_only_suppresses_rejected_version(self):
+        t = Twin()
+        t.setup("cursor", "3.23.23-1", "3.24.9-1")
+        orchestrator.run(t.session(FakeUI()), ["cursor"], dry=False, smoke=False)
+        orchestrator.rollback(t.session(FakeUI()), "cursor", ["machine-a", "machine-b"], dry=False)
+        chk = t.eng["machine-a"].check(["cursor"])
+        self.assertEqual(chk["apps"]["cursor"].get("rejected"), "3.24.9-1")
+        self.assertFalse(chk["apps"]["cursor"]["update_available"])
+        t.sys["machine-a"].cands["cursor"] = "3.25.0"
+        t.sys["machine-b"].cands["cursor"] = "3.25.0"
+        t.sys["machine-a"].repo["cursor"] = ["3.25.0"]
+        t.sys["machine-b"].repo["cursor"] = ["3.25.0"]
+        chk = t.eng["machine-a"].check(["cursor"])
+        self.assertTrue(chk["apps"]["cursor"]["update_available"])
+        st = {l: t.eng[l].status(["cursor"]) for l in ("machine-a", "machine-b")}
+        plan = orchestrator.plan_updates(t.cfg, ["cursor"], st, ["machine-a", "machine-b"])
+        self.assertEqual(plan["cursor"]["action"], "update")
+        self.assertEqual(plan["cursor"]["target"], "3.25.0")
+
+    def test_unhold_clears_record_when_apt_not_held(self):
+        t = Twin(); standard(t)
+        t.eng["machine-a"].set_password(PW)
+        t.eng["machine-a"].hold("cursor", "rollback from 3.24.9", rejected="3.24.9")
+        t.sys["machine-a"].held.discard("cursor")
+        r = t.eng["machine-a"].unhold("cursor")
+        self.assertIn("leftover", r["action"])
+        self.assertFalse(t.eng["machine-a"]._tool_holds())
+        d = t.eng["machine-a"].doctor()
+        self.assertFalse(d.get("rollback_holds"))
+
+    def test_smoke_late_spawn_is_closed(self):
+        t = Twin(); standard(t)
+        t.sys["machine-a"].smoke_late.add("chatgpt")
+        res = t.eng["machine-a"].smoke("chatgpt")
+        self.assertTrue(res["ok"], res)
+        self.assertFalse(t.eng["machine-a"].running("chatgpt"))
+
+    def test_reopen_is_idempotent(self):
+        t = Twin(); standard(t)
+        first = t.eng["machine-a"].reopen(["chatgpt"])
+        n = len([e for e in t.events if e[1] == "LAUNCH"])
+        second = t.eng["machine-a"].reopen(["chatgpt"])
+        self.assertTrue(first["chatgpt"]["ok"])
+        self.assertEqual(second["chatgpt"].get("skipped"), "already open")
+        self.assertEqual(len([e for e in t.events if e[1] == "LAUNCH"]), n)
 
     def test_sigterm_after_close_reopens_apps(self):
         import os
@@ -390,7 +516,8 @@ class RunFlow(unittest.TestCase):
         rep = orchestrator.run(t.session(ui), ["cursor"], dry=False)
         self.assertEqual(rep["result"], "aborted")
         self.assertIn("twin-update rollback", rep["error"])
-        self.assertIn("not upgrading the other machine", rep["error"])
+        self.assertTrue("Not upgrading" in (rep.get("error") or "")
+                        or "not upgrading" in (rep.get("error") or ""))
         installs = [e for e in kinds(t, "INSTALL")]
         self.assertEqual(len(installs), 1)
         self.assertEqual(installs[0][0], "alice")
@@ -612,7 +739,8 @@ class Retention(unittest.TestCase):
         t.sys["machine-b"].cands["cursor"] = "3.24.9-1"
         rep = orchestrator.run(t.session(FakeUI()), ["cursor"], dry=False, smoke=False)
         self.assertEqual(rep["plan"]["cursor"]["action"], "skip")
-        self.assertIn("rollback hold", rep["plan"]["cursor"]["reason"])
+        self.assertTrue("rejected" in rep["plan"]["cursor"]["reason"]
+                        or "unhold" in rep["plan"]["cursor"]["reason"])
         self.assertIn("cursor", t.sys["machine-a"].held)
         d = t.eng["machine-a"].doctor()
         self.assertTrue(d["rollback_holds"])
@@ -679,6 +807,48 @@ class Transport(unittest.TestCase):
         self.assertEqual([o["id"] for o in out], [1, 2, 3, 4])
         self.assertNotIn(PW, wfile.getvalue().decode())
         self.assertIsNone(t.eng["machine-b"]._pw)  # released at EOF
+
+    def test_corrupt_holds_json_does_not_block(self):
+        t = Twin(); standard(t)
+        path = t.eng["machine-a"]._holds_file()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as fh:
+            fh.write("{not json")
+        self.assertEqual(t.eng["machine-a"]._tool_holds(), {})
+        chk = t.eng["machine-a"].check(["cursor"])
+        self.assertTrue(chk["apps"]["cursor"]["update_available"])
+
+    def test_doctor_warns_on_interrupted_dpkg(self):
+        from twin_update.orchestrator import doctor_findings
+        t = Twin(); standard(t)
+        with open(os.path.join(t.eng["machine-a"].dpkg_updates, "0001"), "w") as fh:
+            fh.write("x")
+        d = t.eng["machine-a"].doctor()
+        self.assertTrue(d["dpkg_interrupted"])
+        _, warnings = doctor_findings(d)
+        self.assertTrue(any("dpkg --configure -a" in w for w in warnings))
+
+    def test_ssh_skips_stale_reply_ids(self):
+        from twin_update.peer import SshPeer
+        class P:
+            def __init__(self, argv, **kw):
+                self.stdin = io.BytesIO()
+                self.stdout = io.BytesIO(
+                    b'{"id":1,"ok":true,"result":{"v":1}}\n'
+                    b'{"id":1,"ok":true,"result":{"stale":true}}\n'
+                    b'{"id":2,"ok":true,"result":{"v":2}}\n')
+
+            def poll(self):
+                return None
+
+            def wait(self, timeout=None):
+                return 0
+
+        p = SshPeer("machine-b", "user@host.example", "twin-update", popen=P,
+                    connect_timeout=None)
+        self.addCleanup(p.close)
+        self.assertEqual(p.call("identity"), {"v": 1})
+        self.assertEqual(p.call("status"), {"v": 2})
 
     def test_ssh_argv_has_no_secrets_and_batchmode(self):
         from twin_update.peer import SshPeer

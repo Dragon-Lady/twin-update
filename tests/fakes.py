@@ -95,6 +95,8 @@ class FakeSystem(System):
         self.fail_install = set()
         self.smoke_dies = set()
         self.smoke_handoff = set()
+        self.smoke_late = set()
+        self._smoke_spawned = set()
         self.apt_busy_flag = False
         self.locked = False
         self.window_flock = False
@@ -183,7 +185,7 @@ class FakeSystem(System):
             return None
         return 42
 
-    def try_lockfile(self, path):
+    def try_lockfile(self, path, blocking=False):
         if self.window_flock or path in self._lockfiles:
             return None
         if not os.path.exists(path):
@@ -233,6 +235,9 @@ class FakeSystem(System):
                       if app in p.exe or os.path.basename(p.exe).lower() == app]
             for pid in doomed:
                 self.proc_table.pop(pid, None)
+
+    def run_inherit(self, argv, timeout=None, env=None, cwd=None, wait_after_s=3600):
+        return self.run(argv, timeout=timeout, env=env, cwd=cwd)
 
     def unlock(self, fd):
         if isinstance(fd, tuple) and fd[0] == "lockfile":
@@ -353,6 +358,8 @@ class FakeSystem(System):
             if unit.startswith("twin-smoke-"):
                 app = unit[len("twin-smoke-"):].rsplit("-", 1)[0]
                 self._smoke_started_at[app] = self.clock.t
+                if app in self.smoke_late:
+                    return Result(0)
                 if app in self.smoke_handoff or app in self.smoke_crash_after:
                     exe = (self.files.get(app) or ["/usr/share/cursor/cursor"])[0]
                     self.add_app_procs(exe)
@@ -361,6 +368,10 @@ class FakeSystem(System):
             unit = argv[3] if len(argv) > 3 else ""
             if unit.startswith("twin-smoke-"):
                 app = unit[len("twin-smoke-"):].rsplit("-", 1)[0]
+                if app in self.smoke_late and app not in self._smoke_spawned:
+                    exe = (self.files.get(app) or ["/usr/share/cursor/cursor"])[0]
+                    self.add_app_procs(exe)
+                    self._smoke_spawned.add(app)
                 self._maybe_smoke_crash(app)
                 if app in self.smoke_handoff or app in self.smoke_crash_after:
                     return Result(3, "inactive")
@@ -516,6 +527,8 @@ class Twin:
             cfg = load(text=text, home=s.home())
             e = Engine(cfg, s, label, log=self.logs.append)
             e.archives, e.dpkg_info = s.archives_dir, s.info_dir
+            e.dpkg_updates = os.path.join(s.root, "dpkg-updates")
+            os.makedirs(e.dpkg_updates)
             e.apt_lists = os.path.join(s.root, "lists")
             os.makedirs(os.path.join(e.apt_lists, "partial"))
             ago = self.clock.t - 7200                      # system lists refreshed 2 h ago

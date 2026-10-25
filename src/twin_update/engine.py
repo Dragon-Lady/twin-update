@@ -61,6 +61,8 @@ class Engine:
         self.apt_lists = APT_LISTS
         self.apt_update_stamp = APT_UPDATE_STAMP
         self.sources_dir = SOURCES_DIR
+        self.dpkg_updates = "/var/lib/dpkg/updates"
+        self._reopened: set[str] = set()
 
     # ------------------------------------------------------------------ util
     def log(self, msg: str) -> None:
@@ -173,13 +175,41 @@ class Engine:
     def _tool_holds(self) -> dict:
         raw = self.sys.read_text(self._holds_file())
         try:
-            return json.loads(raw) if raw else {}
+            data = json.loads(raw) if raw else {}
         except ValueError:
             return {}
+        return data if isinstance(data, dict) else {}
+
+    def _sync_hold_records(self) -> dict:
+        """Drop holds.json entries whose apt hold is gone."""
+        held = set(self.showhold())
+        tool = self._tool_holds()
+        changed = False
+        for pkg in list(tool):
+            if pkg not in held:
+                tool.pop(pkg, None)
+                changed = True
+        if changed:
+            self.sys.write_private(self._holds_file(), json.dumps(tool, indent=2))
+        return tool
+
+    def _hold_record(self, pkg: str, tool: dict | None = None) -> dict:
+        rec = (tool if tool is not None else self._tool_holds()).get(pkg) or {}
+        return rec if isinstance(rec, dict) else {}
+
+    def _rejected_version(self, pkg: str, rec: dict | None = None) -> str | None:
+        rec = rec if rec is not None else self._hold_record(pkg)
+        if rec.get("rejected"):
+            return str(rec["rejected"])
+        reason = str(rec.get("reason") or "")
+        for prefix in ("rollback from ", "failed-check of "):
+            if reason.startswith(prefix):
+                return reason[len(prefix):].strip() or None
+        return None
 
     def holds(self) -> dict:
         held = self.showhold()
-        tool = self._tool_holds()
+        tool = self._sync_hold_records()
         managed = {a.package: a.name for a in self.cfg.apps.values()}
         out = {"managed": {}, "other": []}
         for pkg in held:
@@ -190,7 +220,12 @@ class Engine:
                 elif pkg in tool:
                     rec = tool.get(pkg) or {}
                     reason = rec.get("reason") if isinstance(rec, dict) else ""
-                    owner = "rollback" if str(reason or "").startswith("rollback") else "twin-update"
+                    if str(reason or "").startswith("rollback"):
+                        owner = "rollback"
+                    elif str(reason or "").startswith("failed-check"):
+                        owner = "failed-check"
+                    else:
+                        owner = "twin-update"
                 else:
                     owner = "foreign"
                 out["managed"][name] = owner
@@ -199,11 +234,11 @@ class Engine:
         return out
 
     def _rollback_hold_reason(self, pkg: str, tool: dict | None = None) -> str | None:
-        rec = (tool if tool is not None else self._tool_holds()).get(pkg) or {}
-        if not isinstance(rec, dict):
-            return None
+        rec = self._hold_record(pkg, tool)
         reason = str(rec.get("reason") or "")
-        return reason if reason.startswith("rollback") else None
+        if reason.startswith("rollback") or reason.startswith("failed-check"):
+            return reason
+        return None
 
     def clear_holds(self, apps: list[str], dry: bool) -> list[dict]:
         """Release holds on these apps unless kept or set by a rollback."""
@@ -233,25 +268,34 @@ class Engine:
             self.sys.write_private(self._holds_file(), json.dumps(tool, indent=2))
         return actions
 
-    def hold(self, app_name: str, reason: str) -> dict:
+    def hold(self, app_name: str, reason: str, rejected: str | None = None) -> dict:
         app = self._apps([app_name])[0]
         r = self._sudo(["apt-mark", "hold", app.package], timeout=120)
         if r.ok:
             tool = self._tool_holds()
             ver, _ = self.installed(app.package)
-            tool[app.package] = {"reason": reason, "version": ver, "at": int(self.sys.now())}
+            rec = {"reason": reason, "version": ver, "at": int(self.sys.now())}
+            rec["rejected"] = rejected or self._rejected_version(app.package, {"reason": reason})
+            tool[app.package] = rec
             self.sys.write_private(self._holds_file(), json.dumps(tool, indent=2))
         return {"ok": r.ok}
 
     def unhold(self, app_name: str, dry: bool = False) -> dict:
         app = self._apps([app_name])[0]
-        if app.package not in self.showhold():
+        tool = self._tool_holds()
+        held = app.package in self.showhold()
+        if not held:
+            if app.package in tool:
+                if not dry:
+                    tool.pop(app.package, None)
+                    self.sys.write_private(self._holds_file(), json.dumps(tool, indent=2))
+                return {"ok": True,
+                        "action": "would clear leftover record" if dry else "cleared leftover record"}
             return {"ok": True, "action": "not held"}
         if dry:
             return {"ok": True, "action": "would unhold"}
         r = self._sudo(["apt-mark", "unhold", app.package], timeout=120)
         if r.ok:
-            tool = self._tool_holds()
             tool.pop(app.package, None)
             self.sys.write_private(self._holds_file(), json.dumps(tool, indent=2))
         return {"ok": r.ok, "action": "unheld" if r.ok else "unhold failed"}
@@ -569,6 +613,7 @@ class Engine:
                 "rollback": sorted(copies),
                 "rollback_fallback": sorted(v for v, m in copies.items() if m.get("fallback")),
                 "hold": holds["managed"].get(app.name),
+                "rejected": self._rejected_version(app.package),
                 "good_launches": st.get("good_launches"),
             }
         return out
@@ -681,18 +726,25 @@ class Engine:
         out = {"label": self.label, "apps": {}, "lists": lists,
                "apt_lists_age_h": lists["age_h"],
                "apt_busy": self.apt_busy(), "identity_ok": self.identity()["ok"]}
+        tool = self._sync_hold_records()
         for app in self._apps(apps):
             ver, _ = self.installed(app.package)
             use_fresh = bool(f and f["ok"] and app.name in f["apps"])
             cand = self.candidate(app.package, f["opts"] if use_fresh else None) if ver else None
             newer = bool(ver and cand and cand != ver and self.vercmp(cand, "gt", ver))
-            rb_reason = self._rollback_hold_reason(app.package)
-            if newer and rb_reason:
+            rec = self._hold_record(app.package, tool)
+            rb_reason = self._rollback_hold_reason(app.package, tool)
+            rejected = self._rejected_version(app.package, rec)
+            apt_held = app.package in self.showhold()
+            if newer and rb_reason and apt_held and rejected and cand == rejected:
+                newer = False
+            elif newer and rb_reason and apt_held and not rejected:
                 newer = False
             out["apps"][app.name] = {"installed": ver, "candidate": cand,
                                      "update_available": newer,
                                      "lists": "fresh" if use_fresh else "system",
-                                     "rollback_hold": rb_reason}
+                                     "rollback_hold": rb_reason if apt_held else None,
+                                     "rejected": rejected if apt_held else None}
         return out
 
     def _notice_state(self) -> dict:
@@ -796,6 +848,8 @@ class Engine:
     def upgrade(self, app_name: str, version: str) -> dict:
         app = self._apps([app_name])[0]
         before, _ = self.installed(app.package)
+        if app.package in self.showhold():
+            self._sudo(["apt-mark", "unhold", app.package], timeout=120)
         r = self._sudo(["env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "-o",
                         f"DPkg::Lock::Timeout={self.cfg.apt_lock_timeout_s}", "-o",
                         "Dpkg::Options::=--force-confold", "-y", "-q", "install",
@@ -833,12 +887,22 @@ class Engine:
                           "-p", "ExitType=cgroup", "--", *app.launch], env=env, timeout=60)
         if not r.ok:
             return {"ok": False, "reason": "could not start", "err": r.err[-300:]}
+
+        def _collect_started(into):
+            tree = self.app_tree(app)
+            for pid in tree["mains"]:
+                p = tree["procs"].get(pid)
+                if p and (pid, p.start) not in before_all and (pid, p.start) not in into:
+                    into.append((pid, p.start))
+            return into
+
         started_mains = []
-        t0 = self.app_tree(app)
-        for pid in t0["mains"]:
-            p = t0["procs"].get(pid)
-            if p and (pid, p.start) not in before_all:
-                started_mains.append((pid, p.start))
+        sample_until = self.sys.now() + min(3.0, max(0.4, self.cfg.smoke_s))
+        while True:
+            _collect_started(started_mains)
+            if started_mains or self.sys.now() >= sample_until:
+                break
+            self.sys.sleep(0.2)
         threshold = None
         if app.name == "cursor":
             main = self.sys.run(["systemctl", "--user", "show", unit, "--property=MainPID", "--value"], env=env, timeout=10)
@@ -849,31 +913,44 @@ class Engine:
         stayed = True
         waited = 0.0
         handed = False
+
+        def _smoke_up(active: bool) -> bool:
+            if started_mains:
+                procs = self.sys.procs()
+                if any(pid in procs and procs[pid].start == start
+                       for pid, start in started_mains):
+                    return True
+            if active:
+                return True
+            return False
+
         while waited < self.cfg.smoke_s:
             self.sys.sleep(1.0)
             waited += 1.0
+            _collect_started(started_mains)
             a = self.sys.run(["systemctl", "--user", "is-active", unit], env=env)
             active = a.out.strip() in ("active", "activating")
             if not active:
-                # Single-instance apps often exit the transient unit after
-                # handing off to the already-started process. Keep watching
-                # the rest of the interval so a later crash is not missed.
-                if not self.running(app_name, main_only=True):
+                handed = True
+                if not _smoke_up(False):
                     stayed = False
                     break
-                handed = True
-            # Same main_only watch after hand-off; unidentified main stays
-            # "running" (fail closed) so we do not treat it as a crash.
-            if handed and not self.running(app_name, main_only=True):
+            if handed and not _smoke_up(False):
                 stayed = False
                 break
+        _collect_started(started_mains)
         j = self.sys.run(["journalctl", "--user", "-u", unit, "--no-pager", "-o", "cat"], env=env)
         crashed = bool(CRASH_RE.search(j.out))
         procs = self.sys.procs()
-        for pid, start in started_mains:
-            p = procs.get(pid)
-            if p and p.start == start:
-                self.sys.term(pid, start)
+        closed_via_unit = False
+        if started_mains:
+            for pid, start in started_mains:
+                p = procs.get(pid)
+                if p and p.start == start:
+                    self.sys.term(pid, start)
+        else:
+            self.sys.run(["systemctl", "--user", "stop", unit], env=env, timeout=15)
+            closed_via_unit = True
         deadline = self.sys.now() + self.cfg.close_timeout_s
         left = []
         while True:
@@ -932,10 +1009,16 @@ class Engine:
                 out[app.name] = {"ok": True, "skipped": "no_launch: left closed"}
                 self.log(f"reopen {app.name}: skipped (no_launch)")
                 continue
+            if app.name in self._reopened or self.running(app.name, main_only=True):
+                out[app.name] = {"ok": True, "skipped": "already open"}
+                self._reopened.add(app.name)
+                continue
             unit = f"twin-reopen-{app.name}-{int(self.sys.now())}"
             r = self.sys.run(["systemd-run", "--user", "--quiet", "--collect", f"--unit={unit}",
                               "-p", "ExitType=cgroup", "--", *app.launch], env=env, timeout=60)
             out[app.name] = {"ok": r.ok}
+            if r.ok:
+                self._reopened.add(app.name)
         return out
 
     def pre_reopen_hook(self, app_name: str, smoke_ok: bool) -> dict:
@@ -1073,14 +1156,22 @@ class Engine:
         checks["window_open_since"] = since
         checks["slot_pid_reused"] = notice.slot_pid_reused(self.sys, slot)
         rb = []
-        for pkg, rec in self._tool_holds().items():
+        for pkg, rec in self._sync_hold_records().items():
             if not isinstance(rec, dict):
                 continue
             reason = str(rec.get("reason") or "")
-            if reason.startswith("rollback"):
-                rb.append(f"{pkg} at {rec.get('version') or '?'} ({reason})")
+            rejected = rec.get("rejected") or self._rejected_version(pkg, rec)
+            if reason.startswith("rollback") or reason.startswith("failed-check"):
+                bit = f"{pkg} at {rec.get('version') or '?'}"
+                if rejected:
+                    bit += f" (not {rejected})"
+                bit += f" ({reason})"
+                rb.append(bit)
         checks["rollback_holds"] = rb
         checks["record_notice_error"] = notice.last_record_error(self.sys, self.cfg.state_dir)
+        names = self.sys.listdir(self.dpkg_updates)
+        checks["dpkg_interrupted"] = any(
+            n not in (".", "..") and not str(n).startswith(".") for n in (names or []))
         svc_path = os.path.join(self.sys.home(), ".config/systemd/user/twin-update-check.service")
         tmr_path = os.path.join(self.sys.home(), ".config/systemd/user/twin-update-check.timer")
         svc_text = self.sys.read_text(svc_path)

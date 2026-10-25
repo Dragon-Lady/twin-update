@@ -203,6 +203,9 @@ def _print(ui, data, as_json: bool) -> None:
                 elif k == "record_notice_error":
                     if v:
                         ui.say(f"{l:8} record notice: {v}")
+                elif k == "dpkg_interrupted":
+                    if v:
+                        ui.say(f"{l:8} dpkg interrupted: run sudo dpkg --configure -a")
                 elif k in ("locks_ok", "window_stale", "unit_warnings"):
                     continue
                 elif k != "locks_ok":
@@ -288,8 +291,6 @@ def main(argv=None, ui=None, system=None, peer_factory=SshPeer) -> int:
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--no-smoke", action="store_true", help="skip the launch smoke test")
     p.add_argument("--no-detach", action="store_true")
-    p.add_argument("--sudo-from-stdin", action="store_true",
-                   help="read one sudo password line from stdin (prompt-window unit)")
     p = sub.add_parser("rollback"); common(p)
     p.add_argument("app")
     p.add_argument("--machine", default="both")
@@ -326,12 +327,6 @@ def main(argv=None, ui=None, system=None, peer_factory=SshPeer) -> int:
 
     args = ap.parse_args(argv)
     system = system or System()
-    if getattr(args, "sudo_from_stdin", False):
-        line = sys.stdin.readline()
-        if not line:
-            ui.say(notice.SUDO_NEEDED)
-            return 1
-        ui._sudo_from_stdin = line.rstrip("\n")
 
     try:
         if args.cmd == "raft-upload":
@@ -419,7 +414,19 @@ def main(argv=None, ui=None, system=None, peer_factory=SshPeer) -> int:
         ui.say("stopped")
         return 1
     except Exception as exc:
-        ui.say(str(exc))
+        import traceback
+        text = traceback.format_exc()
+        log_path = None
+        try:
+            home = system.home()
+            state = os.path.join(home, ".local/state/twin-update")
+            log_path = os.path.join(state, "last-error.log")
+            system.write_private(log_path, text)
+        except Exception:
+            log_path = None
+        ui.say(f"internal error: {exc}")
+        if log_path:
+            ui.say(f"details: {log_path}")
         if getattr(args, "cmd", None) == "prompt" and hasattr(ui, "pause"):
             ui.pause("Press Enter to close.")
         return 1
@@ -511,7 +518,7 @@ def _keep_launched_window(system, slot: str, pid: int | None, unit: str | None,
                           env: dict | None) -> bool:
     """Record the launch. Do not clear a pid-0 slot while the unit is still up."""
     notice.write_window_pid(system, slot, pid if isinstance(pid, int) else 0,
-                            started=False, unit=unit)
+                            started=False, unit=unit, already_locked=True)
     if notice.verify_window(system, slot, pid if isinstance(pid, int) else 0):
         return True
     if notice.unit_still_up(system, unit, env):

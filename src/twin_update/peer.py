@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import time
 import selectors
 import subprocess
@@ -81,9 +82,22 @@ class SshPeer:
         # stderr goes to an anonymous temp file (nothing on disk by name), read
         # only to explain a failure.
         self._err = tempfile.TemporaryFile()
+        def _preexec():
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+
         try:
             self.proc = popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                              stderr=self._err)
+                              stderr=self._err, start_new_session=True,
+                              preexec_fn=_preexec)
+        except TypeError:
+            # Test fakes and older Popen wrappers may not take these kwargs.
+            try:
+                self.proc = popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                  stderr=self._err)
+            except BaseException:
+                self._err.close()
+                raise
         except BaseException:
             self._err.close()
             raise
@@ -132,11 +146,34 @@ class SshPeer:
         finally:
             del line  # may carry the sudo password; drop our reference
         timeout, self._first_timeout = call_timeout if call_timeout is not None else self._first_timeout, None
-        raw = self._readline(timeout)
+        try:
+            raw = self._readline(timeout)
+        except (KeyboardInterrupt, BrokenPipeError, OSError):
+            self._timed_out = True
+            raise
+        except PeerError:
+            self._timed_out = True
+            raise
         if not raw:
+            self._timed_out = True
             raise PeerError(f"{self.label}: {self._why()}")
-        msg = json.loads(raw)
+        try:
+            msg = json.loads(raw)
+        except ValueError:
+            self._timed_out = True
+            raise PeerError(f"{self.label}: {self._why()}") from None
+        while isinstance(msg.get("id"), int) and msg["id"] < self._id:
+            raw = self._readline(timeout)
+            if not raw:
+                self._timed_out = True
+                raise PeerError(f"{self.label}: {self._why()}")
+            try:
+                msg = json.loads(raw)
+            except ValueError:
+                self._timed_out = True
+                raise PeerError(f"{self.label}: {self._why()}") from None
         if msg.get("id") != self._id:
+            self._timed_out = True
             raise PeerError("unexpected peer response id")
         if not msg.get("ok"):
             raise PeerError(f"{self.label}: {msg.get('error', 'error')}")

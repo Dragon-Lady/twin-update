@@ -5,28 +5,41 @@
 - Confirming `y` starts `run` with `systemd-run --user --scope` (named
   `--unit=`, no `--pipe`/`--collect`/`--no-block`) so the window's tty is
   inherited: the sudo password and the rollback question stay interactive.
-  SIGHUP is ignored so closing the window does not stop apt. Cancel with
-  `systemctl --user stop <unit>` (SIGTERM), which reopens apps that were
-  closed. A missing tty password fails with a clear message and no
-  traceback; a non-interactive failed check does not silently answer N.
-  `follow_unit` (when used) waits to see the unit active, drains the last
-  journal lines, reads Result/ExecMainStatus, prints `Update finished` or
-  `Update failed (details: ...)`, and reset-failed/stops the unit.
-- A non-interactive failed check does not silently answer N: the peer is
-  not upgraded, apps are reopened, and the report says `twin-update rollback`.
-- SIGTERM, `systemctl --user stop`, and SIGHUP reopen apps closed for the
-  run, same as Ctrl-C.
-- Smoke watches and closes with `main_only`; an unidentified main is treated
-  as running (fail closed). A leftover helper under `/resources/` still does
-  not count as the app.
-- The window slot merges fields (a late `started=False` cannot clear
-  `started=True`). MainPID 0 does not clear the slot while the unit is up.
-  A reused pid or a window open more than 24 hours does not block a new
-  window; `doctor` reports both.
+  The run is in its own session. Ctrl-C in the prompt window and closing
+  that window (SIGHUP) do not stop the update. Cancel with
+  `systemctl --user stop <unit>` (SIGTERM): that reopens apps that were
+  closed. The prompt waits for the run to finish its own cleanup and
+  never SIGKILL's it. A missing tty password fails with a clear message
+  and no traceback.
+- A failed check (no tty, declined rollback, timeout, or closed window)
+  does not upgrade the other machine. The failed version is recorded
+  (only that version is hidden; a newer candidate is still offered).
+  Apps that were closed are reopened; the run is recorded; the report
+  says `twin-update rollback`.
+- SIGTERM / `systemctl --user stop` during close, install, or the
+  rollback question reopens closed apps exactly once. SIGHUP does not
+  cancel the run. If the process is SIGKILL'd or apt is killed, recover
+  with `sudo dpkg --configure -a`; `doctor` warns when
+  `/var/lib/dpkg/updates` is not empty.
+- Smoke retries sampling the processes it started, then stops its own
+  unit if none appeared. It never signals a process that was already
+  running. Watch uses those started processes / the smoke unit, not
+  leftover helpers or an unrecognized name.
+- The window slot merges under the flock. Once the window marked itself
+  started, a later launcher write keeps its pid and start ticks and may
+  only add `unit`. MainPID 0 does not clear the slot while the unit is
+  up. A reused pid or a window open more than 24 hours does not block a
+  new window; `doctor` reports both.
 - Version mismatch still stops `run` before any close. `rollback` warns and
   proceeds per machine.
-- A rollback hold is kept across later `run`s so the daily prompt does not
-  re-offer that version. `unhold` clears it; `holds` and `doctor` show it.
+- A rollback or failed-check hold stores the rejected version and
+  suppresses only that version. `unhold` clears the record even if apt
+  already says the package is not held; `check` and `doctor` ignore a
+  leftover record. The prompt and `run` agree: a hold on one machine
+  that would skip the app is shown, not offered as a normal update.
+  Both machines need this same twin-update installed before the first
+  mixed `run`; a peer with no `version` stops before any close and says
+  how to install it. Nothing was changed in that case.
 - Config errors in a prompt window show the error and wait for Enter.
   Any error before the prompt question also waits for Enter.
   `Checking...` is printed before the ssh build. A failed `record_notice`
@@ -71,10 +84,14 @@
   matters. `twin-update --help` no longer shows a hidden `raft-upload`
   line. The zipapp build is reproducible (fixed timestamps, honours
   `SOURCE_DATE_EPOCH`).
-- Known limits: real visible windows, real systemd `--scope` inheriting a
-  desktop tty, real `systemctl --user stop` of a run scope, and the first
-  real timer run were not exercised here. After the window is gone, later
-  prompts have no tty and take the non-interactive stop path.
+- The ssh child ignores SIGTERM/SIGINT and stale replies are skipped by
+  request id so a stop of the run scope can still reopen the other
+  machine. An unexpected error writes `~/.local/state/twin-update/last-error.log`
+  and prints a short line pointing at it.
+- Known limits: a real desktop window, a real `systemctl --user stop` of
+  a run scope on two machines, and the first real timer run were not
+  exercised here. After the window is gone, later questions have no tty
+  and take the non-interactive stop path. SIGKILL cannot run cleanup.
 
 ## 0.4.0 (2026-10-25)
 

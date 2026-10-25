@@ -86,9 +86,12 @@ from a terminal (without `--no-detach`) re-execs into
 `systemd-run --user --scope`. A `run` confirmed with `y` in the prompt
 window uses the same `--scope` path with a named `--unit=` so the window's
 tty is kept: the sudo password and the rollback question stay interactive.
-SIGHUP is ignored so closing the window does not stop the update. Cancel
-with `systemctl --user stop <the update unit>` (the window prints the unit
-name). That SIGTERM reopens apps that were closed for the run.
+The run is in its own session: Ctrl-C in the prompt window does not stop
+it, and closing the window (SIGHUP) does not stop it either. Cancel with
+`systemctl --user stop <the update unit>` (the window prints the unit
+name). That SIGTERM reopens apps that were closed for the run. If the
+run is killed outright or apt is interrupted, recover with
+`sudo dpkg --configure -a` (also noted by `twin-update doctor`).
 
 ## Other commands
 
@@ -127,8 +130,10 @@ with ` / ` when they differ), warns which machines would close those apps
 for about 10 minutes (it says "both machines" only when both need the
 update), and asks `Update now? [y/N]`. If one machine could not be reached,
 that status is in the question. Only a typed `y` starts `twin-update run`
-in its own user unit; closing the prompt window does not stop the update,
-and the window follows the run's progress. N or Enter declines without
+in its own user unit; Ctrl-C or closing the prompt window does not stop
+the update. Cancel with `systemctl --user stop <the update unit>` (the
+window prints the name). The window waits for the run to finish. N or
+Enter declines without
 starting a run. The question is recorded for the calendar day only after
 it has been shown (closing a still-blank window does not use up the day).
 The timer service is not a graphical session, so the window is started
@@ -188,15 +193,27 @@ of the window.
 
 `rollback` checks the stored copy's sha256, closes the app gracefully, installs
 it with `apt-get install --allow-downgrades ./<deb>`, sets `apt-mark hold`
-(recorded as a Twin Update rollback hold). The daily prompt does not re-offer
-that same version while the hold remains. `twin-update holds` and `doctor`
-show it; `twin-update unhold <app>` clears it. A later `run` does not clear
-a rollback hold. Then it verifies and reopens the app if it was open.
+(recorded as a Twin Update rollback hold of that rejected version). The
+daily prompt does not re-offer that same version while the apt hold
+remains; a newer candidate is still offered. `twin-update holds` and
+`doctor` show the rejected version; `twin-update unhold <app>` clears
+the record even if apt already says the package is not held. Then it
+verifies and reopens the app if it was open.
 
-A failed smoke/check inside a non-interactive `run` (the prompt-window unit
-has no tty for confirms) stops before upgrading the other machine, prints
-`twin-update rollback`, and exits non-zero. In an interactive terminal the
-rollback question is still asked.
+Both machines need this same twin-update installed before the first
+mixed `run`. If the other machine reports no `version`, `run` stops
+before closing anything, says to install this twin-update there
+(`pipx install twin-update`, or copy the zipapp to `remote_command`),
+and changes nothing.
+
+A failed smoke/check does not upgrade the other machine unless you
+explicitly roll back or the check succeeded. The failed version is
+held (only that version). The window inherits the tty, so the sudo
+password and the rollback question stay interactive there. After the
+window is gone, later questions have no tty: the run stops before the
+other machine, prints `twin-update rollback`, reopens what it closed,
+and exits non-zero. Closing the window or Ctrl-D at the rollback
+question is treated as no: apps reopen, the failed version stays.
 
 A rollback restores **program files, not app data**. If a new version migrated
 its settings or databases, keep your own data backups. Twin Update never opens,
