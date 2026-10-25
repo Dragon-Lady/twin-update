@@ -10,16 +10,37 @@ class Launcher(unittest.TestCase):
     def test_prefers_cosmic_term(self):
         which = lambda n: "/usr/bin/" + n if n == "cosmic-term" else None
         argv = notice.launcher_argv(which, ["twin-update", "prompt"])
-        self.assertEqual(argv[:3], ["cosmic-term", "-e", "bash"])
+        self.assertEqual(argv[:4], ["cosmic-term", "--no-daemon", "-e", "bash"])
+        self.assertLess(argv.index("--no-daemon"), argv.index("-e"))
         self.assertIn("twin-update prompt", argv[-1])
 
     def test_falls_back_to_x_terminal_emulator(self):
         which = lambda n: "/usr/bin/" + n if n == "x-terminal-emulator" else None
         argv = notice.launcher_argv(which, ["twin-update", "prompt"])
         self.assertEqual(argv[0], "x-terminal-emulator")
+        self.assertNotIn("--no-daemon", argv)
 
     def test_none_when_no_launcher(self):
         self.assertIsNone(notice.launcher_argv(lambda n: None, ["twin-update"]))
+
+    def test_daemonized_launcher_is_not_a_successful_window(self):
+        """Main pid exits at once while a child window pid lives; that is not success."""
+        t = Twin(); s = t.sys["machine-a"]
+        s.spawn_dies_immediately = True
+        env = notice.graphical_env(s)
+        argv = notice.launcher_argv(s.which, ["twin-update", "prompt"])
+        self.assertEqual(argv[0], "cosmic-term")
+        self.assertLess(argv.index("--no-daemon"), argv.index("-e"))
+        pid = notice.start_prompt_window(s, argv, env)
+        self.assertIsNotNone(pid)
+        child = pid + 1
+        s.alive_pids.add(child)  # the forked window, not the unit main pid
+        path = notice.window_lock_path(t.cfg.state_dir)
+        notice.write_window_pid(s, path, pid, started=False)
+        self.assertFalse(s.pid_alive(pid))
+        self.assertTrue(s.pid_alive(child))
+        self.assertFalse(notice.verify_window(s, path, pid))
+        self.assertTrue(t.eng["machine-a"].notice_due("updates", "x"))
 
 
 class GraphicalEnv(unittest.TestCase):
@@ -103,9 +124,11 @@ class PromptAnswers(unittest.TestCase):
         ran = []
         ans = notice.run_prompt(ui, notice.TEST_PENDING, test=True,
                                 run_fn=lambda: ran.append("x"))
-        self.assertEqual(ans, "run")
+        self.assertEqual(ans, "test")
         self.assertEqual(ran, [])
         self.assertIn(notice.TEST_ONLY, ui.lines)
+        self.assertIn(notice.TEST_NOTHING_RAN, ui.lines)
+        self.assertTrue(any("Press Enter" in l for l in ui.lines))
 
 
 class RecordAfterLaunch(unittest.TestCase):
@@ -168,8 +191,10 @@ class PromptCli(unittest.TestCase):
         rc, out, _ = self._run(t, ["prompt", "--test"])
         self.assertEqual(rc, 0)
         self.assertIn("opened a window", out)
-        self.assertEqual(t.sys["machine-a"].spawned[0][0][0], "cosmic-term")
-        inner = t.sys["machine-a"].spawned[0][0][-1]
+        launched = t.sys["machine-a"].spawned[0][0]
+        self.assertEqual(launched[0], "cosmic-term")
+        self.assertLess(launched.index("--no-daemon"), launched.index("-e"))
+        inner = launched[-1]
         self.assertIn("--test", inner)
         self.assertIn("--inside", inner)
         self.assertEqual(t.eng["machine-a"].notice_due("updates", ""), True)
@@ -180,6 +205,29 @@ class PromptCli(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn("answer: no", out)
         self.assertIn(notice.TEST_ONLY, ui.lines)
+
+    def test_prompt_inside_test_yes_says_nothing_ran(self):
+        import contextlib
+        import io
+        import tempfile
+        from fakes import patched_paths
+        from twin_update import cli
+        t = Twin()
+        tmpd = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, tmpd, True)
+        cfgp = os.path.join(tmpd, "c.toml")
+        with open(cfgp, "w") as fh:
+            fh.write(CONFIG.format(keep="[]", fallback="[]"))
+        ui = FakeUI(confirm=True)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), patched_paths(t):
+            rc = cli.main(["--config", cfgp, "prompt", "--test", "--inside"],
+                          ui=ui, system=t.sys["machine-a"])
+        out = buf.getvalue() + "\n".join(ui.lines)
+        self.assertEqual(rc, 0)
+        self.assertIn(notice.TEST_NOTHING_RAN, out)
+        self.assertNotIn("answer: run", out)
+        self.assertTrue(any("Press Enter" in l for l in ui.lines))
 
 
 class DoctorNotice(unittest.TestCase):

@@ -115,7 +115,7 @@ stores no rollback copies. (`twin-update run` still refreshes and installs
 with the system apt, as root.)
 
 With `--notify` it opens a **terminal window** on the machine it runs on
-when updates are available (cosmic-term if present, else
+when updates are available (`cosmic-term --no-daemon` if present, else
 x-terminal-emulator). That window runs `twin-update prompt`: it re-checks,
 lists pending apps and versions, warns that updating closes those apps on
 both machines for about 10 minutes, and asks `Update now? [y/N]`. Only a
@@ -150,7 +150,6 @@ Description=Twin Update: daily read-only update check
 
 [Service]
 Type=oneshot
-KillMode=process
 ExecStart=%h/.local/bin/twin-update check --notify
 SuccessExitStatus=10
 TimeoutStartSec=5min
@@ -172,8 +171,9 @@ WantedBy=timers.target
 `systemctl --user daemon-reload && systemctl --user enable --now twin-update-check.timer`
 
 `SuccessExitStatus=10` is required because `check` exits 10 when updates
-are available. `KillMode=process` keeps the prompt window alive after the
-oneshot service finishes.
+are available. The prompt window is a separate user unit; cosmic-term is
+started with `--no-daemon` so its main process stays alive for the life
+of the window.
 
 `rollback` checks the stored copy's sha256, closes the app gracefully, installs
 it with `apt-get install --allow-downgrades ./<deb>`, sets `apt-mark hold`
