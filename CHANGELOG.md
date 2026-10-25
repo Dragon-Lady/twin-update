@@ -28,13 +28,18 @@
 - A rollback hold is kept across later `run`s so the daily prompt does not
   re-offer that version. `unhold` clears it; `holds` and `doctor` show it.
 - Config errors in a prompt window show the error and wait for Enter.
-  `Checking...` is printed before the ssh build. A one-machine pending app
+  Any error before the prompt question also waits for Enter.
+  `Checking...` is printed before the ssh build. A failed `record_notice`
+  is shown in the window and in `doctor`. A one-machine pending app
   is listed in the close warning even when another app is on both machines.
   A peer that reports no `version` is treated as older and `run` stops
   before any close. `doctor` warns if the check service ExecStart path
-  does not exist. Prompt/run unit names include the pid so two launches
-  in the same second do not collide. gnome-terminal fallback uses
-  `--wait`. The CI workflow display name is `Checks`.
+  does not exist. Prompt/run unit names include the pid and a random
+  suffix so two launches in the same second do not collide.
+  gnome-terminal / kgx fallback uses `--wait`; unknown
+  `x-terminal-emulator` targets stay `-e` and are verified via unit
+  ActiveState, not the client pid. The CI workflow display name is
+  `Checks`.
   README says terminal `run` uses `--scope`.
 - Test prompt windows use their own slot (`prompt.window.test`) so a leftover
   test window cannot block the real daily window. `check --notify` says since

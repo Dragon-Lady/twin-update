@@ -574,8 +574,11 @@ def doctor_findings(checks: dict) -> tuple[list[str], list[str]]:
         elif k == "slot_pid_reused":
             if v:
                 warnings.append("prompt slot pid does not match the recorded process (pid reuse)")
+        elif k == "record_notice_error":
+            if v:
+                warnings.append(f"could not record today's prompt ({v})")
         elif k in ("locks_ok", "check_timer_next", "last_window",
-                   "window_open_since", "rollback_holds"):
+                   "window_open_since", "rollback_holds", "record_notice_error"):
             continue
         elif k != "locks_ok" and isinstance(v, bool) and not v:
             problems.append(k)

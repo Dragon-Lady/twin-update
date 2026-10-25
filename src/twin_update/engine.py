@@ -722,6 +722,8 @@ class Engine:
         seen[kind] = {"date": today, "sig": signature, "handed_at": int(self.sys.now())}
         path = os.path.join(self.cfg.state_dir, "check-notices.json")
         self.sys.write_private(path, json.dumps(seen, indent=2, sort_keys=True))
+        from twin_update import notice
+        notice.clear_record_failure(self.sys, self.cfg.state_dir)
         return {"ok": True}
 
     def last_window_opened(self) -> str | None:
@@ -814,6 +816,8 @@ class Engine:
         app = self._apps([app_name])[0]
         if app.name in self.cfg.no_launch:
             return {"ok": True, "skipped": "no_launch: never started by twin-update"}
+        # main_only: leftover helpers do not count. An unidentified main is
+        # treated as running (fail closed — do not start over a live app).
         if self.running(app_name, main_only=True):
             return {"ok": False,
                     "reason": "app is running again; not killing a user-launched instance"}
@@ -824,7 +828,7 @@ class Engine:
         before_all = {(p.pid, p.start) for p in self.sys.procs().values()}
         before = {(p.pid, p.start) for p in self.sys.procs().values() if worker(p)} if app.name == "cursor" else set()
         env = self._user_env()
-        unit = f"twin-smoke-{app.name}-{int(self.sys.now())}"
+        unit = f"twin-smoke-{app.name}-{int(self.sys.now())}.{os.urandom(2).hex()}"
         r = self.sys.run(["systemd-run", "--user", "--quiet", "--collect", f"--unit={unit}",
                           "-p", "ExitType=cgroup", "--", *app.launch], env=env, timeout=60)
         if not r.ok:
@@ -858,6 +862,8 @@ class Engine:
                     stayed = False
                     break
                 handed = True
+            # Same main_only watch after hand-off; unidentified main stays
+            # "running" (fail closed) so we do not treat it as a crash.
             if handed and not self.running(app_name, main_only=True):
                 stayed = False
                 break
@@ -1074,6 +1080,7 @@ class Engine:
             if reason.startswith("rollback"):
                 rb.append(f"{pkg} at {rec.get('version') or '?'} ({reason})")
         checks["rollback_holds"] = rb
+        checks["record_notice_error"] = notice.last_record_error(self.sys, self.cfg.state_dir)
         svc_path = os.path.join(self.sys.home(), ".config/systemd/user/twin-update-check.service")
         tmr_path = os.path.join(self.sys.home(), ".config/systemd/user/twin-update-check.timer")
         svc_text = self.sys.read_text(svc_path)

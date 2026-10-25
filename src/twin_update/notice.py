@@ -17,6 +17,7 @@ from typing import Callable
 APP_NAME = "Twin Update"
 WINDOW_LOCK = "prompt.window"
 WINDOW_LOCK_TEST = "prompt.window.test"
+RECORD_NOTICE_ERROR = "record-notice-error"
 LAUNCH_VERIFY_S = 2.0
 MAINPID_POLL_S = 0.6
 MAINPID_STEP_S = 0.1
@@ -39,11 +40,15 @@ GUI_KEYS = ("WAYLAND_DISPLAY", "DISPLAY", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_A
 
 # basename of the resolved launcher -> argv inserted before the inner command.
 # gnome-terminal style launchers treat -e as a title/deprecated and need --.
+# Use wait/no-fork where known so a client that forks and exits does not look
+# like "window exited". x-terminal-emulator stays -e until realpath resolves
+# it; that fallback is best-effort and is verified via unit ActiveState, not
+# the client's pid.
 TERMINAL_FLAGS = {
     "cosmic-term": ["--no-daemon", "-e"],
     "gnome-terminal": ["--wait", "--"],
     "gnome-terminal.wrapper": ["--wait", "--"],
-    "kgx": ["--"],
+    "kgx": ["--wait", "--"],
     "ptyxis": ["--"],
     "xfce4-terminal": ["-x"],
     "konsole": ["-e"],
@@ -112,7 +117,8 @@ def start_prompt_window(system, argv: list[str], env: dict) -> tuple[int | None,
     """
     if not system.which("systemd-run"):
         return None, None
-    unit = f"twin-update-prompt-{int(system.now())}-{system.own_pid()}"
+    unit = (f"twin-update-prompt-{int(system.now())}-"
+            f"{system.own_pid()}-{os.urandom(2).hex()}")
     started = system.run(
         ["systemd-run", "--user", "--collect", "--quiet", "--no-block",
          f"--unit={unit}", "--", *argv],
@@ -215,6 +221,34 @@ def graphical_env(system) -> dict | None:
 
 def window_lock_path(state_dir: str, test: bool = False) -> str:
     return os.path.join(state_dir, WINDOW_LOCK_TEST if test else WINDOW_LOCK)
+
+
+def record_error_path(state_dir: str) -> str:
+    return os.path.join(state_dir, RECORD_NOTICE_ERROR)
+
+
+def note_record_failure(system, state_dir: str, msg: str) -> None:
+    text = (msg or "record failed").strip() or "record failed"
+    system.write_private(record_error_path(state_dir), text + "\n")
+
+
+def clear_record_failure(system, state_dir: str) -> None:
+    path = record_error_path(state_dir)
+    if hasattr(system, "remove"):
+        system.remove(path)
+    elif system.exists(path):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def last_record_error(system, state_dir: str) -> str | None:
+    raw = system.read_text(record_error_path(state_dir))
+    if not raw:
+        return None
+    text = raw.strip()
+    return text or None
 
 
 def _slot(raw: str | None) -> dict:
@@ -344,20 +378,22 @@ def already_open_message(system, path: str) -> str:
 
 
 def verify_window(system, path: str, pid: int, wait_s: float = LAUNCH_VERIFY_S) -> bool:
-    """True if the launched process stayed up, or the prompt marked itself started."""
+    """True if the slot, unit, or (last) the client pid shows a live window.
+
+    A still-activating unit with MainPID 0 is alive. Client pid is only a
+    fallback after unit state; a forking launcher pid must not clear a live
+    slot.
+    """
     deadline = system.now() + wait_s
-    while system.now() < deadline:
+    while True:
         data = read_slot(system, path)
-        if data.get("started"):
+        if data.get("started") or unit_still_up(system, data.get("unit")):
             return True
-        left = deadline - system.now()
-        if left <= 0:
+        if system.now() >= deadline:
             break
+        left = deadline - system.now()
         system.sleep(min(0.2, left))
-    data = read_slot(system, path)
-    if data.get("started") or (pid > 0 and system.pid_alive(pid)):
-        return True
-    return unit_still_up(system, data.get("unit"))
+    return bool(pid > 0 and system.pid_alive(pid))
 
 
 def slot_stale(system, path: str, limit_s: float = STALE_WINDOW_S) -> tuple[bool, str | None]:
@@ -686,7 +722,8 @@ def start_and_follow_run(system, argv: list[str], env: dict, ui) -> int:
     if not system.which("systemd-run"):
         ui.say("systemd-run not found; the run stays in this window.")
         return 1
-    unit = f"twin-update-run-{int(system.now())}-{system.own_pid()}"
+    unit = (f"twin-update-run-{int(system.now())}-"
+            f"{system.own_pid()}-{os.urandom(2).hex()}")
     ui.say(f"update unit: {unit}")
     ui.say(f"To cancel: systemctl --user stop {unit}")
     runner = system.run_inherit if hasattr(system, "run_inherit") else system.run

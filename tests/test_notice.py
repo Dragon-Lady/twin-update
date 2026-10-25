@@ -33,15 +33,50 @@ class Launcher(unittest.TestCase):
             "cosmic-term": ["--no-daemon", "-e"],
             "gnome-terminal": ["--wait", "--"],
             "gnome-terminal.wrapper": ["--wait", "--"],
-            "kgx": ["--"],
+            "kgx": ["--wait", "--"],
             "ptyxis": ["--"],
             "xfce4-terminal": ["-x"],
             "konsole": ["-e"],
             "xterm": ["-e"],
+            "alacritty": ["-e"],
+            "kitty": ["-e"],
+            # Unknown x-terminal-emulator target: best-effort -e; verify via unit.
             "x-terminal-emulator": ["-e"],
         }
         for name, flags in expected.items():
             self.assertEqual(notice.terminal_flags(name), flags)
+        self.assertEqual(set(expected), set(notice.TERMINAL_FLAGS))
+
+    def test_prompt_unit_names_differ_in_the_same_second(self):
+        t = Twin(); s = t.sys["machine-a"]
+        env = notice.graphical_env(s)
+        argv = notice.launcher_argv(s.which, ["twin-update", "prompt"])
+        _p1, u1 = notice.start_prompt_window(s, argv, env)
+        _p2, u2 = notice.start_prompt_window(s, argv, env)
+        self.assertNotEqual(u1, u2)
+        for unit in (u1, u2):
+            self.assertRegex(unit, r"^twin-update-prompt-\d+-\d+-[0-9a-f]{4}$")
+
+    def test_x_terminal_emulator_forking_client_uses_unit_state(self):
+        """Fallback client forks and exits; an activating unit is still a window."""
+        t = Twin(); s = t.sys["machine-a"]
+        s.missing_tools = {"cosmic-term"}
+        s.spawn_forks = True
+        env = notice.graphical_env(s)
+        argv = notice.launcher_argv(s.which, ["twin-update", "prompt"],
+                                    realpath=s.realpath)
+        self.assertEqual(argv[0], "x-terminal-emulator")
+        self.assertEqual(argv[1], "-e")
+        pid, unit = notice.start_prompt_window(s, argv, env)
+        self.assertTrue(unit)
+        self.assertFalse(s.pid_alive(pid or 0))
+        self.assertTrue(notice.unit_still_up(s, unit, env))
+        path = notice.window_lock_path(t.cfg.state_dir)
+        from twin_update import cli
+        kept = cli._keep_launched_window(s, path, pid if isinstance(pid, int) else 0,
+                                         unit, env)
+        self.assertTrue(kept)
+        self.assertNotEqual(notice.read_slot(s, path), {})
 
     def test_none_when_no_launcher(self):
         self.assertIsNone(notice.launcher_argv(lambda n: None, ["twin-update"]))
@@ -728,28 +763,93 @@ class SlotMerge(unittest.TestCase):
         self.assertTrue(seen)
         self.assertIn(notice.CHECKING, seen[0])
 
-    def test_console_confirm_on_pty(self):
+    def test_pty_password_and_rollback_prompts(self):
+        import contextlib
+        import io
         import os
         import pty
         from unittest import mock
-        from twin_update import cli
+        from fakes import PW
+        from twin_update import cli, orchestrator
+        t = Twin(); standard(t)
+        t.sys["machine-b"].smoke_dies.add("cursor")
         master, slave = pty.openpty()
+        slave_in = None
         try:
             slave_in = os.fdopen(slave, "r", buffering=1)
+            os.write(master, (PW + "\n").encode())
             os.write(master, b"y\n")
-            with mock.patch.object(cli.sys, "stdin", slave_in):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf), mock.patch.object(cli.sys, "stdin", slave_in):
                 ui = cli.ConsoleUI()
                 self.assertTrue(ui.can_prompt())
-                self.assertTrue(ui.confirm("Update now?"))
+                rep = orchestrator.run(t.session(ui), ["cursor"], dry=False)
         finally:
-            try:
-                slave_in.close()
-            except Exception:
-                pass
+            if slave_in is not None:
+                try:
+                    slave_in.close()
+                except Exception:
+                    pass
             try:
                 os.close(master)
             except OSError:
                 pass
+        self.assertIn("rollback", (rep.get("results") or {}).get("cursor", {}).get("machine-b", {}))
+        self.assertEqual(t.sys["machine-b"].pkgs["cursor"], "3.23.23-1")
+        self.assertIn("cursor", t.sys["machine-b"].held)
+
+    def test_console_main_no_tty_exits_cleanly(self):
+        import contextlib
+        import io
+        import tempfile
+        from unittest import mock
+        from fakes import patched_paths
+        from twin_update import cli
+        t = Twin(); standard(t)
+        tmpd = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, tmpd, True)
+        cfgp = os.path.join(tmpd, "c.toml")
+        with open(cfgp, "w") as fh:
+            fh.write(CONFIG.format(keep="[]", fallback="[]"))
+        fake_in = io.StringIO("")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf), \
+                patched_paths(t), mock.patch.object(cli.sys, "stdin", fake_in):
+            rc = cli.main(["--config", cfgp, "run", "--no-detach", "--no-smoke"],
+                          ui=cli.ConsoleUI(), system=t.sys["machine-a"],
+                          peer_factory=lambda label, target, cmd: t.peers[label])
+        out = buf.getvalue()
+        self.assertEqual(rc, 1)
+        self.assertNotIn("Traceback", out)
+        self.assertIn("sudo password needed", out)
+
+    def test_record_notice_failure_warns_window_and_doctor(self):
+        from argparse import Namespace
+        from twin_update import cli
+        from twin_update.orchestrator import doctor_findings
+        from twin_update.peer import PeerError
+        t = Twin(); standard(t)
+        real = t.peers["machine-a"]
+
+        class Boom:
+            def call(self, op, **kw):
+                if op == "record_notice":
+                    raise PeerError("record failed")
+                return real.call(op, **kw)
+
+            def close(self):
+                real.close()
+
+        t.peers["machine-a"] = Boom()
+        ui = FakeUI(confirm=False)
+        sess = t.session(ui)
+        args = Namespace(slot=None, config=None, no_fetch=False)
+        cli._prompt_here(args, ui, sess, {}, t.sys["machine-a"], None)
+        self.assertTrue(any("could not record today's prompt" in l for l in ui.lines))
+        d = t.eng["machine-a"].doctor()
+        self.assertTrue(d.get("record_notice_error"))
+        _, warnings = doctor_findings(d)
+        self.assertTrue(any("could not record" in w for w in warnings))
 
     def test_doctor_warns_when_execstart_missing(self):
         from twin_update.orchestrator import doctor_findings

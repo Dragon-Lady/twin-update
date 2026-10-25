@@ -106,6 +106,7 @@ class FakeSystem(System):
         self.alive_pids = set()
         self.prompt_pids = {}
         self.spawn_dies_immediately = False
+        self.spawn_forks = False  # client pid exits; unit stays activating
         self.fresh_cands = {}     # pkg -> candidate seen by a fresh user-level fetch
         self.fresh_fail = None    # apt-get update error text, or None
         self.fetched = False
@@ -339,7 +340,7 @@ class FakeSystem(System):
                 self.next_spawn_pid += 1
                 self.spawned.append((inner, None, pid))
                 self.prompt_pids[unit] = pid
-                if not self.spawn_dies_immediately:
+                if not self.spawn_dies_immediately and not self.spawn_forks:
                     self.alive_pids.add(pid)
                 return Result(0)
             if unit.startswith("twin-update-run-"):
@@ -399,7 +400,12 @@ class FakeSystem(System):
                 pid = self.prompt_pids[unit]
                 if self.mainpid_zero_first and n == 0:
                     pid = 0
-                state = "inactive" if self.spawn_dies_immediately else "active"
+                if self.spawn_dies_immediately:
+                    state = "inactive"
+                elif self.spawn_forks:
+                    state = "activating"
+                else:
+                    state = "active"
                 return Result(0, f"MainPID={pid}\nActiveState={state}\nLoadState=loaded\n")
             if unit.startswith("twin-update-run-"):
                 snap = self._run_snap(consume=True)

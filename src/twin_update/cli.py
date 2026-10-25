@@ -36,21 +36,49 @@ class ConsoleUI:
             return preset
         if not sys.stdin.isatty():
             raise EOFError(notice.SUDO_NEEDED)
-        return getpass.getpass(prompt)
+        # Read this process's stdin (echo off). getpass() uses /dev/tty and
+        # would miss a systemd-run --scope that inherited the window tty.
+        fd = sys.stdin.fileno()
+        try:
+            import termios
+            old = termios.tcgetattr(fd)
+            cfg = list(old)
+            cfg[3] &= ~termios.ECHO
+            termios.tcsetattr(fd, termios.TCSADRAIN, cfg)
+            try:
+                print(prompt, end="", flush=True)
+                line = sys.stdin.readline()
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old)
+                print(flush=True)
+        except (OSError, AttributeError):
+            try:
+                return getpass.getpass(prompt)
+            except EOFError:
+                raise EOFError(notice.SUDO_NEEDED) from None
+        if not line:
+            raise EOFError(notice.SUDO_NEEDED)
+        return line.rstrip("\n")
 
     def confirm(self, prompt: str, timeout_s: float | None = None) -> bool:
         if not sys.stdin.isatty():
-            return False
+            raise EOFError("no terminal for confirm")
         try:
-            if timeout_s is None:
-                return input(prompt + " [y/N] ").strip().lower() in ("y", "yes")
+            # Read inherited stdin (same fd as getpass). input() would use
+            # the process tty and miss a systemd-run --scope window.
             print(prompt + " [y/N] ", end="", flush=True)
-            ready, _, _ = select.select([sys.stdin], [], [], timeout_s)
-            if not ready:
-                print("(timed out; defaulting to no)", flush=True)
-                return False
-            return sys.stdin.readline().strip().lower() in ("y", "yes")
-        except (EOFError, OSError):
+            if timeout_s is not None:
+                ready, _, _ = select.select([sys.stdin], [], [], timeout_s)
+                if not ready:
+                    print("(timed out; defaulting to no)", flush=True)
+                    return False
+            line = sys.stdin.readline()
+            if not line:
+                raise EOFError("no terminal for confirm")
+            return line.strip().lower() in ("y", "yes")
+        except (EOFError, OSError) as exc:
+            if isinstance(exc, EOFError):
+                raise
             return False
 
     def pause(self, msg: str = "Press Enter to close.") -> None:
@@ -71,7 +99,7 @@ def _detach_if_needed(args) -> None:
     if not shutil.which("systemd-run"):
         signal.signal(signal.SIGHUP, signal.SIG_IGN)
         return
-    unit = f"twin-update-run-{int(time.time())}-{os.getpid()}"
+    unit = f"twin-update-run-{int(time.time())}-{os.getpid()}-{os.urandom(2).hex()}"
     argv = ["systemd-run", "--user", "--scope", "--quiet", f"--unit={unit}", "--",
             "env", "TWIN_UPDATE_SCOPE=1", sys.executable, *sys.argv]
     os.execvp(argv[0], argv)
@@ -172,6 +200,9 @@ def _print(ui, data, as_json: bool) -> None:
                 elif k == "slot_pid_reused":
                     if v:
                         ui.say(f"{l:8} slot pid reused: yes")
+                elif k == "record_notice_error":
+                    if v:
+                        ui.say(f"{l:8} record notice: {v}")
                 elif k in ("locks_ok", "window_stale", "unit_warnings"):
                     continue
                 elif k != "locks_ok":
@@ -337,6 +368,8 @@ def main(argv=None, ui=None, system=None, peer_factory=SshPeer) -> int:
 
         if args.cmd == "prompt":
             ui.say(notice.CHECKING)
+            if getattr(args, "slot", None):
+                notice.mark_started(system, args.slot, system.own_pid())
         cfg, sess, unreachable, me, peer = _build(args, ui, system, peer_factory)
         try:
             if args.cmd == "status":
@@ -384,6 +417,11 @@ def main(argv=None, ui=None, system=None, peer_factory=SshPeer) -> int:
         return 1
     except KeyboardInterrupt:
         ui.say("stopped")
+        return 1
+    except Exception as exc:
+        ui.say(str(exc))
+        if getattr(args, "cmd", None) == "prompt" and hasattr(ui, "pause"):
+            ui.pause("Press Enter to close.")
         return 1
     _print(ui, data, args.json)
     if data.get("kind") == "check":
@@ -476,7 +514,7 @@ def _keep_launched_window(system, slot: str, pid: int | None, unit: str | None,
                             started=False, unit=unit)
     if notice.verify_window(system, slot, pid if isinstance(pid, int) else 0):
         return True
-    if (not isinstance(pid, int) or pid <= 0) and notice.unit_still_up(system, unit, env):
+    if notice.unit_still_up(system, unit, env):
         return True
     notice.clear_slot(system, slot)
     return False
@@ -568,6 +606,7 @@ def _prompt_here(args, ui, sess, unreachable, system, peer_factory) -> dict:
                 local.call("record_notice", kind="updates", signature=sig)
             except Exception as exc:
                 ui.say(f"warning: could not record today's prompt ({exc})")
+                notice.note_record_failure(system, sess.cfg.state_dir, str(exc))
 
         sess.close()
 
