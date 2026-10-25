@@ -24,6 +24,7 @@ from twin_update.system import Proc, System
 APT_BUSY = {"apt", "apt-get", "dpkg", "unattended-upgr", "apt.systemd.dai", "aptitude"}
 CRASH_RE = re.compile(r"segmentation fault|core dumped|SIGSEGV|SIGABRT|SIGILL|SIGBUS",
                       re.IGNORECASE)
+HELPER_EXE_MARKS = ("/resources/", "crashpad", "helper", "zygote", "nacl", "sandbox")
 ARCHIVES = "/var/cache/apt/archives"
 APT_LISTS = "/var/lib/apt/lists"
 APT_UPDATE_STAMP = "/var/lib/apt/periodic/update-success-stamp"
@@ -187,7 +188,9 @@ class Engine:
                 if name in self.cfg.keep_holds or pkg in self.cfg.keep_holds:
                     owner = "kept"
                 elif pkg in tool:
-                    owner = "twin-update"
+                    rec = tool.get(pkg) or {}
+                    reason = rec.get("reason") if isinstance(rec, dict) else ""
+                    owner = "rollback" if str(reason or "").startswith("rollback") else "twin-update"
                 else:
                     owner = "foreign"
                 out["managed"][name] = owner
@@ -195,14 +198,25 @@ class Engine:
                 out["other"].append(pkg)
         return out
 
+    def _rollback_hold_reason(self, pkg: str, tool: dict | None = None) -> str | None:
+        rec = (tool if tool is not None else self._tool_holds()).get(pkg) or {}
+        if not isinstance(rec, dict):
+            return None
+        reason = str(rec.get("reason") or "")
+        return reason if reason.startswith("rollback") else None
+
     def clear_holds(self, apps: list[str], dry: bool) -> list[dict]:
-        """Release holds on these apps unless kept. Foreign holds are cleared too."""
+        """Release holds on these apps unless kept or set by a rollback."""
         actions = []
         info = self.holds()["managed"]
         tool = self._tool_holds()
         for app in self._apps(apps):
             owner = info.get(app.name)
             if owner in (None, "kept"):
+                continue
+            if owner == "rollback" or self._rollback_hold_reason(app.package, tool):
+                actions.append({"app": app.name, "owner": "rollback",
+                                "action": "kept rollback hold"})
                 continue
             act = {"app": app.name, "owner": owner,
                    "action": "would clear hold" if dry else "cleared hold"}
@@ -298,14 +312,31 @@ class Engine:
             names.add(os.path.basename(app.launch[0]).lower())
         return os.path.basename(exe).lower() in names
 
+    def _looks_like_helper(self, exe: str) -> bool:
+        low = exe.lower()
+        return any(mark in low for mark in HELPER_EXE_MARKS)
+
     def running(self, app_name: str, main_only: bool = False) -> bool:
         app = self._apps([app_name])[0]
         tree = self.app_tree(app)
+        if not tree["tree"]:
+            return False
         if not main_only:
-            return bool(tree["tree"])
+            return True
         procs = tree["procs"]
-        return any(self._is_main_exe(app, procs[pid].exe) for pid in tree["mains"]
-                   if pid in procs)
+        mains = [pid for pid in tree["mains"] if pid in procs]
+        if any(self._is_main_exe(app, procs[pid].exe) for pid in mains):
+            return True
+        if not mains:
+            self.log(f"running {app.name}: tree has no identifiable main; treating as running")
+            return True
+        if not app.launch:
+            self.log(f"running {app.name}: no launch command; treating tree as running")
+            return True
+        if any(not self._looks_like_helper(procs[pid].exe) for pid in mains):
+            self.log(f"running {app.name}: main exe not identified; treating as running")
+            return True
+        return False
 
     def close_start(self, apps: list[str], dry: bool) -> dict:
         out = {}
@@ -655,9 +686,13 @@ class Engine:
             use_fresh = bool(f and f["ok"] and app.name in f["apps"])
             cand = self.candidate(app.package, f["opts"] if use_fresh else None) if ver else None
             newer = bool(ver and cand and cand != ver and self.vercmp(cand, "gt", ver))
+            rb_reason = self._rollback_hold_reason(app.package)
+            if newer and rb_reason:
+                newer = False
             out["apps"][app.name] = {"installed": ver, "candidate": cand,
                                      "update_available": newer,
-                                     "lists": "fresh" if use_fresh else "system"}
+                                     "lists": "fresh" if use_fresh else "system",
+                                     "rollback_hold": rb_reason}
         return out
 
     def _notice_state(self) -> dict:
@@ -786,6 +821,7 @@ class Engine:
         def worker(p):
             return any(os.path.isabs(v) and os.path.realpath(v).startswith(worker_root + "/")
                        for v in (p.exe, *p.argv[:2]))
+        before_all = {(p.pid, p.start) for p in self.sys.procs().values()}
         before = {(p.pid, p.start) for p in self.sys.procs().values() if worker(p)} if app.name == "cursor" else set()
         env = self._user_env()
         unit = f"twin-smoke-{app.name}-{int(self.sys.now())}"
@@ -793,6 +829,12 @@ class Engine:
                           "-p", "ExitType=cgroup", "--", *app.launch], env=env, timeout=60)
         if not r.ok:
             return {"ok": False, "reason": "could not start", "err": r.err[-300:]}
+        started_mains = []
+        t0 = self.app_tree(app)
+        for pid in t0["mains"]:
+            p = t0["procs"].get(pid)
+            if p and (pid, p.start) not in before_all:
+                started_mains.append((pid, p.start))
         threshold = None
         if app.name == "cursor":
             main = self.sys.run(["systemctl", "--user", "show", unit, "--property=MainPID", "--value"], env=env, timeout=10)
@@ -812,17 +854,32 @@ class Engine:
                 # Single-instance apps often exit the transient unit after
                 # handing off to the already-started process. Keep watching
                 # the rest of the interval so a later crash is not missed.
-                if not self.running(app_name):
+                if not self.running(app_name, main_only=True):
                     stayed = False
                     break
                 handed = True
-            if handed and not self.running(app_name):
+            if handed and not self.running(app_name, main_only=True):
                 stayed = False
                 break
         j = self.sys.run(["journalctl", "--user", "-u", unit, "--no-pager", "-o", "cat"], env=env)
         crashed = bool(CRASH_RE.search(j.out))
-        closed = self.close_start([app.name], dry=False)
-        wait = self.close_wait([app.name], self.cfg.close_timeout_s)[app.name]
+        procs = self.sys.procs()
+        for pid, start in started_mains:
+            p = procs.get(pid)
+            if p and p.start == start:
+                self.sys.term(pid, start)
+        deadline = self.sys.now() + self.cfg.close_timeout_s
+        left = []
+        while True:
+            procs = self.sys.procs()
+            left = [(pid, start) for pid, start in started_mains
+                    if pid in procs and procs[pid].start == start]
+            if not left or self.sys.now() >= deadline:
+                break
+            self.sys.sleep(1.0)
+        rem = [{"pid": pid, "exe": self._redact(procs[pid].exe)}
+               for pid, _start in left if pid in procs]
+        wait = {"closed": not left, "remaining": rem[:10], "remaining_count": len(left)}
         ok = stayed and not crashed and wait["closed"]
         res = {"ok": ok, "stayed_up_s": waited if stayed else waited - 1, "crash_in_journal": crashed,
                "closed_gracefully": wait["closed"], "handoff": handed}
@@ -840,7 +897,6 @@ class Engine:
             if st:
                 st["good_launches"] = int(st.get("good_launches", 0)) + 1
                 self._save_state(app, st)
-        del closed
         return res
 
     def verify(self, app_name: str, version: str, smoke: bool = True) -> dict:
@@ -1009,6 +1065,15 @@ class Engine:
         stale, since = notice.slot_stale(self.sys, slot)
         checks["window_stale"] = stale
         checks["window_open_since"] = since
+        checks["slot_pid_reused"] = notice.slot_pid_reused(self.sys, slot)
+        rb = []
+        for pkg, rec in self._tool_holds().items():
+            if not isinstance(rec, dict):
+                continue
+            reason = str(rec.get("reason") or "")
+            if reason.startswith("rollback"):
+                rb.append(f"{pkg} at {rec.get('version') or '?'} ({reason})")
+        checks["rollback_holds"] = rb
         svc_path = os.path.join(self.sys.home(), ".config/systemd/user/twin-update-check.service")
         tmr_path = os.path.join(self.sys.home(), ".config/systemd/user/twin-update-check.timer")
         svc_text = self.sys.read_text(svc_path)
@@ -1022,4 +1087,11 @@ class Engine:
                                env=env, timeout=15)
             tmr_text = cat.out if cat.ok and cat.out.strip() else None
         checks["unit_warnings"] = notice.unit_drift_warnings(svc_text, tmr_text)
+        exe = notice.check_exec_start(svc_text, self.sys.home())
+        if exe:
+            present = (self.sys.exists(exe) if os.path.isabs(exe)
+                       else bool(self.sys.which(exe)))
+            if not present:
+                checks["unit_warnings"].append(
+                    f"check service ExecStart does not exist: {exe}")
         return checks

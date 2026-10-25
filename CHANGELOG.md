@@ -2,6 +2,40 @@
 
 ## Unreleased
 
+- Confirming `y` starts `run` with `systemd-run --user --scope` (named
+  `--unit=`, no `--pipe`/`--collect`/`--no-block`) so the window's tty is
+  inherited: the sudo password and the rollback question stay interactive.
+  SIGHUP is ignored so closing the window does not stop apt. Cancel with
+  `systemctl --user stop <unit>` (SIGTERM), which reopens apps that were
+  closed. A missing tty password fails with a clear message and no
+  traceback; a non-interactive failed check does not silently answer N.
+  `follow_unit` (when used) waits to see the unit active, drains the last
+  journal lines, reads Result/ExecMainStatus, prints `Update finished` or
+  `Update failed (details: ...)`, and reset-failed/stops the unit.
+- A non-interactive failed check does not silently answer N: the peer is
+  not upgraded, apps are reopened, and the report says `twin-update rollback`.
+- SIGTERM, `systemctl --user stop`, and SIGHUP reopen apps closed for the
+  run, same as Ctrl-C.
+- Smoke watches and closes with `main_only`; an unidentified main is treated
+  as running (fail closed). A leftover helper under `/resources/` still does
+  not count as the app.
+- The window slot merges fields (a late `started=False` cannot clear
+  `started=True`). MainPID 0 does not clear the slot while the unit is up.
+  A reused pid or a window open more than 24 hours does not block a new
+  window; `doctor` reports both.
+- Version mismatch still stops `run` before any close. `rollback` warns and
+  proceeds per machine.
+- A rollback hold is kept across later `run`s so the daily prompt does not
+  re-offer that version. `unhold` clears it; `holds` and `doctor` show it.
+- Config errors in a prompt window show the error and wait for Enter.
+  `Checking...` is printed before the ssh build. A one-machine pending app
+  is listed in the close warning even when another app is on both machines.
+  A peer that reports no `version` is treated as older and `run` stops
+  before any close. `doctor` warns if the check service ExecStart path
+  does not exist. Prompt/run unit names include the pid so two launches
+  in the same second do not collide. gnome-terminal fallback uses
+  `--wait`. The CI workflow display name is `Checks`.
+  README says terminal `run` uses `--scope`.
 - Test prompt windows use their own slot (`prompt.window.test`) so a leftover
   test window cannot block the real daily window. `check --notify` says since
   when a real window is already open. `doctor` warns if that real window has
@@ -24,21 +58,18 @@
 - Smoke keeps watching for the rest of the interval after a single-instance
   hand-off, so a later crash is not missed. The "app is running again" guard
   matches the app's main process only, not leftover helpers.
-- `run` and `rollback` compare twin-update versions before closing anything
-  and stop if they differ. An older peer that rejects the `running` op is
-  tolerated (the old behaviour). Confirming `y` starts `run` in its own
-  user unit so closing the window cannot stop the update; the window follows
-  the unit and says so. Apps still reopen at the end of `run`.
+- An older peer that rejects the `running` op is tolerated (the old
+  behaviour). Apps still reopen at the end of `run`.
 - Terminal fallback flags depend on the resolved launcher (gnome-terminal
   style uses `--`). `doctor` warns when the installed check units lack
   `SuccessExitStatus=10` or differ from the shipped units in a way that
   matters. `twin-update --help` no longer shows a hidden `raft-upload`
   line. The zipapp build is reproducible (fixed timestamps, honours
   `SOURCE_DATE_EPOCH`).
-- Known limits: real visible windows, real systemd scope behaviour on a
-  desktop, and the first real timer run were not exercised here. Main-process
-  matching uses the launch binary and the app/package name; an unusual vendor
-  layout could still need a closer look.
+- Known limits: real visible windows, real systemd `--scope` inheriting a
+  desktop tty, real `systemctl --user stop` of a run scope, and the first
+  real timer run were not exercised here. After the window is gone, later
+  prompts have no tty and take the non-interactive stop path.
 
 ## 0.4.0 (2026-10-25)
 

@@ -51,6 +51,18 @@ class System:
             return False
         return True
 
+    def pid_start(self, pid: int) -> int | None:
+        """Starttime ticks for a live pid, used to reject PID reuse in the slot."""
+        if not isinstance(pid, int) or pid <= 0:
+            return None
+        try:
+            with open(f"/proc/{pid}/stat", "rb") as fh:
+                raw = fh.read().decode("utf-8", "replace")
+            fields = raw[raw.rindex(")") + 2:].split()
+            return int(fields[19])
+        except (OSError, ValueError, IndexError):
+            return None
+
     def try_lockfile(self, path: str):
         """Exclusive flock on a lockfile, created if needed. None if busy."""
         import fcntl
@@ -78,6 +90,17 @@ class System:
             return Result(124, "", "timeout")
         return Result(cp.returncode, cp.stdout.decode("utf-8", "replace"),
                       cp.stderr.decode("utf-8", "replace"))
+
+    def run_inherit(self, argv, timeout: float | None = None,
+                    env: dict | None = None, cwd: str | None = None) -> Result:
+        """Run without capturing stdio so a window tty stays attached."""
+        try:
+            cp = subprocess.run(list(argv), timeout=timeout, env=env, cwd=cwd)
+        except FileNotFoundError as exc:
+            return Result(127, "", str(exc))
+        except subprocess.TimeoutExpired:
+            return Result(124, "", "timeout")
+        return Result(cp.returncode, "", "")
 
     # identity -----------------------------------------------------------
     def whoami(self) -> str:

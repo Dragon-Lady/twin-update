@@ -81,9 +81,14 @@ twin-update run [--apps cursor,chatgpt] [--dry-run]
 
 Apps are only ever closed inside a run you start or confirm. There is no
 resident daemon. An optional user timer may open one prompt window; the ssh
-session to the other machine exists only for the command. A `run` you start from a terminal, or confirm with `y` in the prompt
-window, runs in its own `systemd-run --user` unit/scope, so closing that
-terminal or window does not stop the update.
+session to the other machine exists only for the command. A `run` you start
+from a terminal (without `--no-detach`) re-execs into
+`systemd-run --user --scope`. A `run` confirmed with `y` in the prompt
+window uses the same `--scope` path with a named `--unit=` so the window's
+tty is kept: the sudo password and the rollback question stay interactive.
+SIGHUP is ignored so closing the window does not stop the update. Cancel
+with `systemctl --user stop <the update unit>` (the window prints the unit
+name). That SIGTERM reopens apps that were closed for the run.
 
 ## Other commands
 
@@ -183,8 +188,15 @@ of the window.
 
 `rollback` checks the stored copy's sha256, closes the app gracefully, installs
 it with `apt-get install --allow-downgrades ./<deb>`, sets `apt-mark hold`
-(recorded as Twin Update's own hold; the next deliberate `run` releases it),
-verifies, and reopens the app if it was open.
+(recorded as a Twin Update rollback hold). The daily prompt does not re-offer
+that same version while the hold remains. `twin-update holds` and `doctor`
+show it; `twin-update unhold <app>` clears it. A later `run` does not clear
+a rollback hold. Then it verifies and reopens the app if it was open.
+
+A failed smoke/check inside a non-interactive `run` (the prompt-window unit
+has no tty for confirms) stops before upgrading the other machine, prints
+`twin-update rollback`, and exits non-zero. In an interactive terminal the
+rollback question is still asked.
 
 A rollback restores **program files, not app data**. If a new version migrated
 its settings or databases, keep your own data backups. Twin Update never opens,

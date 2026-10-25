@@ -25,14 +25,14 @@ class Launcher(unittest.TestCase):
         which = lambda n: "/usr/bin/" + n if n == "x-terminal-emulator" else None
         argv = notice.launcher_argv(which, ["twin-update", "prompt"],
                                     realpath=lambda p: "/usr/bin/gnome-terminal")
-        self.assertEqual(argv[:3], ["x-terminal-emulator", "--", "bash"])
+        self.assertEqual(argv[:4], ["x-terminal-emulator", "--wait", "--", "bash"])
         self.assertNotIn("-e", argv)
 
     def test_terminal_flags_table(self):
         expected = {
             "cosmic-term": ["--no-daemon", "-e"],
-            "gnome-terminal": ["--"],
-            "gnome-terminal.wrapper": ["--"],
+            "gnome-terminal": ["--wait", "--"],
+            "gnome-terminal.wrapper": ["--wait", "--"],
             "kgx": ["--"],
             "ptyxis": ["--"],
             "xfce4-terminal": ["-x"],
@@ -51,9 +51,10 @@ class Launcher(unittest.TestCase):
         s.mainpid_zero_first = True
         env = notice.graphical_env(s)
         argv = notice.launcher_argv(s.which, ["twin-update", "prompt"])
-        pid = notice.start_prompt_window(s, argv, env)
+        pid, unit = notice.start_prompt_window(s, argv, env)
         self.assertIsNotNone(pid)
         self.assertGreater(pid, 0)
+        self.assertTrue(unit)
 
     def test_daemonized_launcher_is_not_a_successful_window(self):
         """Main pid exits at once while a child window pid lives; that is not success."""
@@ -63,7 +64,7 @@ class Launcher(unittest.TestCase):
         argv = notice.launcher_argv(s.which, ["twin-update", "prompt"])
         self.assertEqual(argv[0], "cosmic-term")
         self.assertLess(argv.index("--no-daemon"), argv.index("-e"))
-        pid = notice.start_prompt_window(s, argv, env)
+        pid, _unit = notice.start_prompt_window(s, argv, env)
         self.assertIsNotNone(pid)
         child = pid + 1
         s.alive_pids.add(child)  # the forked window, not the unit main pid
@@ -225,7 +226,20 @@ class PromptAnswers(unittest.TestCase):
         items = [{"display": "Cursor", "where": "machine-a", "machines": ["machine-a"]}]
         line = notice.warning_line(items)
         self.assertIn("machine-a", line)
+        self.assertIn("Cursor", line)
         self.assertNotIn("both machines", line)
+
+    def test_warning_lists_one_machine_app_with_both(self):
+        items = [
+            {"display": "Cursor", "machines": ["machine-a"]},
+            {"display": "Grok Bot", "machines": ["machine-a", "machine-b"],
+             "where": "both machines"},
+        ]
+        line = notice.warning_line(items)
+        self.assertIn("Cursor", line)
+        self.assertIn("Grok Bot", line)
+        self.assertIn("machine-a", line)
+        self.assertIn("machine-b", line)
 
     def test_no_does_nothing(self):
         ui = FakeUI(confirm=False)
@@ -502,8 +516,255 @@ class DetachedRun(unittest.TestCase):
         self.assertTrue(unit.startswith("twin-update-run-"))
         self.assertIn("run", inner)
         self.assertIn("--no-detach", inner)
+        self.assertNotIn("--sudo-from-stdin", inner)
+        started = [c for c in t.sys["machine-a"].calls if c[0][:1] == ["systemd-run"]
+                   and any(a.startswith("--unit=twin-update-run-") for a in c[0])]
+        self.assertTrue(started)
+        argv, _stdin, _env = started[0]
+        self.assertIn("--scope", argv)
+        self.assertNotIn("--pipe", argv)
+        self.assertNotIn("--collect", argv)
+        self.assertNotIn("c0rrect-Horse!pw", " ".join(argv))
+        self.assertIn(notice.UPDATE_FINISHED, ui.lines)
+        self.assertTrue(any("systemctl --user stop" in l for l in ui.lines))
+        self.assertEqual(ui.lines.count(notice.CLOSE_DOES_NOT_STOP), 1)
         self.assertEqual(rc, 0)
         self.assertIn("Checking...", out)
+
+
+class FollowUnit(unittest.TestCase):
+    def _follow(self, script):
+        t = Twin()
+        s = t.sys["machine-a"]
+        s.follow_script = script
+        s.follow_idx = 0
+        ui = FakeUI()
+        rc = notice.follow_unit(s, "twin-update-run-1", {}, ui, poll_s=0)
+        return rc, ui, s
+
+    def test_failed_unit_is_not_success(self):
+        """Old fake always returned Result=success; that hid a failed run."""
+        rc, ui, s = self._follow([
+            {"active": "activating",
+             "show": "Result=\nExecMainStatus=0\nActiveState=activating\nLoadState=loaded\n"},
+            {"active": "inactive",
+             "show": "Result=exit-code\nExecMainStatus=3\nActiveState=failed\nLoadState=loaded\n"},
+        ])
+        self.assertEqual(rc, 3)
+        self.assertTrue(any(notice.UPDATE_FAILED in l for l in ui.lines))
+        self.assertTrue(any("exit 3" in l for l in ui.lines))
+        self.assertTrue(s.cleaned_units)
+
+    def test_unloaded_failed_unit_is_not_success(self):
+        rc, ui, s = self._follow([
+            {"active": "inactive", "show": "", "rc": 0},
+        ])
+        self.assertNotEqual(rc, 0)
+        self.assertTrue(any(notice.UPDATE_FAILED in l for l in ui.lines))
+        self.assertTrue(s.cleaned_units)
+
+    def test_early_inactive_then_activating_failure(self):
+        """A queued unit looks inactive first; the old follow ended there as success."""
+        rc, ui, _s = self._follow([
+            {"active": "inactive",
+             "show": "Result=\nExecMainStatus=0\nActiveState=inactive\nLoadState=loaded\n"},
+            {"active": "inactive",
+             "show": "Result=\nExecMainStatus=0\nActiveState=inactive\nLoadState=loaded\n"},
+            {"active": "activating",
+             "show": "Result=\nExecMainStatus=0\nActiveState=activating\nLoadState=loaded\n"},
+            {"active": "inactive",
+             "show": "Result=exit-code\nExecMainStatus=7\nActiveState=failed\nLoadState=loaded\n"},
+        ])
+        self.assertEqual(rc, 7)
+        self.assertTrue(any(notice.UPDATE_FAILED in l for l in ui.lines))
+
+
+class PasswordHandoff(unittest.TestCase):
+    def test_console_getpass_no_tty_raises(self):
+        from unittest import mock
+        from twin_update import cli
+        ui = cli.ConsoleUI()
+        with mock.patch.object(cli.sys.stdin, "isatty", return_value=False):
+            with self.assertRaises(EOFError) as ctx:
+                ui.getpass("sudo password: ")
+        self.assertIn("sudo password needed", str(ctx.exception))
+
+    def test_main_catches_eof_without_traceback(self):
+        import contextlib
+        import io
+        import tempfile
+        from fakes import patched_paths
+        from twin_update import cli
+        t = Twin(); standard(t)
+        tmpd = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, tmpd, True)
+        cfgp = os.path.join(tmpd, "c.toml")
+        with open(cfgp, "w") as fh:
+            fh.write(CONFIG.format(keep="[]", fallback="[]"))
+        ui = FakeUI(eof=True)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), patched_paths(t):
+            rc = cli.main(["--config", cfgp, "run", "--no-detach", "--no-smoke"],
+                          ui=ui, system=t.sys["machine-a"],
+                          peer_factory=lambda label, target, cmd: t.peers[label])
+        out = buf.getvalue() + "\n".join(ui.lines)
+        self.assertEqual(rc, 1)
+        self.assertNotIn("Traceback", out)
+        self.assertTrue("sudo" in out.lower() or notice.SUDO_NEEDED in out)
+
+
+class SlotMerge(unittest.TestCase):
+    def test_launch_then_window_keeps_started(self):
+        t = Twin(); s = t.sys["machine-a"]
+        path = notice.window_lock_path(t.cfg.state_dir)
+        notice.write_window_pid(s, path, 0, started=False, unit="twin-update-prompt-1")
+        s.alive_pids.add(5001)
+        s.pid_starts[5001] = 42
+        notice.write_window_pid(s, path, 5001, started=True, start=42)
+        data = notice.read_slot(s, path)
+        self.assertTrue(data["started"])
+        self.assertEqual(data["pid"], 5001)
+        self.assertEqual(data["start"], 42)
+
+    def test_window_then_launch_keeps_started(self):
+        t = Twin(); s = t.sys["machine-a"]
+        path = notice.window_lock_path(t.cfg.state_dir)
+        s.alive_pids.add(5002)
+        s.pid_starts[5002] = 7
+        notice.write_window_pid(s, path, 5002, started=True, start=7,
+                                unit="twin-update-prompt-2")
+        notice.write_window_pid(s, path, 0, started=False, unit="twin-update-prompt-2")
+        data = notice.read_slot(s, path)
+        self.assertTrue(data["started"])
+        self.assertEqual(data["pid"], 5002)
+        self.assertEqual(data["start"], 7)
+
+    def test_pid_zero_does_not_clear_live_unit(self):
+        t = Twin(); s = t.sys["machine-a"]
+        path = notice.window_lock_path(t.cfg.state_dir)
+        s.mainpid_zero_first = True
+        env = notice.graphical_env(s)
+        argv = notice.launcher_argv(s.which, ["twin-update", "prompt"])
+        # Force a pid-0 return by making show stay at 0 / activating.
+        s.prompt_pids["held"] = 0
+        notice.write_window_pid(s, path, 0, started=False, unit="twin-update-prompt-9")
+        s._mainpid_reads["twin-update-prompt-9"] = 0
+        s.prompt_pids["twin-update-prompt-9"] = 0
+        self.assertTrue(notice.unit_still_up(s, "twin-update-prompt-9", env))
+        from twin_update import cli
+        kept = cli._keep_launched_window(s, path, 0, "twin-update-prompt-9", env)
+        self.assertTrue(kept)
+        self.assertTrue(notice.read_slot(s, path).get("unit"))
+        self.assertNotEqual(notice.read_slot(s, path), {})
+
+    def test_reused_pid_does_not_hold_slot(self):
+        t = Twin(); s = t.sys["machine-a"]
+        path = notice.window_lock_path(t.cfg.state_dir)
+        s.alive_pids.add(6000)
+        s.pid_starts[6000] = 11
+        notice.write_window_pid(s, path, 6000, started=True, start=11)
+        self.assertTrue(notice.slot_held(s, path))
+        s.pid_starts[6000] = 99
+        self.assertFalse(notice.slot_held(s, path))
+        self.assertTrue(notice.slot_pid_reused(s, path))
+
+    def test_window_older_than_a_day_does_not_hold(self):
+        t = Twin(); s = t.sys["machine-a"]
+        path = notice.window_lock_path(t.cfg.state_dir)
+        s.alive_pids.add(6001)
+        s.pid_starts[6001] = 1
+        notice.write_window_pid(s, path, 6001, started=True, start=1,
+                                opened_at=s.now() - 90000)
+        self.assertFalse(notice.slot_held(s, path))
+        stale, _since = notice.slot_stale(s, path)
+        self.assertTrue(stale)
+
+    def test_prompt_config_error_pauses(self):
+        import contextlib
+        import io
+        import tempfile
+        from twin_update import cli
+        tmpd = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, tmpd, True)
+        cfgp = os.path.join(tmpd, "c.toml")
+        with open(cfgp, "w") as fh:
+            fh.write("[machines]\n")
+        ui = FakeUI()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = cli.main(["--config", cfgp, "prompt", "--inside"], ui=ui)
+        out = buf.getvalue() + "\n".join(ui.lines)
+        self.assertEqual(rc, 2)
+        self.assertIn("config error", out)
+        self.assertTrue(any("Press Enter" in l for l in ui.lines))
+
+    def test_checking_prints_before_build(self):
+        import contextlib
+        import io
+        import tempfile
+        from unittest import mock
+        from fakes import patched_paths
+        from twin_update import cli
+        t = Twin(); standard(t)
+        tmpd = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, tmpd, True)
+        cfgp = os.path.join(tmpd, "c.toml")
+        with open(cfgp, "w") as fh:
+            fh.write(CONFIG.format(keep="[]", fallback="[]"))
+        ui = FakeUI(confirm=False)
+        seen = []
+        real = cli._build
+
+        def wrapped(*a, **k):
+            seen.append(list(ui.lines))
+            return real(*a, **k)
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), patched_paths(t), \
+                mock.patch.object(cli, "_build", side_effect=wrapped):
+            cli.main(["--config", cfgp, "prompt", "--inside"], ui=ui,
+                     system=t.sys["machine-a"],
+                     peer_factory=lambda label, target, cmd: t.peers[label])
+        self.assertTrue(seen)
+        self.assertIn(notice.CHECKING, seen[0])
+
+    def test_console_confirm_on_pty(self):
+        import os
+        import pty
+        from unittest import mock
+        from twin_update import cli
+        master, slave = pty.openpty()
+        try:
+            slave_in = os.fdopen(slave, "r", buffering=1)
+            os.write(master, b"y\n")
+            with mock.patch.object(cli.sys, "stdin", slave_in):
+                ui = cli.ConsoleUI()
+                self.assertTrue(ui.can_prompt())
+                self.assertTrue(ui.confirm("Update now?"))
+        finally:
+            try:
+                slave_in.close()
+            except Exception:
+                pass
+            try:
+                os.close(master)
+            except OSError:
+                pass
+
+    def test_doctor_warns_when_execstart_missing(self):
+        from twin_update.orchestrator import doctor_findings
+        t = Twin(); standard(t)
+        home = t.sys["machine-a"].home()
+        unit_dir = os.path.join(home, ".config/systemd/user")
+        os.makedirs(unit_dir, exist_ok=True)
+        with open(os.path.join(unit_dir, "twin-update-check.service"), "w") as fh:
+            fh.write("[Service]\nType=oneshot\nSuccessExitStatus=10\n"
+                     "ExecStart=/no/such/twin-update check --notify\n")
+        with open(os.path.join(unit_dir, "twin-update-check.timer"), "w") as fh:
+            fh.write("[Timer]\nOnCalendar=*-*-* 09:13:00\nPersistent=true\n")
+        d = t.eng["machine-a"].doctor()
+        _, warnings = doctor_findings(d)
+        self.assertTrue(any("ExecStart does not exist" in w for w in warnings))
 
 
 class HelpHidesRaft(unittest.TestCase):

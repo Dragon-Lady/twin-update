@@ -324,10 +324,6 @@ class RunFlow(unittest.TestCase):
 
         class Old:
             def call(self, op, **kw):
-                if op == "identity":
-                    r = dict(real.call(op, **kw))
-                    r.pop("version", None)
-                    return r
                 if op == "running":
                     raise PeerError("machine-b: op not allowed: running")
                 return real.call(op, **kw)
@@ -339,6 +335,73 @@ class RunFlow(unittest.TestCase):
         rep = orchestrator.run(t.session(FakeUI()), ["cursor"], dry=False, smoke=False)
         self.assertEqual(rep["result"], "ok")
         self.assertTrue(kinds(t, "INSTALL"))
+
+    def test_peer_without_version_aborts_before_close(self):
+        t = Twin(); standard(t)
+        t.sys["machine-a"].add_app_procs(CUR)
+        real = t.peers["machine-b"]
+
+        class Old:
+            def call(self, op, **kw):
+                if op == "identity":
+                    r = dict(real.call(op, **kw))
+                    r.pop("version", None)
+                    return r
+                return real.call(op, **kw)
+
+            def close(self):
+                real.close()
+
+        t.peers["machine-b"] = Old()
+        rep = orchestrator.run(t.session(FakeUI()), ["cursor"], dry=False, smoke=False)
+        self.assertEqual(rep["result"], "aborted")
+        self.assertIn("older twin-update", rep["error"])
+        self.assertEqual(kinds(t, "TERM"), [])
+        self.assertEqual(kinds(t, "INSTALL"), [])
+
+    def test_sigterm_after_close_reopens_apps(self):
+        import os
+        import signal
+        t = Twin(); standard(t)
+        t.sys["machine-a"].add_app_procs(CUR)
+        real = t.peers["machine-a"]
+
+        class Term:
+            def call(self, op, **kw):
+                if op == "upgrade":
+                    os.kill(os.getpid(), signal.SIGTERM)
+                return real.call(op, **kw)
+
+            def close(self):
+                real.close()
+
+        t.peers["machine-a"] = Term()
+        rep = orchestrator.run(t.session(FakeUI()), ["cursor"], dry=False, smoke=False)
+        self.assertEqual(rep["result"], "aborted")
+        self.assertIn("interrupted after close", rep["error"])
+        self.assertIn("cursor", rep.get("reopen", {}).get("machine-a", {}))
+
+    def test_noninteractive_failed_check_stops_peer(self):
+        t = Twin(); standard(t)
+        t.sys["machine-a"].add_app_procs(CUR)
+        t.sys["machine-b"].add_app_procs(CUR)
+        t.sys["machine-a"].smoke_dies.add("cursor")
+        ui = FakeUI(can_prompt=False)
+        rep = orchestrator.run(t.session(ui), ["cursor"], dry=False)
+        self.assertEqual(rep["result"], "aborted")
+        self.assertIn("twin-update rollback", rep["error"])
+        self.assertIn("not upgrading the other machine", rep["error"])
+        installs = [e for e in kinds(t, "INSTALL")]
+        self.assertEqual(len(installs), 1)
+        self.assertEqual(installs[0][0], "alice")
+        self.assertEqual(t.sys["machine-b"].pkgs["cursor"], "3.23.23-1")
+        self.assertIn("cursor", (rep.get("reopen") or {}).get("machine-a", {}))
+
+    def test_differently_named_main_is_treated_as_running(self):
+        t = Twin(); standard(t)
+        t.sys["machine-a"].proc_table[5100] = Proc(
+            5100, 1, "/usr/share/cursor/cursor.bin", "cursor.bin", 12)
+        self.assertTrue(t.eng["machine-a"].running("cursor", main_only=True))
 
     def test_identity_mismatch_aborts(self):
         t = Twin(); standard(t)
@@ -510,9 +573,8 @@ class Retention(unittest.TestCase):
         self.assertEqual(t.sys["machine-a"].pkgs["cursor"], "3.24.9-1")
         self.assertIn("cursor", t.sys["machine-b"].held)
         self.assertEqual(rep["reopen"], {"machine-b": {"cursor": {"ok": True}}})
-        # the next deliberate run releases our own hold
         h = t.eng["machine-b"].holds()["managed"]
-        self.assertEqual(h["cursor"], "twin-update")
+        self.assertEqual(h["cursor"], "rollback")
 
     def test_rollback_refuses_tampered_copy(self):
         t = Twin()
@@ -532,6 +594,53 @@ class Retention(unittest.TestCase):
         rep = orchestrator.rollback(t.session(FakeUI()), "cursor", ["machine-a", "machine-b"], dry=False)
         self.assertEqual(rep["result"], "aborted")
         self.assertIn("no rollback copy", rep["error"])
+
+    def test_rollback_hold_survives_next_run_and_check(self):
+        t = Twin()
+        t.setup("cursor", "3.23.23-1", "3.24.9-1")
+        orchestrator.run(t.session(FakeUI()), ["cursor"], dry=False, smoke=False)
+        orchestrator.rollback(t.session(FakeUI()), "cursor", ["machine-a", "machine-b"], dry=False)
+        self.assertEqual(t.eng["machine-a"].holds()["managed"]["cursor"], "rollback")
+        chk = t.eng["machine-a"].check(["cursor"])
+        self.assertFalse(chk["apps"]["cursor"]["update_available"])
+        self.assertTrue(chk["apps"]["cursor"]["rollback_hold"])
+        t.eng["machine-a"].set_password(PW)
+        acts = t.eng["machine-a"].clear_holds(["cursor"], dry=False)
+        self.assertTrue(any(a.get("action") == "kept rollback hold" for a in acts))
+        self.assertIn("cursor", t.sys["machine-a"].held)
+        t.sys["machine-a"].cands["cursor"] = "3.24.9-1"
+        t.sys["machine-b"].cands["cursor"] = "3.24.9-1"
+        rep = orchestrator.run(t.session(FakeUI()), ["cursor"], dry=False, smoke=False)
+        self.assertEqual(rep["plan"]["cursor"]["action"], "skip")
+        self.assertIn("rollback hold", rep["plan"]["cursor"]["reason"])
+        self.assertIn("cursor", t.sys["machine-a"].held)
+        d = t.eng["machine-a"].doctor()
+        self.assertTrue(d["rollback_holds"])
+
+    def test_rollback_with_mismatched_versions_warns_and_proceeds(self):
+        t = Twin()
+        t.setup("cursor", "3.23.23-1", "3.24.9-1")
+        orchestrator.run(t.session(FakeUI()), ["cursor"], dry=False, smoke=False)
+        real = t.peers["machine-b"]
+
+        class Old:
+            def call(self, op, **kw):
+                if op == "identity":
+                    r = dict(real.call(op, **kw))
+                    r["version"] = "0.3.0"
+                    return r
+                return real.call(op, **kw)
+
+            def close(self):
+                real.close()
+
+        t.peers["machine-b"] = Old()
+        ui = FakeUI()
+        rep = orchestrator.rollback(t.session(ui), "cursor", ["machine-a", "machine-b"], dry=False)
+        self.assertNotEqual(rep["result"], "aborted")
+        self.assertTrue(any("versions differ" in l for l in ui.lines + rep["summary"]))
+        self.assertEqual(t.sys["machine-a"].pkgs["cursor"], "3.23.23-1")
+        self.assertEqual(t.sys["machine-b"].pkgs["cursor"], "3.23.23-1")
 
 
 class Processes(unittest.TestCase):

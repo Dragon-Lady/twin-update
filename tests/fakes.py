@@ -118,6 +118,10 @@ class FakeSystem(System):
         self.journal_crash = set()
         self.unit_files = {}  # name -> text for systemctl cat
         self.run_units = []   # started twin-update-run-* units
+        self.pid_starts = {}  # pid -> starttime ticks (slot identity)
+        self.follow_script = None  # list of {active, show} snapshots
+        self.follow_idx = 0
+        self.cleaned_units = []  # ("reset-failed"|"stop", unit)
 
     # identity
     def whoami(self): return self.user
@@ -195,6 +199,28 @@ class FakeSystem(System):
     def pid_alive(self, pid):
         return pid in self.alive_pids
 
+    def pid_start(self, pid):
+        if pid in self.proc_table:
+            return self.proc_table[pid].start
+        return self.pid_starts.get(pid)
+
+    def _run_snap(self, consume=False):
+        script = self.follow_script
+        if script is None:
+            script = [
+                {"active": "activating",
+                 "show": "Result=\nExecMainStatus=0\nActiveState=activating\nLoadState=loaded\n"},
+                {"active": "inactive",
+                 "show": "Result=success\nExecMainStatus=0\nActiveState=inactive\nLoadState=loaded\n"},
+            ]
+        i = self.follow_idx
+        if i >= len(script):
+            i = len(script) - 1
+        snap = script[i]
+        if consume and self.follow_idx < len(script):
+            self.follow_idx += 1
+        return snap
+
     def _maybe_smoke_crash(self, app):
         after = self.smoke_crash_after.get(app)
         started = self._smoke_started_at.get(app)
@@ -242,6 +268,9 @@ class FakeSystem(System):
             fh.write("m-" + pkg + ver)
 
     # subprocess
+    def run_inherit(self, argv, timeout=None, env=None, cwd=None):
+        return self.run(argv, input=None, timeout=timeout, env=env, cwd=cwd)
+
     def run(self, argv, input=None, timeout=None, env=None, cwd=None):
         argv = list(argv)
         self.calls.append((argv, input, env))
@@ -336,8 +365,18 @@ class FakeSystem(System):
                     return Result(3, "inactive")
                 return Result(0, "failed" if app in self.smoke_dies else "active")
             if unit.startswith("twin-update-run-"):
-                return Result(3, "inactive")
+                snap = self._run_snap(consume=False)
+                state = snap.get("active", "inactive")
+                return Result(0 if state == "active" else 3, state)
             return Result(3, "inactive")
+        if argv[:3] == ["systemctl", "--user", "reset-failed"]:
+            unit = argv[3] if len(argv) > 3 else ""
+            self.cleaned_units.append(("reset-failed", unit))
+            return Result(0)
+        if argv[:3] == ["systemctl", "--user", "stop"]:
+            unit = argv[3] if len(argv) > 3 else ""
+            self.cleaned_units.append(("stop", unit))
+            return Result(0)
         if argv[:3] == ["systemctl", "--user", "is-enabled"]:
             return Result(0, "enabled\n")
         if argv[:3] == ["systemctl", "--user", "show-environment"]:
@@ -360,9 +399,14 @@ class FakeSystem(System):
                 pid = self.prompt_pids[unit]
                 if self.mainpid_zero_first and n == 0:
                     pid = 0
-                return Result(0, f"MainPID={pid}\nActiveState=active\n")
+                state = "inactive" if self.spawn_dies_immediately else "active"
+                return Result(0, f"MainPID={pid}\nActiveState={state}\nLoadState=loaded\n")
             if unit.startswith("twin-update-run-"):
-                return Result(0, "Result=success\nExecMainStatus=0\nActiveState=inactive\n")
+                snap = self._run_snap(consume=True)
+                text = snap.get("show", "")
+                return Result(snap.get("rc", 0), text)
+            if unit.startswith("twin-smoke-"):
+                return Result(0, "MainPID=0\nActiveState=active\n")
             return Result(127, "", f"fake: unknown {argv}")
         if cmd == "journalctl":
             unit = ""
@@ -414,11 +458,13 @@ class FakeSystem(System):
 
 
 class FakeUI:
-    def __init__(self, password=PW, confirm=False, eof=False, confirm_timeout=False):
+    def __init__(self, password=PW, confirm=False, eof=False, confirm_timeout=False,
+                 can_prompt=True):
         self.password = password
         self.answer = confirm
         self.eof = eof
         self.confirm_timeout = confirm_timeout
+        self._can_prompt = can_prompt
         self.lines = []
         self.prompts = []
         self.timeouts = []
@@ -426,8 +472,13 @@ class FakeUI:
     def say(self, msg):
         self.lines.append(msg)
 
+    def can_prompt(self):
+        return self._can_prompt
+
     def getpass(self, prompt):
         self.prompts.append(prompt)
+        if self.eof:
+            raise EOFError
         return self.password
 
     def confirm(self, prompt, timeout_s=None):

@@ -29,14 +29,20 @@ EXTRA_NOTIFY_BODY = "Updates waiting: see the Twin Update window"
 UPDATE_NOW = "Update now?"
 CHECKING = "Checking..."
 CLOSE_DOES_NOT_STOP = "Closing this window does not stop the update."
+CANCEL_HINT = "To cancel: systemctl --user stop <the update unit shown below>."
+SUDO_NEEDED = ("sudo password needed but this run has no terminal and none was "
+               "supplied; start it from a Twin Update window or a terminal")
+UPDATE_FINISHED = "Update finished"
+UPDATE_FAILED = "Update failed"
+FOLLOW_ACTIVE_TRIES = 6
 GUI_KEYS = ("WAYLAND_DISPLAY", "DISPLAY", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS")
 
 # basename of the resolved launcher -> argv inserted before the inner command.
 # gnome-terminal style launchers treat -e as a title/deprecated and need --.
 TERMINAL_FLAGS = {
     "cosmic-term": ["--no-daemon", "-e"],
-    "gnome-terminal": ["--"],
-    "gnome-terminal.wrapper": ["--"],
+    "gnome-terminal": ["--wait", "--"],
+    "gnome-terminal.wrapper": ["--wait", "--"],
     "kgx": ["--"],
     "ptyxis": ["--"],
     "xfce4-terminal": ["-x"],
@@ -96,7 +102,7 @@ def parse_unit_show(text: str) -> tuple[int, str]:
     return pid, state
 
 
-def start_prompt_window(system, argv: list[str], env: dict) -> int | None:
+def start_prompt_window(system, argv: list[str], env: dict) -> tuple[int | None, str | None]:
     """Start the terminal via a user transient unit (the oneshot can then exit).
 
     ``systemd-run --no-block`` can report MainPID 0 while the unit is still
@@ -105,14 +111,14 @@ def start_prompt_window(system, argv: list[str], env: dict) -> int | None:
     caller can wait for the prompt to mark itself started.
     """
     if not system.which("systemd-run"):
-        return None
-    unit = f"twin-update-prompt-{int(system.now())}"
+        return None, None
+    unit = f"twin-update-prompt-{int(system.now())}-{system.own_pid()}"
     started = system.run(
         ["systemd-run", "--user", "--collect", "--quiet", "--no-block",
          f"--unit={unit}", "--", *argv],
         env=env, timeout=30)
     if not started.ok:
-        return None
+        return None, unit
     deadline = system.now() + MAINPID_POLL_S
     pid, state = 0, ""
     while True:
@@ -122,15 +128,15 @@ def start_prompt_window(system, argv: list[str], env: dict) -> int | None:
             env=env, timeout=10)
         pid, state = parse_unit_show(shown.out)
         if pid > 0:
-            return pid
+            return pid, unit
         if state in ("failed", "inactive", "dead"):
-            return None
+            return None, unit
         if system.now() >= deadline:
             break
         system.sleep(MAINPID_STEP_S)
     if state in ("active", "activating") or not state:
-        return 0
-    return None
+        return 0, unit
+    return None, unit
 
 
 def launcher_argv(which: Callable[[str], str | None], inner: list[str],
@@ -233,11 +239,30 @@ def slot_opened_at(system, path: str) -> str | None:
     return format_since(read_slot(system, path).get("opened_at"))
 
 
-def slot_held(system, path: str) -> bool:
-    """True if a live window owns the slot, or a launch is still starting."""
-    data = read_slot(system, path)
+def _pid_matches_slot(system, data: dict) -> bool:
+    """True only if the stored pid is still the same process we recorded."""
     pid = data.get("pid")
-    if isinstance(pid, int) and pid > 0 and system.pid_alive(pid):
+    if not (isinstance(pid, int) and pid > 0 and system.pid_alive(pid)):
+        return False
+    stored = data.get("start")
+    if isinstance(stored, int) and hasattr(system, "pid_start"):
+        cur = system.pid_start(pid)
+        if cur is not None and cur != stored:
+            return False
+    return True
+
+
+def slot_held(system, path: str) -> bool:
+    """True if a live, validated window owns the slot, or a launch is starting.
+
+    A pid that has been reused, or a window open more than 24 hours, does not
+    hold the slot (doctor still reports the stale window so it can be replaced).
+    """
+    data = read_slot(system, path)
+    if _pid_matches_slot(system, data):
+        ts = data.get("opened_at")
+        if isinstance(ts, (int, float)) and system.now() - ts > STALE_WINDOW_S:
+            return False
         return True
     if data.get("starting") and isinstance(data.get("opened_at"), (int, float)):
         if system.now() - data["opened_at"] < STARTING_SLOT_S:
@@ -249,6 +274,14 @@ def slot_pid_alive(system, path: str) -> bool:
     data = read_slot(system, path)
     pid = data.get("pid")
     return isinstance(pid, int) and pid > 0 and system.pid_alive(pid)
+
+
+def slot_pid_reused(system, path: str) -> bool:
+    """True when a live pid no longer matches the recorded start time."""
+    data = read_slot(system, path)
+    pid = data.get("pid")
+    return (isinstance(pid, int) and pid > 0 and system.pid_alive(pid)
+            and not _pid_matches_slot(system, data))
 
 
 def try_begin_window(system, path: str):
@@ -270,18 +303,33 @@ def try_begin_window(system, path: str):
 
 
 def write_window_pid(system, path: str, pid: int, started: bool = False,
-                     opened_at: float | None = None) -> None:
+                     opened_at: float | None = None, start: int | None = None,
+                     unit: str | None = None) -> None:
+    """Merge slot fields. A later launch write must not clear started=True."""
     prev = read_slot(system, path)
+    if prev.get("started"):
+        started = True
+    if (not isinstance(pid, int) or pid <= 0) and isinstance(prev.get("pid"), int) and prev["pid"] > 0:
+        pid = prev["pid"]
     ts = opened_at if opened_at is not None else prev.get("opened_at")
     if not isinstance(ts, (int, float)):
         ts = system.now()
+    if start is None:
+        start = prev.get("start")
+    if start is None and isinstance(pid, int) and pid > 0 and hasattr(system, "pid_start"):
+        start = system.pid_start(pid)
     payload = {"pid": pid, "started": started, "opened_at": ts,
-               "starting": bool(not started and pid <= 0)}
+               "starting": bool(not started and (not isinstance(pid, int) or pid <= 0))}
+    if isinstance(start, int):
+        payload["start"] = start
+    if unit or prev.get("unit"):
+        payload["unit"] = unit or prev.get("unit")
     system.write_inplace(path, json.dumps(payload) + "\n")
 
 
 def mark_started(system, path: str, pid: int) -> None:
-    write_window_pid(system, path, pid, started=True)
+    start = system.pid_start(pid) if hasattr(system, "pid_start") else None
+    write_window_pid(system, path, pid, started=True, start=start)
 
 
 def clear_slot(system, path: str) -> None:
@@ -307,21 +355,42 @@ def verify_window(system, path: str, pid: int, wait_s: float = LAUNCH_VERIFY_S) 
             break
         system.sleep(min(0.2, left))
     data = read_slot(system, path)
-    return bool(data.get("started") or (pid > 0 and system.pid_alive(pid)))
+    if data.get("started") or (pid > 0 and system.pid_alive(pid)):
+        return True
+    return unit_still_up(system, data.get("unit"))
 
 
 def slot_stale(system, path: str, limit_s: float = STALE_WINDOW_S) -> tuple[bool, str | None]:
     """True when the real-slot window has been open longer than limit_s."""
     data = read_slot(system, path)
-    pid = data.get("pid")
     ts = data.get("opened_at")
-    if not (isinstance(pid, int) and pid > 0 and system.pid_alive(pid)):
+    if not _pid_matches_slot(system, data) and not (
+            isinstance(data.get("pid"), int) and data["pid"] > 0 and system.pid_alive(data["pid"])):
         return False, None
     if not isinstance(ts, (int, float)):
         return False, None
     if system.now() - ts <= limit_s:
         return False, format_since(ts)
     return True, format_since(ts)
+
+
+def unit_still_up(system, unit: str | None, env: dict | None = None) -> bool:
+    if not unit:
+        return False
+    shown = system.run(
+        ["systemctl", "--user", "show", unit,
+         "--property=ActiveState", "--property=LoadState"],
+        env=env, timeout=10)
+    state = ""
+    load = ""
+    for line in shown.out.splitlines():
+        if line.startswith("ActiveState="):
+            state = line.split("=", 1)[1].strip()
+        if line.startswith("LoadState="):
+            load = line.split("=", 1)[1].strip()
+    if load == "not-found":
+        return False
+    return state in ("active", "activating")
 
 
 def warning_line(items: list[dict]) -> str:
@@ -345,10 +414,13 @@ def warning_line(items: list[dict]) -> str:
                 by_machine.setdefault(m, []).append(name)
         else:
             unnamed.append(name)
-    if both_items and len(by_machine) != 1:
-        listed = ", ".join(dict.fromkeys(both_items))
-        return f"Updating closes {listed} on both machines for about 10 minutes."
     if by_machine:
+        listed_both = list(dict.fromkeys(both_items))
+        sets = [tuple(dict.fromkeys(names)) for names in by_machine.values()]
+        if (len(by_machine) >= 2 and listed_both and not unnamed
+                and len(set(sets)) == 1 and set(sets[0]) == set(listed_both)):
+            return (f"Updating closes {', '.join(listed_both)} on both machines "
+                    "for about 10 minutes.")
         parts = [f"{label}: {', '.join(dict.fromkeys(names))}"
                  for label, names in sorted(by_machine.items())]
         return "Updating closes " + "; ".join(parts) + " for about 10 minutes."
@@ -466,6 +538,7 @@ def run_prompt(ui, items: list[dict], *, test: bool = False,
             return "test"
         if run_fn is not None:
             ui.say(CLOSE_DOES_NOT_STOP)
+            ui.say(CANCEL_HINT)
             run_fn()
             _pause(ui)
         return "run"
@@ -478,9 +551,53 @@ def run_prompt(ui, items: list[dict], *, test: bool = False,
         return "error"
 
 
+def _parse_unit_result(text: str) -> tuple[int | None, str, str, str]:
+    """Return (exec_status, result, active, load) from ``systemctl show``."""
+    status, result, active, load = None, "", "", ""
+    for line in text.splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        value = value.strip()
+        if key == "ExecMainStatus" and value.isdigit():
+            status = int(value)
+        elif key == "Result":
+            result = value
+        elif key == "ActiveState":
+            active = value
+        elif key == "LoadState":
+            load = value
+    return status, result, active, load
+
+
+def _cleanup_unit(system, unit: str, env: dict | None = None) -> None:
+    system.run(["systemctl", "--user", "reset-failed", unit], env=env, timeout=10)
+    system.run(["systemctl", "--user", "stop", unit], env=env, timeout=15)
+
+
+def _announce_run_result(ui, rc: int, result: str, status: int | None) -> None:
+    if rc == 0:
+        ui.say(UPDATE_FINISHED)
+        return
+    detail = result or "failed"
+    if status is not None:
+        detail = f"{detail}, exit {status}"
+    ui.say(f"{UPDATE_FAILED} (details: {detail})")
+
+
 def follow_unit(system, unit: str, env: dict, ui, poll_s: float = 0.5) -> int:
-    """Print new journal lines until the unit leaves active/activating."""
+    """Follow a run unit until it finishes. Do not trust a first 'inactive'.
+
+    ``--collect`` is not used by the caller: a failed collected unit vanishes
+    and ``show`` then looks like success. We require the unit to have been
+    seen active/activating (or retry a few times) before treating inactive
+    as finished, then read Result/ExecMainStatus. An unloaded failed unit
+    is a failure. Cleans up so the name can be reused.
+    """
     seen = 0
+    seen_active = False
+    inactive_tries = 0
+    last_status, last_result = None, ""
     while True:
         j = system.run(["journalctl", "--user", "-u", unit, "--no-pager", "-o", "cat"],
                        env=env, timeout=30)
@@ -491,41 +608,95 @@ def follow_unit(system, unit: str, env: dict, ui, poll_s: float = 0.5) -> int:
         seen = len(lines)
         a = system.run(["systemctl", "--user", "is-active", unit], env=env, timeout=10)
         state = a.out.strip()
-        if state not in ("active", "activating"):
-            shown = system.run(
-                ["systemctl", "--user", "show", unit,
-                 "--property=Result", "--property=ExecMainStatus"],
-                env=env, timeout=10)
-            rc = 0
-            for line in shown.out.splitlines():
-                if line.startswith("ExecMainStatus=") and line.split("=", 1)[1].isdigit():
-                    rc = int(line.split("=", 1)[1])
-                if line.startswith("Result=") and line.split("=", 1)[1] not in ("", "success"):
-                    rc = rc or 1
+        shown = system.run(
+            ["systemctl", "--user", "show", unit,
+             "--property=Result", "--property=ExecMainStatus",
+             "--property=ActiveState", "--property=LoadState"],
+            env=env, timeout=10)
+        status, result, active, load = _parse_unit_result(shown.out)
+        if status is not None:
+            last_status = status
+        if result:
+            last_result = result
+        if state in ("active", "activating") or active in ("active", "activating"):
+            seen_active = True
+            inactive_tries = 0
+            system.sleep(poll_s)
+            continue
+        inactive_tries += 1
+        gone = load == "not-found" or (not shown.out.strip() and load != "loaded")
+        failed = bool(last_result and last_result not in ("success", ""))
+        if not seen_active:
+            if gone:
+                rc = last_status if last_status not in (None, 0) else 1
+                last_result = last_result or "not-found"
+                _announce_run_result(ui, rc, last_result, last_status)
+                _cleanup_unit(system, unit, env)
+                return rc
+            if failed:
+                rc = last_status if last_status not in (None, 0) else 1
+                _announce_run_result(ui, rc, last_result, last_status)
+                _cleanup_unit(system, unit, env)
+                return rc
+            if inactive_tries < FOLLOW_ACTIVE_TRIES:
+                system.sleep(poll_s)
+                continue
+            rc = 1
+            last_result = last_result or "never-active"
+            _announce_run_result(ui, rc, last_result, last_status)
+            _cleanup_unit(system, unit, env)
             return rc
-        system.sleep(poll_s)
+        if gone:
+            rc = last_status if last_status not in (None, 0) else 1
+            last_result = last_result or "not-found"
+        elif failed:
+            rc = last_status if last_status not in (None,) else 1
+            if rc == 0:
+                rc = 1
+        elif last_status is not None:
+            rc = last_status
+        else:
+            rc = 0
+        j = system.run(["journalctl", "--user", "-u", unit, "--no-pager", "-o", "cat"],
+                       env=env, timeout=30)
+        text = j.out if j.ok else ""
+        lines = text.splitlines()
+        for line in lines[seen:]:
+            ui.say(line)
+        _announce_run_result(ui, rc, last_result, last_status)
+        _cleanup_unit(system, unit, env)
+        return rc
 
 
 def start_and_follow_run(system, argv: list[str], env: dict, ui) -> int:
-    """Start ``twin-update run`` in its own transient unit and follow it.
+    """Start ``twin-update run`` in a user scope that keeps this window's tty.
 
-    Closing the prompt window must not signal the run. The unit lives under
-    the user systemd instance, not the terminal's process group.
+    ``systemd-run --user --scope`` (no ``--pipe``, no ``--no-block``) inherits
+    stdin/stdout so the sudo password and the rollback question stay
+    interactive. SIGHUP is ignored inside the run so closing this window
+    does not stop apt. Cancel with ``systemctl --user stop <unit>`` (SIGTERM),
+    which reopens apps that were closed. A run with no tty fails cleanly
+    instead of answering N.
+
+    Trade-off: after the window is gone, later prompts have no tty and take
+    the non-interactive path (stop before the peer, print
+    ``twin-update rollback``). Logout also sends SIGHUP and is ignored so
+    a close cannot look like a cancel.
     """
-    ui.say(CLOSE_DOES_NOT_STOP)
     if not system.which("systemd-run"):
         ui.say("systemd-run not found; the run stays in this window.")
         return 1
-    unit = f"twin-update-run-{int(system.now())}"
-    started = system.run(
-        ["systemd-run", "--user", "--collect", "--quiet", "--no-block",
-         f"--unit={unit}", "--", "env", "TWIN_UPDATE_SCOPE=1", *argv],
-        env=env, timeout=30)
-    if not started.ok:
-        ui.say("could not start the update unit")
-        return 1
+    unit = f"twin-update-run-{int(system.now())}-{system.own_pid()}"
     ui.say(f"update unit: {unit}")
-    return follow_unit(system, unit, env, ui)
+    ui.say(f"To cancel: systemctl --user stop {unit}")
+    runner = system.run_inherit if hasattr(system, "run_inherit") else system.run
+    started = runner(
+        ["systemd-run", "--user", "--scope", "--quiet",
+         f"--unit={unit}", "--", "env", "TWIN_UPDATE_SCOPE=1", *argv],
+        env=env, timeout=None)
+    rc = 0 if started.ok else (started.rc or 1)
+    _announce_run_result(ui, rc, "success" if rc == 0 else "exit-code", rc)
+    return rc
 
 
 def extra_notify_body() -> str:
@@ -543,6 +714,19 @@ def shipped_unit_text(name: str) -> str | None:
             return fh.read()
     except OSError:
         return None
+
+
+def check_exec_start(service: str | None, home: str) -> str | None:
+    """First token of ExecStart=, with %h expanded."""
+    if not service:
+        return None
+    for line in service.splitlines():
+        if line.startswith("ExecStart="):
+            cmd = line.split("=", 1)[1].strip()
+            if not cmd:
+                return None
+            return cmd.split()[0].replace("%h", home)
+    return None
 
 
 def unit_drift_warnings(installed_service: str | None, installed_timer: str | None,

@@ -10,6 +10,7 @@ import select
 import shutil
 import signal
 import sys
+import time
 
 from twin_update import __version__, notice, orchestrator
 from twin_update.config import ConfigError, load
@@ -25,7 +26,16 @@ class ConsoleUI:
         except OSError:  # terminal went away (e.g. the app hosting it was closed)
             pass
 
+    def can_prompt(self) -> bool:
+        return sys.stdin.isatty()
+
     def getpass(self, prompt: str) -> str:
+        preset = getattr(self, "_sudo_from_stdin", None)
+        if preset is not None:
+            self._sudo_from_stdin = None
+            return preset
+        if not sys.stdin.isatty():
+            raise EOFError(notice.SUDO_NEEDED)
         return getpass.getpass(prompt)
 
     def confirm(self, prompt: str, timeout_s: float | None = None) -> bool:
@@ -54,12 +64,15 @@ def _detach_if_needed(args) -> None:
     """Re-exec in its own systemd user scope so closing the app that hosts our
     terminal (e.g. Grok Bot) does not kill the run. The scope ends with us."""
     if args.no_detach or os.environ.get("TWIN_UPDATE_SCOPE") == "1":
+        # Closing the prompt window sends SIGHUP; ignore it so apt continues.
+        # SIGTERM (systemctl --user stop) is handled in the orchestrator.
         signal.signal(signal.SIGHUP, signal.SIG_IGN)
         return
     if not shutil.which("systemd-run"):
         signal.signal(signal.SIGHUP, signal.SIG_IGN)
         return
-    argv = ["systemd-run", "--user", "--scope", "--quiet", "--collect", "--",
+    unit = f"twin-update-run-{int(time.time())}-{os.getpid()}"
+    argv = ["systemd-run", "--user", "--scope", "--quiet", f"--unit={unit}", "--",
             "env", "TWIN_UPDATE_SCOPE=1", sys.executable, *sys.argv]
     os.execvp(argv[0], argv)
 
@@ -153,6 +166,12 @@ def _print(ui, data, as_json: bool) -> None:
                 elif k == "window_open_since":
                     if v:
                         ui.say(f"{l:8} window open since: {v}")
+                elif k == "rollback_holds":
+                    if v:
+                        ui.say(f"{l:8} rollback holds: {'; '.join(v)}")
+                elif k == "slot_pid_reused":
+                    if v:
+                        ui.say(f"{l:8} slot pid reused: yes")
                 elif k in ("locks_ok", "window_stale", "unit_warnings"):
                     continue
                 elif k != "locks_ok":
@@ -238,6 +257,8 @@ def main(argv=None, ui=None, system=None, peer_factory=SshPeer) -> int:
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--no-smoke", action="store_true", help="skip the launch smoke test")
     p.add_argument("--no-detach", action="store_true")
+    p.add_argument("--sudo-from-stdin", action="store_true",
+                   help="read one sudo password line from stdin (prompt-window unit)")
     p = sub.add_parser("rollback"); common(p)
     p.add_argument("app")
     p.add_argument("--machine", default="both")
@@ -274,6 +295,12 @@ def main(argv=None, ui=None, system=None, peer_factory=SshPeer) -> int:
 
     args = ap.parse_args(argv)
     system = system or System()
+    if getattr(args, "sudo_from_stdin", False):
+        line = sys.stdin.readline()
+        if not line:
+            ui.say(notice.SUDO_NEEDED)
+            return 1
+        ui._sudo_from_stdin = line.rstrip("\n")
 
     try:
         if args.cmd == "raft-upload":
@@ -308,6 +335,8 @@ def main(argv=None, ui=None, system=None, peer_factory=SshPeer) -> int:
                 return 2
             _detach_if_needed(args)
 
+        if args.cmd == "prompt":
+            ui.say(notice.CHECKING)
         cfg, sess, unreachable, me, peer = _build(args, ui, system, peer_factory)
         try:
             if args.cmd == "status":
@@ -342,9 +371,19 @@ def main(argv=None, ui=None, system=None, peer_factory=SshPeer) -> int:
             sess.close()
     except ConfigError as exc:
         ui.say(f"config error: {exc}")
+        if getattr(args, "cmd", None) == "prompt" and hasattr(ui, "pause"):
+            ui.pause("Press Enter to close.")
         return 2
     except PeerError as exc:
         ui.say(f"error: {exc}")
+        if getattr(args, "cmd", None) == "prompt" and hasattr(ui, "pause"):
+            ui.pause("Press Enter to close.")
+        return 1
+    except EOFError as exc:
+        ui.say(str(exc) if str(exc) else notice.SUDO_NEEDED)
+        return 1
+    except KeyboardInterrupt:
+        ui.say("stopped")
         return 1
     _print(ui, data, args.json)
     if data.get("kind") == "check":
@@ -412,12 +451,10 @@ def _check_notify(sess, me: str, data: dict, system, config_path: str | None) ->
         argv = notice.launcher_argv(system.which, inner, realpath=system.realpath)
         if not argv:
             return "failed (no cosmic-term or x-terminal-emulator)"
-        pid = notice.start_prompt_window(system, argv, env)
+        pid, unit = notice.start_prompt_window(system, argv, env)
         if pid is None:
             return "failed (could not start the window)"
-        notice.write_window_pid(system, slot, pid, started=False)
-        if not notice.verify_window(system, slot, pid):
-            notice.clear_slot(system, slot)
+        if not _keep_launched_window(system, slot, pid, unit, env):
             return "window exited immediately; not recorded"
         # The day is recorded inside the window after the question is shown.
         try:
@@ -430,6 +467,19 @@ def _check_notify(sess, me: str, data: dict, system, config_path: str | None) ->
 
 
 APP_NAME = notice.APP_NAME
+
+
+def _keep_launched_window(system, slot: str, pid: int | None, unit: str | None,
+                          env: dict | None) -> bool:
+    """Record the launch. Do not clear a pid-0 slot while the unit is still up."""
+    notice.write_window_pid(system, slot, pid if isinstance(pid, int) else 0,
+                            started=False, unit=unit)
+    if notice.verify_window(system, slot, pid if isinstance(pid, int) else 0):
+        return True
+    if (not isinstance(pid, int) or pid <= 0) and notice.unit_still_up(system, unit, env):
+        return True
+    notice.clear_slot(system, slot)
+    return False
 
 
 def _open_prompt_window(system, config_path: str | None, state_dir: str,
@@ -450,14 +500,11 @@ def _open_prompt_window(system, config_path: str | None, state_dir: str,
         if not argv:
             return {"kind": "prompt", "opened": False,
                     "window": "no cosmic-term or x-terminal-emulator", "answer": None}
-        pid = notice.start_prompt_window(system, argv, env)
+        pid, unit = notice.start_prompt_window(system, argv, env)
         if pid is None:
             return {"kind": "prompt", "opened": False,
                     "window": "could not start the window", "answer": None}
-        notice.write_window_pid(system, slot, pid, started=False)
-        opened = notice.verify_window(system, slot, pid)
-        if not opened:
-            notice.clear_slot(system, slot)
+        opened = _keep_launched_window(system, slot, pid, unit, env)
         return {"kind": "prompt", "opened": opened, "pid": pid,
                 "window": "opened a window" if opened else "window exited immediately",
                 "answer": None, "launcher": argv[0]}
@@ -497,7 +544,6 @@ def _prompt_here(args, ui, sess, unreachable, system, peer_factory) -> dict:
     del peer_factory
     if args.slot:
         notice.mark_started(system, args.slot, system.own_pid())
-    ui.say(notice.CHECKING)
     run_rc = [0]
     try:
         try:
@@ -520,8 +566,8 @@ def _prompt_here(args, ui, sess, unreachable, system, peer_factory) -> dict:
                 return
             try:
                 local.call("record_notice", kind="updates", signature=sig)
-            except Exception:
-                pass
+            except Exception as exc:
+                ui.say(f"warning: could not record today's prompt ({exc})")
 
         sess.close()
 

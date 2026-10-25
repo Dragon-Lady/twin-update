@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import signal
 import time
 
 from twin_update import __version__
 from twin_update.config import Config
 from twin_update.peer import PeerError
+
+ROLLBACK_CMD = "twin-update rollback"
 
 
 class Abort(Exception):
@@ -63,16 +66,75 @@ def _identity(s: Session, rep: dict) -> None:
         raise Abort(f"identity check failed on: {', '.join(bad)} (whoami/machine-id vs config)")
 
 
-def _require_same_version(s: Session, rep: dict) -> None:
-    """Stop before any close when known twin-update versions differ."""
+def _version_detail(s: Session, rep: dict) -> str:
     ids = rep.get("identity") or {}
     known = {l: (ids.get(l) or {}).get("version") for l in s.order}
     known = {l: v for l, v in known.items() if v}
-    if len(set(known.values())) > 1:
-        detail = ", ".join(f"{l} {v}" for l, v in known.items())
+    return ", ".join(f"{l} {v}" for l, v in known.items())
+
+
+def _versions_differ(s: Session, rep: dict) -> bool:
+    ids = rep.get("identity") or {}
+    known = {(ids.get(l) or {}).get("version") for l in s.order}
+    known.discard(None)
+    known.discard("")
+    return len(known) > 1
+
+
+def _require_same_version(s: Session, rep: dict) -> None:
+    """Stop before any close when versions differ or a peer omits version."""
+    ids = rep.get("identity") or {}
+    known = {l: (ids.get(l) or {}).get("version") for l in s.order}
+    missing = [l for l, v in known.items() if not v]
+    if missing:
         raise Abort(
-            f"twin-update versions differ ({detail}); "
+            f"{', '.join(missing)} is running an older twin-update "
+            "(no version reported); update that machine to this version before running")
+    if _versions_differ(s, rep):
+        raise Abort(
+            f"twin-update versions differ ({_version_detail(s, rep)}); "
             "update both machines to the same version before running")
+
+
+def _warn_version_mismatch(s: Session, rep: dict) -> None:
+    """Rollback proceeds per machine when versions differ."""
+    if not _versions_differ(s, rep):
+        return
+    msg = (f"twin-update versions differ ({_version_detail(s, rep)}); "
+           "continuing rollback on each machine as far as it supports it")
+    rep.setdefault("warnings", []).append(msg)
+    s.ui.say(f"warning: {msg}")
+    rep["summary"].append(f"warning: {msg}")
+
+
+def _install_stop_handlers() -> dict:
+    """Treat SIGTERM/SIGHUP like Ctrl-C so a stop can reopen closed apps."""
+    prev = {}
+
+    def _on_stop(signum, frame):
+        raise KeyboardInterrupt
+
+    for sig in (signal.SIGTERM,):
+        try:
+            prev[sig] = signal.signal(sig, _on_stop)
+        except (ValueError, OSError):
+            pass
+    return prev
+
+
+def _restore_stop_handlers(prev: dict) -> None:
+    for sig, old in prev.items():
+        try:
+            signal.signal(sig, old)
+        except (ValueError, OSError):
+            pass
+
+
+def _ui_can_prompt(ui) -> bool:
+    can = getattr(ui, "can_prompt", None)
+    if callable(can):
+        return bool(can())
+    return True
 
 
 def _optional_call(peer, op: str, **kw):
@@ -134,11 +196,16 @@ def plan_updates(cfg: Config, apps, status: dict, labels) -> dict:
         a = {l: status[l]["apps"][app] for l in labels}
         missing = [l for l in labels if not a[l]["installed"]]
         kept = [l for l in labels if a[l]["hold"] == "kept"]
+        rolled = [l for l in labels if a[l]["hold"] == "rollback"]
         cands = {a[l]["candidate"] for l in labels}
         if missing:
             plan[app] = {"action": "skip", "reason": f"not installed on {', '.join(missing)}"}
         elif kept:
             plan[app] = {"action": "skip", "reason": f"hold kept by config on {', '.join(kept)}"}
+        elif rolled:
+            plan[app] = {"action": "skip", "reason": (
+                f"rollback hold on {', '.join(rolled)} "
+                f"(clear with twin-update unhold {app})")}
         elif len(cands) != 1 or None in cands:
             plan[app] = {"action": "skip", "reason": "candidate versions differ between machines: "
                          + ", ".join(f"{l}={a[l]['candidate']}" for l in labels)}
@@ -256,6 +323,14 @@ def _reopen_after_interrupt(s: Session, rep: dict, was_open: dict, results: dict
 
 
 def run(s: Session, apps, dry: bool, smoke: bool = True, unreachable=None) -> dict:
+    prev = _install_stop_handlers()
+    try:
+        return _run(s, apps, dry, smoke, unreachable)
+    finally:
+        _restore_stop_handlers(prev)
+
+
+def _run(s: Session, apps, dry: bool, smoke: bool = True, unreachable=None) -> dict:
     rep = _new_report("run", dry, apps, s.order, unreachable or {})
     rep["blockers"] = [f"{l} unreachable: {why}" for l, why in (unreachable or {}).items()]
     labels = s.order
@@ -337,21 +412,32 @@ def run(s: Session, apps, dry: bool, smoke: bool = True, unreachable=None) -> di
                                           smoke=smoke) if up["ok"] else {"ok": False}
                     r = {"upgrade": up, "verify": ver}
                     if not ver["ok"]:
-                        if s.ui.confirm(
+                        want_rb = False
+                        if _ui_can_prompt(s.ui):
+                            want_rb = s.ui.confirm(
                                 f"{s.cfg.apps[app].display} {p['target']} failed its check on "
                                 f"{l}. Roll back to {up.get('before')}?",
-                                timeout_s=s.cfg.rollback_prompt_s):
+                                timeout_s=s.cfg.rollback_prompt_s)
+                        if want_rb:
                             rb = s.peers[l].call("rollback_install", app_name=app, hold=True)
                             r["rollback"] = rb
                             if rb.get("ok"):
                                 r["rollback_verify"] = s.peers[l].call(
                                     "verify", app_name=app, version=rb["to"], smoke=smoke)
+                        elif not _ui_can_prompt(s.ui):
+                            results.setdefault(app, {})[l] = r
+                            raise Abort(
+                                f"{s.cfg.apps[app].display} {p['target']} failed its check on "
+                                f"{l}; not upgrading the other machine. "
+                                f"To roll back: {ROLLBACK_CMD}")
                     results.setdefault(app, {})[l] = r
                     mark = ver["ok"]
                     txt = (f"{s.cfg.apps[app].display} {l} {up.get('before')}\u2192"
                            f"{up.get('after')} {_ok(mark)}")
                     if "rollback" in r:
                         txt += f" (rolled back to {r['rollback'].get('to')})"
+                    elif not ver["ok"]:
+                        txt += f" (left installed; {ROLLBACK_CMD} to undo)"
                     rep["summary"].append(txt)
             rep["results"] = results
             finals = {}
@@ -380,11 +466,20 @@ def run(s: Session, apps, dry: bool, smoke: bool = True, unreachable=None) -> di
 
 def rollback(s: Session, app: str, labels, dry: bool, smoke: bool = True,
              hold: bool = True) -> dict:
+    prev = _install_stop_handlers()
+    try:
+        return _rollback(s, app, labels, dry, smoke, hold)
+    finally:
+        _restore_stop_handlers(prev)
+
+
+def _rollback(s: Session, app: str, labels, dry: bool, smoke: bool = True,
+              hold: bool = True) -> dict:
     rep = _new_report("rollback", dry, [app], labels, {})
     rep["blockers"] = []
     try:
         _identity(s, rep)
-        _require_same_version(s, rep)
+        _warn_version_mismatch(s, rep)
         targets = s.both("rollback_target", labels=labels, app_name=app)
         rep["targets"] = targets
         bad = [l for l, t in targets.items() if not t["ok"]]
@@ -473,8 +568,14 @@ def doctor_findings(checks: dict) -> tuple[list[str], list[str]]:
                 warnings.append(f"prompt window has been open since {since} (over 24 hours)")
         elif k == "unit_warnings":
             warnings.extend(v or [])
+        elif k == "rollback_holds":
+            for item in (v or []):
+                warnings.append(f"rollback hold: {item}")
+        elif k == "slot_pid_reused":
+            if v:
+                warnings.append("prompt slot pid does not match the recorded process (pid reuse)")
         elif k in ("locks_ok", "check_timer_next", "last_window",
-                   "window_open_since"):
+                   "window_open_since", "rollback_holds"):
             continue
         elif k != "locks_ok" and isinstance(v, bool) and not v:
             problems.append(k)
