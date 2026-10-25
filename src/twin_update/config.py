@@ -128,8 +128,15 @@ def load(path: str | None = None, home: str | None = None, text: str | None = No
                 data = tomllib.load(fh)
         except FileNotFoundError:
             raise ConfigError(f"config not found: {path or DEFAULT_PATH}") from None
+        except tomllib.TOMLDecodeError as exc:
+            raise ConfigError(f"{path or DEFAULT_PATH}: {exc}") from exc
     else:
-        data = tomllib.loads(text)
+        try:
+            data = tomllib.loads(text)
+        except tomllib.TOMLDecodeError as exc:
+            raise ConfigError(str(exc)) from exc
+    if not isinstance(data, dict):
+        raise ConfigError("config must be a table")
 
     msec = data.get("machines") or {}
     if len(msec) != 2:

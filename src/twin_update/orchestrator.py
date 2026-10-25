@@ -13,7 +13,9 @@ ROLLBACK_CMD = "twin-update rollback"
 
 
 class Abort(Exception):
-    pass
+    def __init__(self, message: str = "", interrupted: bool = False):
+        super().__init__(message)
+        self.interrupted = interrupted
 
 
 def _ok(mark: bool) -> str:
@@ -89,8 +91,9 @@ def _require_same_version(s: Session, rep: dict) -> None:
     if missing:
         raise Abort(
             f"{', '.join(missing)} is running an older twin-update "
-            "(no version reported). Install this same twin-update on that "
-            "machine (pipx install twin-update, or copy the zipapp to the "
+            "(no version reported). Install twin-update "
+            f"{__version__} or newer on that machine "
+            "(pipx install twin-update, or copy the zipapp to the "
             "path in remote_command), then run again. Nothing was changed.")
     if _versions_differ(s, rep):
         raise Abort(
@@ -116,7 +119,7 @@ def _install_stop_handlers() -> dict:
     def _on_stop(signum, frame):
         raise KeyboardInterrupt
 
-    for sig in (signal.SIGTERM, signal.SIGINT):
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         try:
             prev[sig] = signal.signal(sig, _on_stop)
         except (ValueError, OSError):
@@ -230,40 +233,76 @@ def plan_updates(cfg: Config, apps, status: dict, labels) -> dict:
     return plan
 
 
+DPKG_HINT = "If apt was mid-install, recover with: sudo dpkg --configure -a"
+
+
+def _reopen_each(s: Session, was_open: dict, rep: dict) -> dict:
+    """Reopen every machine independently. Never stop at the first failure."""
+    reopened = {}
+    failed = {}
+    for l, apps in (was_open or {}).items():
+        if not apps:
+            continue
+        try:
+            reopened[l] = s.peers[l].call("reopen", apps=apps)
+        except (PeerError, KeyboardInterrupt, EOFError) as exc:
+            failed[l] = str(exc) or exc.__class__.__name__
+            reopened[l] = {"error": failed[l]}
+    if failed:
+        rep.setdefault("reopen_errors", {}).update(failed)
+        for l, why in failed.items():
+            line = f"could not reopen apps on {l}: {why}"
+            if line not in rep["summary"]:
+                rep["summary"].append(line)
+    return reopened
+
+
+def _interrupt_abort(exc: BaseException, after_close: bool = True) -> Abort:
+    if after_close:
+        return Abort("interrupted after close; apps reopened. " + DPKG_HINT,
+                     interrupted=True)
+    return Abort(str(exc) if str(exc) else "interrupted", interrupted=True)
+
+
 def _close_all(s: Session, rep: dict, per_machine: dict, dry: bool) -> dict:
     """per_machine: label -> [apps]. Returns was_open map; raises Abort if anything stays."""
-    started = {l: s.peers[l].call("close_start", apps=apps, dry=dry)
-               for l, apps in per_machine.items() if apps}
+    started = {}
+    was_open = {}
     rep["close"] = {"start": started}
-    was_open = {l: [a for a, r in res.items() if r["was_open"]] for l, res in started.items()}
     rep["was_open"] = was_open
-    if dry:
-        return was_open
     try:
-        waited = {l: s.peers[l].call("close_wait", apps=apps, timeout=s.cfg.close_timeout_s)
-                  for l, apps in per_machine.items() if apps}
-    except (KeyboardInterrupt, EOFError, PeerError) as exc:
-        for l, apps in was_open.items():
+        for l, apps in per_machine.items():
+            if not apps:
+                continue
+            res = s.peers[l].call("close_start", apps=apps, dry=dry)
+            started[l] = res
+            was_open[l] = [a for a, r in res.items() if r.get("was_open")]
+            rep["was_open"] = dict(was_open)
+        if dry:
+            return was_open
+        waited = {}
+        for l, apps in per_machine.items():
             if apps:
-                try:
-                    s.peers[l].call("reopen", apps=apps)
-                except (PeerError, KeyboardInterrupt):
-                    pass
+                waited[l] = s.peers[l].call("close_wait", apps=apps,
+                                            timeout=s.cfg.close_timeout_s)
+    except (KeyboardInterrupt, EOFError, PeerError) as exc:
+        reopened = _reopen_each(s, was_open, rep)
+        if reopened:
+            rep["reopen"] = reopened
         if isinstance(exc, KeyboardInterrupt):
-            raise Abort("interrupted after close; apps reopened") from exc
+            raise _interrupt_abort(exc) from exc
         if isinstance(exc, EOFError):
             raise Abort("input ended after close; apps reopened") from exc
         raise
     rep["close"]["wait"] = waited
     stuck = [(l, a, r) for l, res in waited.items() for a, r in res.items() if not r["closed"]]
     if stuck:
-        # Abort on BOTH before any update; reopen what we closed.
-        reopened = {}
+        reopen_map = {}
         for l, apps in was_open.items():
-            closed_ok = [a for a in apps if waited[l][a]["closed"]]
+            closed_ok = [a for a in apps if waited.get(l, {}).get(a, {}).get("closed")]
             if closed_ok:
-                reopened[l] = s.peers[l].call("reopen", apps=closed_ok)
-        rep["close"]["reopened_after_abort"] = reopened
+                reopen_map[l] = closed_ok
+        rep["close"]["reopened_after_abort"] = _reopen_each(s, reopen_map, rep)
         detail = "; ".join(
             f"{a} on {l} still running ({r['remaining_count']} proc, e.g. "
             f"{r['remaining'][0]['exe'] if r['remaining'] else '?'})" for l, a, r in stuck)
@@ -272,20 +311,40 @@ def _close_all(s: Session, rep: dict, per_machine: dict, dry: bool) -> dict:
 
 
 def _finish(s: Session, rep: dict, dry: bool) -> dict:
+    prev = {}
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        try:
+            prev[sig] = signal.signal(sig, signal.SIG_IGN)
+        except (ValueError, OSError):
+            pass
     try:
-        s.both("release")
-    except PeerError:
-        pass
-    if not dry:
-        title = "Twin Update: " + ("done" if rep["result"] == "ok" else rep["result"] or "?")
-        body = "\n".join(rep["summary"][:12]) or "nothing to do"
         for l in s.order:
             try:
-                rep.setdefault("report_paths", {})[l] = s.peers[l].call("record_run", report=rep)
-                s.peers[l].call("notify", summary=title, body=body)
-            except PeerError:
+                s.peers[l].call("release")
+            except (PeerError, KeyboardInterrupt, EOFError):
                 pass
-    return rep
+        if not dry:
+            title = "Twin Update: " + ("done" if rep["result"] == "ok" else rep["result"] or "?")
+            body = "\n".join(rep["summary"][:12]) or "nothing to do"
+            for l in s.order:
+                try:
+                    rep.setdefault("report_paths", {})[l] = s.peers[l].call(
+                        "record_run", report=rep)
+                except (PeerError, KeyboardInterrupt, EOFError) as exc:
+                    rep.setdefault("record_errors", {})[l] = str(exc)
+                try:
+                    s.peers[l].call("notify", summary=title, body=body)
+                except (PeerError, KeyboardInterrupt, EOFError):
+                    pass
+        return rep
+    except KeyboardInterrupt:
+        return rep
+    finally:
+        for sig, old in prev.items():
+            try:
+                signal.signal(sig, old)
+            except (ValueError, OSError):
+                pass
 
 
 def status(s: Session) -> dict:
@@ -320,7 +379,12 @@ def _reopen(s, rep, was_open, results):
         finally:
             # The engine honors no_launch. A hook failure never suppresses
             # reopening of apps whose launch policy explicitly permits it.
-            reopened[label] = s.peers[label].call("reopen", apps=apps)
+            try:
+                reopened[label] = s.peers[label].call("reopen", apps=apps)
+            except (PeerError, KeyboardInterrupt, EOFError) as exc:
+                reopened[label] = {"error": str(exc)}
+                rep.setdefault("reopen_errors", {})[label] = str(exc)
+                rep["summary"].append(f"could not reopen apps on {label}: {exc}")
         if hook:
             if hook.get("ok"):
                 try:
@@ -372,7 +436,10 @@ def _run(s: Session, apps, dry: bool, smoke: bool = True, unreachable=None) -> d
             try:
                 _reopen_after_interrupt(s, rep, was, results)
             except KeyboardInterrupt:
-                pass
+                try:
+                    _reopen_after_interrupt(s, rep, was, results)
+                except KeyboardInterrupt:
+                    _reopen_each(s, was, rep)
 
     try:
         if unreachable and not dry:
@@ -480,13 +547,21 @@ def _run(s: Session, apps, dry: bool, smoke: bool = True, unreachable=None) -> d
                                     "verify", app_name=app, version=rb["to"], smoke=smoke)
                         else:
                             try:
-                                s.peers[l].call(
+                                hr = s.peers[l].call(
                                     "hold", app_name=app,
                                     reason=f"failed-check of {p['target']}",
                                     rejected=p["target"])
                                 r["held_failed"] = p["target"]
-                            except PeerError:
-                                pass
+                                if not hr.get("ok"):
+                                    r["hold_error"] = "apt-mark hold failed"
+                                    rep["summary"].append(
+                                        f"could not hold {s.cfg.apps[app].display} "
+                                        f"{p['target']} on {l}")
+                            except PeerError as exc:
+                                r["hold_error"] = str(exc)
+                                rep["summary"].append(
+                                    f"could not hold {s.cfg.apps[app].display} "
+                                    f"on {l}: {exc}")
                             remaining = [x for x in p["machines"][p["machines"].index(l) + 1:]]
                             results.setdefault(app, {})[l] = r
                             if remaining:
@@ -529,7 +604,8 @@ def _run(s: Session, apps, dry: bool, smoke: bool = True, unreachable=None) -> d
         except (Abort, PeerError, KeyboardInterrupt, EOFError) as exc:
             ensure_reopen()
             if isinstance(exc, KeyboardInterrupt):
-                raise Abort("interrupted after close; apps reopened") from exc
+                raise Abort("interrupted after close; apps reopened. " + DPKG_HINT,
+                            interrupted=True) from exc
             if isinstance(exc, EOFError):
                 raise Abort("input ended after close; apps reopened; "
                             "the installed version was left as it is") from exc
@@ -540,8 +616,11 @@ def _run(s: Session, apps, dry: bool, smoke: bool = True, unreachable=None) -> d
                 ensure_reopen()
             except Exception:
                 pass
-        if isinstance(exc, KeyboardInterrupt):
-            exc = Abort("interrupted after close; apps reopened")
+        if isinstance(exc, KeyboardInterrupt) or getattr(exc, "interrupted", False):
+            rep["interrupted"] = True
+            if not getattr(exc, "interrupted", False):
+                exc = Abort("interrupted after close; apps reopened. " + DPKG_HINT,
+                            interrupted=True)
         elif isinstance(exc, EOFError):
             exc = Abort("input ended; nothing was changed")
         rep["result"] = "aborted"
@@ -577,7 +656,10 @@ def _rollback(s: Session, app: str, labels, dry: bool, smoke: bool = True,
             try:
                 _reopen_after_interrupt(s, rep, was, {app: res} if res else {})
             except KeyboardInterrupt:
-                pass
+                try:
+                    _reopen_after_interrupt(s, rep, was, {app: res} if res else {})
+                except KeyboardInterrupt:
+                    _reopen_each(s, was, rep)
 
     try:
         _identity(s, rep)
@@ -589,7 +671,11 @@ def _rollback(s: Session, app: str, labels, dry: bool, smoke: bool = True,
             raise Abort("no rollback copy on: " + ", ".join(
                 f"{l} ({targets[l].get('reason')})" for l in bad))
         if not dry:
-            s.password(labels)
+            try:
+                s.password(labels)
+            except EOFError as exc:
+                raise Abort(str(exc) or "sudo password needed but this run has no "
+                            "terminal and none was supplied") from exc
         _locks(s, rep, dry, labels=labels)
         _wait_apt(s, rep, dry, labels)
         try:
@@ -629,17 +715,23 @@ def _rollback(s: Session, app: str, labels, dry: bool, smoke: bool = True,
         except (Abort, PeerError, KeyboardInterrupt, EOFError) as exc:
             ensure_reopen()
             if isinstance(exc, KeyboardInterrupt):
-                raise Abort("interrupted after close; apps reopened") from exc
+                raise Abort("interrupted after close; apps reopened. " + DPKG_HINT,
+                            interrupted=True) from exc
             if isinstance(exc, EOFError):
                 raise Abort("input ended after close; apps reopened") from exc
             raise
-    except (Abort, PeerError, KeyboardInterrupt) as exc:
+    except (Abort, PeerError, KeyboardInterrupt, EOFError) as exc:
         try:
             ensure_reopen()
         except Exception:
             pass
-        if isinstance(exc, KeyboardInterrupt):
-            exc = Abort("interrupted after close; apps reopened")
+        if isinstance(exc, KeyboardInterrupt) or getattr(exc, "interrupted", False):
+            rep["interrupted"] = True
+            if not getattr(exc, "interrupted", False):
+                exc = Abort("interrupted after close; apps reopened. " + DPKG_HINT,
+                            interrupted=True)
+        elif isinstance(exc, EOFError):
+            exc = Abort("input ended; nothing was changed")
         rep["result"] = "aborted"
         rep["error"] = str(exc)
         rep["summary"].append(f"aborted: {exc}")
@@ -696,9 +788,12 @@ def doctor_findings(checks: dict) -> tuple[list[str], list[str]]:
         elif k == "dpkg_interrupted":
             if v:
                 warnings.append("dpkg was interrupted; recover with: sudo dpkg --configure -a")
+        elif k == "bad_state":
+            for item in (v or []):
+                warnings.append(f"ignored unreadable state file: {item}")
         elif k in ("locks_ok", "check_timer_next", "last_window",
                    "window_open_since", "rollback_holds", "record_notice_error",
-                   "dpkg_interrupted"):
+                   "dpkg_interrupted", "bad_state"):
             continue
         elif k != "locks_ok" and isinstance(v, bool) and not v:
             problems.append(k)

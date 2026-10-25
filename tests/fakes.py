@@ -97,6 +97,7 @@ class FakeSystem(System):
         self.smoke_handoff = set()
         self.smoke_late = set()
         self._smoke_spawned = set()
+        self.showhold_fail = False
         self.apt_busy_flag = False
         self.locked = False
         self.window_flock = False
@@ -277,7 +278,7 @@ class FakeSystem(System):
     def run_inherit(self, argv, timeout=None, env=None, cwd=None):
         return self.run(argv, input=None, timeout=timeout, env=env, cwd=cwd)
 
-    def run(self, argv, input=None, timeout=None, env=None, cwd=None):
+    def run(self, argv, input=None, timeout=None, env=None, cwd=None, **_kw):
         argv = list(argv)
         self.calls.append((argv, input, env))
         if argv[:1] == ["sudo"]:
@@ -311,6 +312,8 @@ class FakeSystem(System):
             return Result(0, "".join(f" {argv[2]} | {v} | http://repo stable/main amd64 Packages\n"
                                      for v in self.repo.get(argv[2], [])))
         if argv[:2] == ["apt-mark", "showhold"]:
+            if self.showhold_fail:
+                return Result(1, "", "apt-mark: could not get lock")
             return Result(0, "".join(h + "\n" for h in sorted(self.held)))
         if argv[:2] == ["dpkg", "--compare-versions"]:
             a, op, b = argv[2:5]

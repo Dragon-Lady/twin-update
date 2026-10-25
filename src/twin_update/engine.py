@@ -63,6 +63,7 @@ class Engine:
         self.sources_dir = SOURCES_DIR
         self.dpkg_updates = "/var/lib/dpkg/updates"
         self._reopened: set[str] = set()
+        self._bad_state: list[str] = []
 
     # ------------------------------------------------------------------ util
     def log(self, msg: str) -> None:
@@ -158,8 +159,10 @@ class Engine:
                 out.append(parts[1])
         return out
 
-    def showhold(self) -> list[str]:
+    def showhold(self) -> list[str] | None:
         r = self.sys.run(["apt-mark", "showhold"])
+        if not r.ok:
+            return None
         return sorted({x.strip() for x in r.out.splitlines() if x.strip()})
 
     def apt_busy(self) -> bool:
@@ -172,26 +175,64 @@ class Engine:
     def _holds_file(self) -> str:
         return os.path.join(self.cfg.state_dir, "holds.json")
 
-    def _tool_holds(self) -> dict:
-        raw = self.sys.read_text(self._holds_file())
-        try:
-            data = json.loads(raw) if raw else {}
-        except ValueError:
+    def _note_bad_state(self, path: str, why: str) -> None:
+        bit = f"{self._redact(path)} ({why})"
+        if bit not in self._bad_state:
+            self._bad_state.append(bit)
+
+    def _read_json_dict(self, path: str) -> dict:
+        if self.sys.isdir(path):
+            self._note_bad_state(path, "is a directory")
             return {}
-        return data if isinstance(data, dict) else {}
+        raw = self.sys.read_text(path)
+        if raw is None:
+            return {}
+        try:
+            data = json.loads(raw) if raw.strip() else {}
+        except ValueError:
+            self._note_bad_state(path, "not valid JSON")
+            return {}
+        if not isinstance(data, dict):
+            self._note_bad_state(path, "not a JSON object")
+            return {}
+        return data
+
+    def _tool_holds(self) -> dict:
+        return self._read_json_dict(self._holds_file())
+
+    def _holds_lock(self, create: bool = True):
+        lock = os.path.join(self.cfg.state_dir, "holds.lock")
+        if not create and not self.sys.exists(self._holds_file()) and not self.sys.exists(lock):
+            return None
+        return self.sys.try_lockfile(lock, blocking=True)
+
+    def _write_holds(self, tool: dict) -> None:
+        if not self.sys.write_private(self._holds_file(), json.dumps(tool, indent=2)):
+            self._note_bad_state(self._holds_file(), "could not write")
 
     def _sync_hold_records(self) -> dict:
-        """Drop holds.json entries whose apt hold is gone."""
-        held = set(self.showhold())
-        tool = self._tool_holds()
-        changed = False
-        for pkg in list(tool):
-            if pkg not in held:
-                tool.pop(pkg, None)
-                changed = True
-        if changed:
-            self.sys.write_private(self._holds_file(), json.dumps(tool, indent=2))
-        return tool
+        """Drop holds.json entries whose apt hold is gone.
+
+        If apt-mark showhold fails, leave the records alone.
+        """
+        fd = self._holds_lock(create=False)
+        try:
+            held = self.showhold()
+            tool = self._tool_holds()
+            if held is None:
+                return tool
+            held_set = set(held)
+            changed = False
+            for pkg in list(tool):
+                if pkg not in held_set:
+                    tool.pop(pkg, None)
+                    changed = True
+            if changed:
+                self._write_holds(tool)
+            return tool
+        finally:
+            if fd is not None:
+                self.sys.unlock(fd)
 
     def _hold_record(self, pkg: str, tool: dict | None = None) -> dict:
         rec = (tool if tool is not None else self._tool_holds()).get(pkg) or {}
@@ -210,6 +251,8 @@ class Engine:
     def holds(self) -> dict:
         held = self.showhold()
         tool = self._sync_hold_records()
+        if held is None:
+            held = list(tool)
         managed = {a.package: a.name for a in self.cfg.apps.values()}
         out = {"managed": {}, "other": []}
         for pkg in held:
@@ -244,7 +287,16 @@ class Engine:
         """Release holds on these apps unless kept or set by a rollback."""
         actions = []
         info = self.holds()["managed"]
-        tool = self._tool_holds()
+        fd = self._holds_lock(create=not dry)
+        try:
+            tool = self._tool_holds()
+            return self._clear_holds_locked(apps, dry, info, tool)
+        finally:
+            if fd is not None:
+                self.sys.unlock(fd)
+
+    def _clear_holds_locked(self, apps, dry, info, tool) -> list[dict]:
+        actions = []
         for app in self._apps(apps):
             owner = info.get(app.name)
             if owner in (None, "kept"):
@@ -265,40 +317,53 @@ class Engine:
                     tool.pop(app.package, None)
             actions.append(act)
         if not dry and actions:
-            self.sys.write_private(self._holds_file(), json.dumps(tool, indent=2))
+            self._write_holds(tool)
         return actions
 
     def hold(self, app_name: str, reason: str, rejected: str | None = None) -> dict:
         app = self._apps([app_name])[0]
         r = self._sudo(["apt-mark", "hold", app.package], timeout=120)
         if r.ok:
-            tool = self._tool_holds()
-            ver, _ = self.installed(app.package)
-            rec = {"reason": reason, "version": ver, "at": int(self.sys.now())}
-            rec["rejected"] = rejected or self._rejected_version(app.package, {"reason": reason})
-            tool[app.package] = rec
-            self.sys.write_private(self._holds_file(), json.dumps(tool, indent=2))
+            fd = self._holds_lock()
+            try:
+                tool = self._tool_holds()
+                ver, _ = self.installed(app.package)
+                rec = {"reason": reason, "version": ver, "at": int(self.sys.now())}
+                rec["rejected"] = rejected or self._rejected_version(app.package, {"reason": reason})
+                tool[app.package] = rec
+                self._write_holds(tool)
+            finally:
+                if fd is not None:
+                    self.sys.unlock(fd)
         return {"ok": r.ok}
 
     def unhold(self, app_name: str, dry: bool = False) -> dict:
         app = self._apps([app_name])[0]
-        tool = self._tool_holds()
-        held = app.package in self.showhold()
-        if not held:
-            if app.package in tool:
-                if not dry:
-                    tool.pop(app.package, None)
-                    self.sys.write_private(self._holds_file(), json.dumps(tool, indent=2))
-                return {"ok": True,
-                        "action": "would clear leftover record" if dry else "cleared leftover record"}
-            return {"ok": True, "action": "not held"}
-        if dry:
-            return {"ok": True, "action": "would unhold"}
-        r = self._sudo(["apt-mark", "unhold", app.package], timeout=120)
-        if r.ok:
-            tool.pop(app.package, None)
-            self.sys.write_private(self._holds_file(), json.dumps(tool, indent=2))
-        return {"ok": r.ok, "action": "unheld" if r.ok else "unhold failed"}
+        shown = self.showhold()
+        if shown is None:
+            return {"ok": False, "action": "could not read apt holds"}
+        fd = self._holds_lock()
+        try:
+            tool = self._tool_holds()
+            held = app.package in shown
+            if not held:
+                if app.package in tool:
+                    if not dry:
+                        tool.pop(app.package, None)
+                        self._write_holds(tool)
+                    return {"ok": True,
+                            "action": "would clear leftover record" if dry else "cleared leftover record"}
+                return {"ok": True, "action": "not held"}
+            if dry:
+                return {"ok": True, "action": "would unhold"}
+            r = self._sudo(["apt-mark", "unhold", app.package], timeout=120)
+            if r.ok:
+                tool.pop(app.package, None)
+                self._write_holds(tool)
+            return {"ok": r.ok, "action": "unheld" if r.ok else "unhold failed"}
+        finally:
+            if fd is not None:
+                self.sys.unlock(fd)
 
     # ------------------------------------------------------------ processes
     def _app_exes(self, app: App) -> set[str]:
@@ -427,25 +492,23 @@ class Engine:
         return os.path.join(self._app_store(app), "state.json")
 
     def _state(self, app: App) -> dict:
-        raw = self.sys.read_text(self._state_path(app))
-        try:
-            return json.loads(raw) if raw else {}
-        except ValueError:
-            return {}
+        return self._read_json_dict(self._state_path(app))
 
     def _save_state(self, app: App, st: dict) -> None:
-        self.sys.write_private(self._state_path(app), json.dumps(st, indent=2, sort_keys=True))
+        if not isinstance(st, dict):
+            return
+        if not self.sys.write_private(self._state_path(app), json.dumps(st, indent=2, sort_keys=True)):
+            self._note_bad_state(self._state_path(app), "could not write")
 
     def stored_copies(self, app: App) -> dict[str, dict]:
         base = self._app_store(app)
         out = {}
         for v in self.sys.listdir(base):
-            meta_raw = self.sys.read_text(os.path.join(base, v, "meta.json"))
-            if not meta_raw:
+            meta_path = os.path.join(base, v, "meta.json")
+            if not (self.sys.exists(meta_path) or self.sys.isdir(meta_path)):
                 continue
-            try:
-                meta = json.loads(meta_raw)
-            except ValueError:
+            meta = self._read_json_dict(meta_path)
+            if not meta:
                 continue
             out[meta.get("version", v)] = {**meta, "dir": os.path.join(base, v)}
         return out
@@ -585,7 +648,10 @@ class Engine:
                 "file": os.path.basename(dest), "sha256": sha, "source": source,
                 "verified_against_installed": verified, "fallback": fallback,
                 "captured_at": int(self.sys.now())}
-        self.sys.write_private(os.path.join(dest_dir, "meta.json"), json.dumps(meta, indent=2))
+        meta_path = os.path.join(dest_dir, "meta.json")
+        if not self.sys.write_private(meta_path, json.dumps(meta, indent=2)):
+            self._note_bad_state(meta_path, "could not write")
+            return {"ok": False, "version": version, "reason": "could not write rollback metadata"}
         self.sys.write_private(os.path.join(dest_dir, "SHA256SUMS"),
                                f"{sha}  {os.path.basename(dest)}\n")
         res.update({"sha256": sha, "verified": verified, "action": "stored"})
@@ -735,7 +801,11 @@ class Engine:
             rec = self._hold_record(app.package, tool)
             rb_reason = self._rollback_hold_reason(app.package, tool)
             rejected = self._rejected_version(app.package, rec)
-            apt_held = app.package in self.showhold()
+            shown = self.showhold()
+            if shown is None:
+                apt_held = bool(rb_reason or rejected)
+            else:
+                apt_held = app.package in shown
             if newer and rb_reason and apt_held and rejected and cand == rejected:
                 newer = False
             elif newer and rb_reason and apt_held and not rejected:
@@ -748,13 +818,7 @@ class Engine:
         return out
 
     def _notice_state(self) -> dict:
-        path = os.path.join(self.cfg.state_dir, "check-notices.json")
-        raw = self.sys.read_text(path)
-        try:
-            seen = json.loads(raw) if raw else {}
-        except ValueError:
-            seen = {}
-        return seen if isinstance(seen, dict) else {}
+        return self._read_json_dict(os.path.join(self.cfg.state_dir, "check-notices.json"))
 
     def notice_due(self, kind: str, signature: str = "") -> bool:
         """True unless a notice of this kind was already recorded today.
@@ -764,7 +828,9 @@ class Engine:
         """
         del signature
         today = time.strftime("%Y-%m-%d", time.localtime(self.sys.now()))
-        rec = self._notice_state().get(kind) or {}
+        rec = self._notice_state().get(kind)
+        if not isinstance(rec, dict):
+            rec = {}
         return rec.get("date") != today
 
     def record_notice(self, kind: str, signature: str = "") -> dict:
@@ -773,13 +839,16 @@ class Engine:
         today = time.strftime("%Y-%m-%d", time.localtime(self.sys.now()))
         seen[kind] = {"date": today, "sig": signature, "handed_at": int(self.sys.now())}
         path = os.path.join(self.cfg.state_dir, "check-notices.json")
-        self.sys.write_private(path, json.dumps(seen, indent=2, sort_keys=True))
+        if not self.sys.write_private(path, json.dumps(seen, indent=2, sort_keys=True)):
+            self._note_bad_state(path, "could not write")
         from twin_update import notice
         notice.clear_record_failure(self.sys, self.cfg.state_dir)
         return {"ok": True}
 
     def last_window_opened(self) -> str | None:
-        rec = self._notice_state().get("updates") or {}
+        rec = self._notice_state().get("updates")
+        if not isinstance(rec, dict):
+            rec = {}
         ts = rec.get("handed_at")
         if not ts:
             return None
@@ -848,7 +917,8 @@ class Engine:
     def upgrade(self, app_name: str, version: str) -> dict:
         app = self._apps([app_name])[0]
         before, _ = self.installed(app.package)
-        if app.package in self.showhold():
+        shown = self.showhold()
+        if shown is not None and app.package in shown:
             self._sudo(["apt-mark", "unhold", app.package], timeout=120)
         r = self._sudo(["env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "-o",
                         f"DPkg::Lock::Timeout={self.cfg.apt_lock_timeout_s}", "-o",
@@ -942,7 +1012,6 @@ class Engine:
         j = self.sys.run(["journalctl", "--user", "-u", unit, "--no-pager", "-o", "cat"], env=env)
         crashed = bool(CRASH_RE.search(j.out))
         procs = self.sys.procs()
-        closed_via_unit = False
         if started_mains:
             for pid, start in started_mains:
                 p = procs.get(pid)
@@ -950,7 +1019,6 @@ class Engine:
                     self.sys.term(pid, start)
         else:
             self.sys.run(["systemctl", "--user", "stop", unit], env=env, timeout=15)
-            closed_via_unit = True
         deadline = self.sys.now() + self.cfg.close_timeout_s
         left = []
         while True:
@@ -1116,7 +1184,9 @@ class Engine:
     def record_run(self, report: dict) -> dict:
         ts = report.get("started_ts", int(self.sys.now()))
         path = os.path.join(self.cfg.state_dir, "runs", f"{ts}-{report.get('kind', 'run')}.json")
-        self.sys.write_private(path, json.dumps(report, indent=2, sort_keys=True))
+        if not self.sys.write_private(path, json.dumps(report, indent=2, sort_keys=True)):
+            self._note_bad_state(path, "could not write")
+            return {"ok": False, "path": self._redact(path)}
         return {"ok": True, "path": self._redact(path)}
 
     # --------------------------------------------------------------- doctor
@@ -1169,6 +1239,11 @@ class Engine:
                 rb.append(bit)
         checks["rollback_holds"] = rb
         checks["record_notice_error"] = notice.last_record_error(self.sys, self.cfg.state_dir)
+        for app in self.cfg.apps.values():
+            self._state(app)
+        self._notice_state()
+        self._tool_holds()
+        checks["bad_state"] = list(self._bad_state)
         names = self.sys.listdir(self.dpkg_updates)
         checks["dpkg_interrupted"] = any(
             n not in (".", "..") and not str(n).startswith(".") for n in (names or []))

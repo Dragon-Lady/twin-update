@@ -1,97 +1,35 @@
 # Changelog
 
-## Unreleased
+## 0.4.1 - 2026-10-25
 
-- Confirming `y` starts `run` with `systemd-run --user --scope` (named
-  `--unit=`, no `--pipe`/`--collect`/`--no-block`) so the window's tty is
-  inherited: the sudo password and the rollback question stay interactive.
-  The run is in its own session. Ctrl-C in the prompt window and closing
-  that window (SIGHUP) do not stop the update. Cancel with
-  `systemctl --user stop <unit>` (SIGTERM): that reopens apps that were
-  closed. The prompt waits for the run to finish its own cleanup and
-  never SIGKILL's it. A missing tty password fails with a clear message
-  and no traceback.
-- A failed check (no tty, declined rollback, timeout, or closed window)
-  does not upgrade the other machine. The failed version is recorded
-  (only that version is hidden; a newer candidate is still offered).
-  Apps that were closed are reopened; the run is recorded; the report
-  says `twin-update rollback`.
-- SIGTERM / `systemctl --user stop` during close, install, or the
-  rollback question reopens closed apps exactly once. SIGHUP does not
-  cancel the run. If the process is SIGKILL'd or apt is killed, recover
-  with `sudo dpkg --configure -a`; `doctor` warns when
-  `/var/lib/dpkg/updates` is not empty.
-- Smoke retries sampling the processes it started, then stops its own
-  unit if none appeared. It never signals a process that was already
-  running. Watch uses those started processes / the smoke unit, not
-  leftover helpers or an unrecognized name.
-- The window slot merges under the flock. Once the window marked itself
-  started, a later launcher write keeps its pid and start ticks and may
-  only add `unit`. MainPID 0 does not clear the slot while the unit is
-  up. A reused pid or a window open more than 24 hours does not block a
-  new window; `doctor` reports both.
-- Version mismatch still stops `run` before any close. `rollback` warns and
-  proceeds per machine.
-- A rollback or failed-check hold stores the rejected version and
-  suppresses only that version. `unhold` clears the record even if apt
-  already says the package is not held; `check` and `doctor` ignore a
-  leftover record. The prompt and `run` agree: a hold on one machine
-  that would skip the app is shown, not offered as a normal update.
-  Both machines need this same twin-update installed before the first
-  mixed `run`; a peer with no `version` stops before any close and says
-  how to install it. Nothing was changed in that case.
-- Config errors in a prompt window show the error and wait for Enter.
-  Any error before the prompt question also waits for Enter.
-  `Checking...` is printed before the ssh build. A failed `record_notice`
-  is shown in the window and in `doctor`. A one-machine pending app
-  is listed in the close warning even when another app is on both machines.
-  A peer that reports no `version` is treated as older and `run` stops
-  before any close. `doctor` warns if the check service ExecStart path
-  does not exist. Prompt/run unit names include the pid and a random
-  suffix so two launches in the same second do not collide.
-  gnome-terminal / kgx fallback uses `--wait`; unknown
-  `x-terminal-emulator` targets stay `-e` and are verified via unit
-  ActiveState, not the client pid. The CI workflow display name is
-  `Checks`.
-  README says terminal `run` uses `--scope`.
-- Test prompt windows use their own slot (`prompt.window.test`) so a leftover
-  test window cannot block the real daily window. `check --notify` says since
-  when a real window is already open. `doctor` warns if that real window has
-  been open for more than 24 hours. The slot file is written in place so the
-  flock is not dropped; a dead pid does not block a new window, and two
-  launchers cannot both start one.
-- The prompt prints "Checking..." before the re-check. A check error shows
-  the real per-machine error and waits for Enter; it never claims nothing is
-  pending. "Nothing pending" also waits for Enter. Only an explicit N closes
-  without a pause. The day is recorded after the question is shown, not when
-  the window is launched. If one machine is unreachable, the question names
-  that machine.
-- Window text lists closures per machine and only says "both machines" when
-  both need the update. Version jumps are joined with " / " like `check`.
-- A failed window launch is not retried until the next timer run.
-  `Persistent=true` only catches up a missed timer run.
-- `systemd-run --no-block` reporting MainPID 0 is treated as "still
-  starting" and polled briefly; only an inactive or failed unit is a launch
-  failure.
-- Smoke keeps watching for the rest of the interval after a single-instance
-  hand-off, so a later crash is not missed. The "app is running again" guard
-  matches the app's main process only, not leftover helpers.
-- An older peer that rejects the `running` op is tolerated (the old
-  behaviour). Apps still reopen at the end of `run`.
-- Terminal fallback flags depend on the resolved launcher (gnome-terminal
-  style uses `--`). `doctor` warns when the installed check units lack
-  `SuccessExitStatus=10` or differ from the shipped units in a way that
-  matters. `twin-update --help` no longer shows a hidden `raft-upload`
-  line. The zipapp build is reproducible (fixed timestamps, honours
-  `SOURCE_DATE_EPOCH`).
-- The ssh child ignores SIGTERM/SIGINT and stale replies are skipped by
-  request id so a stop of the run scope can still reopen the other
-  machine. An unexpected error writes `~/.local/state/twin-update/last-error.log`
-  and prints a short line pointing at it.
-- Known limits: a real desktop window, a real `systemctl --user stop` of
-  a run scope on two machines, and the first real timer run were not
-  exercised here. After the window is gone, later questions have no tty
-  and take the non-interactive stop path. SIGKILL cannot run cleanup.
+- Confirming Update now starts the update in its own user scope that keeps
+  this window's keyboard. Ctrl-C and closing the window do not stop it.
+  Cancel with `systemctl --user stop <the update unit>` (the window prints
+  the name). That stop reopens apps that were closed. The window waits for
+  the update to finish cleanup and never force-kills it.
+- A stop or a dropped connection while closing the second machine still
+  reopens apps already closed on the first. The run is always recorded.
+- Stopping during the final record/notify step still writes the run and
+  tries every machine. A failed reopen is named in the report.
+- `sudo apt-get` / `dpkg` is not force-killed on interrupt. If apt was
+  mid-install, recover with `sudo dpkg --configure -a`. `doctor` warns
+  when `/var/lib/dpkg/updates` is not empty.
+- A failed check records that version only and does not upgrade the other
+  machine. A newer candidate is still offered. A failed `apt-mark showhold`
+  does not erase the rejected-version record. A failed hold after a failed
+  check is reported, not swallowed.
+- Broken or unreadable state files (wrong JSON type, a directory in the
+  way) are ignored. `doctor` names the file. They never block an update
+  and never crash the timer.
+- Exit 3 means you stopped it. Exit 5 means the update stopped before
+  finishing (see the report; a failed check may have left a version
+  installed). A broken `config.toml` is a config error (exit 2) and the
+  window waits for Enter.
+- Both machines need twin-update 0.4.1 or newer. A peer with no version
+  stops before anything is closed and says how to install it. On rollback,
+  an older peer that does not understand `running` is still tolerated.
+- After the window is gone, later questions have no keyboard and take the
+  non-interactive stop path. A kill of the process cannot run cleanup.
 
 ## 0.4.0 (2026-10-25)
 

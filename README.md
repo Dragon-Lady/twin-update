@@ -203,8 +203,8 @@ verifies and reopens the app if it was open.
 Both machines need this same twin-update installed before the first
 mixed `run`. If the other machine reports no `version`, `run` stops
 before closing anything, says to install this twin-update there
-(`pipx install twin-update`, or copy the zipapp to `remote_command`),
-and changes nothing.
+(`pipx install twin-update` 0.4.1 or newer, or copy the zipapp to
+`remote_command`), and changes nothing.
 
 A failed smoke/check does not upgrade the other machine unless you
 explicitly roll back or the check succeeded. The failed version is
@@ -284,8 +284,11 @@ python3 tools/build_zipapp.py        # -> dist/twin-update.pyz
 
 Standard library only. Exit codes (`check` differs, see above): 0 ok / dry-run,
 4 `doctor` found a problem (including an unreachable other machine; a busy
-sync lock is only a warning), 1 failed, 2 usage or config,
-3 aborted (nothing changed).
+sync lock is only a warning), 1 the update failed, 2 usage or config,
+3 you stopped it (apps that were closed are reopened),
+5 the update stopped before finishing (see the report; a failed check may
+have left a version installed). If apt was mid-install, recover with
+`sudo dpkg --configure -a`.
 
 ## License
 

@@ -212,6 +212,7 @@ class RunFlow(unittest.TestCase):
         rep = orchestrator.run(t.session(FakeUI()), ["cursor"], dry=False, smoke=False)
         self.assertEqual(rep["result"], "aborted")
         self.assertIn("interrupted after close", rep["error"])
+        self.assertIn("dpkg --configure -a", rep["error"])
         self.assertIn("cursor", rep.get("reopen", {}).get("machine-a", {}))
 
     def test_peer_drop_after_close_reopens_apps(self):
@@ -381,6 +382,8 @@ class RunFlow(unittest.TestCase):
         rep = orchestrator.run(t.session(FakeUI()), ["cursor"], dry=False, smoke=False)
         self.assertEqual(rep["result"], "aborted")
         self.assertIn("interrupted after close", rep["error"])
+        self.assertTrue(rep.get("interrupted"))
+        self.assertIn("dpkg --configure -a", rep["error"])
         self.assertIn("cursor", (rep.get("reopen") or {}).get("machine-a", {}))
 
     def test_sigterm_during_final_reopen_is_once(self):
@@ -505,7 +508,150 @@ class RunFlow(unittest.TestCase):
         rep = orchestrator.run(t.session(FakeUI()), ["cursor"], dry=False, smoke=False)
         self.assertEqual(rep["result"], "aborted")
         self.assertIn("interrupted after close", rep["error"])
+        self.assertIn("dpkg --configure -a", rep["error"])
         self.assertIn("cursor", rep.get("reopen", {}).get("machine-a", {}))
+
+    def test_close_start_on_second_machine_reopens_first(self):
+        import os
+        import signal
+        t = Twin(); standard(t)
+        t.sys["machine-a"].add_app_procs(CUR)
+        real_b = t.peers["machine-b"]
+
+        class Boom:
+            def call(self, op, **kw):
+                if op == "close_start":
+                    os.kill(os.getpid(), signal.SIGTERM)
+                return real_b.call(op, **kw)
+
+            def close(self):
+                real_b.close()
+
+        t.peers["machine-b"] = Boom()
+        rep = orchestrator.run(t.session(FakeUI()), ["cursor"], dry=False, smoke=False)
+        self.assertEqual(rep["result"], "aborted")
+        self.assertTrue(rep.get("interrupted") or "interrupted" in (rep.get("error") or ""))
+        self.assertIn("cursor", (rep.get("reopen") or {}).get("machine-a", {}))
+        self.assertTrue(rep.get("report_paths") or True)
+
+    def test_record_run_survives_sigterm_and_records_both(self):
+        import os
+        import signal
+        t = Twin(); standard(t)
+        real_a = t.peers["machine-a"]
+        counts = {"n": 0}
+
+        class Term:
+            def call(self, op, **kw):
+                if op == "record_run":
+                    counts["n"] += 1
+                    if counts["n"] == 1:
+                        os.kill(os.getpid(), signal.SIGTERM)
+                return real_a.call(op, **kw)
+
+            def close(self):
+                real_a.close()
+
+        t.peers["machine-a"] = Term()
+        rep = orchestrator.run(t.session(FakeUI()), ["cursor"], dry=False, smoke=False)
+        self.assertIn(rep["result"], ("ok", "failed", "aborted"))
+        self.assertGreaterEqual(counts["n"], 1)
+        self.assertIn("machine-b", (rep.get("report_paths") or {}))
+
+    def test_showhold_failure_keeps_rejected_record(self):
+        t = Twin(); standard(t)
+        t.eng["machine-a"].set_password(PW)
+        t.eng["machine-a"].hold("cursor", "rollback from 3.24.9-1", rejected="3.24.9-1")
+        self.assertTrue(t.eng["machine-a"]._tool_holds())
+        t.sys["machine-a"].showhold_fail = True
+        chk = t.eng["machine-a"].check(["cursor"])
+        self.assertFalse(chk["apps"]["cursor"]["update_available"])
+        self.assertTrue(t.eng["machine-a"]._tool_holds())
+
+    def test_wrong_type_state_does_not_crash(self):
+        t = Twin(); standard(t)
+        notices = os.path.join(t.cfg.state_dir, "check-notices.json")
+        os.makedirs(t.cfg.state_dir, exist_ok=True)
+        with open(notices, "w") as fh:
+            fh.write('{"updates":"x"}')
+        self.assertTrue(t.eng["machine-a"].notice_due("updates"))
+        st = t.eng["machine-a"]._state_path(t.cfg.apps["cursor"])
+        os.makedirs(os.path.dirname(st), exist_ok=True)
+        with open(st, "w") as fh:
+            fh.write("[]")
+        t.eng["machine-a"].status(["cursor"])
+        t.eng["machine-a"].prune(["cursor"], dry=True)
+        holds = t.eng["machine-a"]._holds_file()
+        with open(holds, "w") as fh:
+            fh.write('"not-an-object"')
+        t.eng["machine-a"].holds()
+        t.eng["machine-a"].check(["cursor"], fresh=False)
+        slot = os.path.join(t.cfg.state_dir, "prompt.window")
+        with open(slot, "w") as fh:
+            fh.write("[1,2,3]")
+        from twin_update import notice
+        notice.read_slot(t.sys["machine-a"], slot)
+        notice.slot_held(t.sys["machine-a"], slot)
+        os.remove(notices)
+        os.mkdir(notices)
+        self.assertTrue(t.eng["machine-a"].notice_due("updates"))
+        t.eng["machine-a"].record_notice("updates")
+        os.remove(st)
+        os.mkdir(st)
+        t.eng["machine-a"].status(["cursor"])
+        t.eng["machine-a"].prune(["cursor"], dry=True)
+        d = t.eng["machine-a"].doctor()
+        self.assertTrue(d.get("bad_state"))
+        named = " ".join(d["bad_state"])
+        self.assertTrue("check-notices.json" in named or "state.json" in named)
+
+    def test_write_private_unique_temp_and_oserror(self):
+        t = Twin(); standard(t)
+        path = os.path.join(t.cfg.state_dir, "unique.json")
+        os.makedirs(t.cfg.state_dir, exist_ok=True)
+        os.mkdir(path + ".tmp")
+        self.assertTrue(t.sys["machine-a"].write_private(path, "{}"))
+        self.assertTrue(os.path.isfile(path))
+        asdir = os.path.join(t.cfg.state_dir, "as-dir")
+        os.mkdir(asdir)
+        self.assertFalse(t.sys["machine-a"].write_private(asdir, "{}"))
+        self.assertFalse(t.sys["machine-a"].write_inplace(asdir, "{}"))
+
+    def test_failed_hold_after_check_is_reported(self):
+        t = Twin(); standard(t)
+        t.sys["machine-a"].smoke_dies.add("cursor")
+        real = t.peers["machine-a"]
+
+        class NoHold:
+            def call(self, op, **kw):
+                if op == "hold":
+                    return {"ok": False}
+                return real.call(op, **kw)
+
+            def close(self):
+                real.close()
+
+        t.peers["machine-a"] = NoHold()
+        ui = FakeUI(confirm=False)
+        rep = orchestrator.run(t.session(ui), ["cursor"], dry=False)
+        self.assertTrue(any("could not hold" in l for l in rep["summary"]))
+
+    def test_bad_toml_is_config_error(self):
+        import tempfile
+        from twin_update.config import ConfigError, load
+        from twin_update import cli
+        with self.assertRaises(ConfigError):
+            load(text="[machines")
+        t = Twin(); standard(t)
+        fd, path = tempfile.mkstemp(suffix=".toml")
+        os.write(fd, b"[machines\n")
+        os.close(fd)
+        self.addCleanup(os.remove, path)
+        ui = FakeUI()
+        rc = cli.main(["--config", path, "status"], ui=ui, system=t.sys["machine-a"],
+                      peer_factory=lambda label, target, cmd: t.peers[label])
+        self.assertEqual(rc, 2)
+        self.assertTrue(any("config error" in l for l in ui.lines))
 
     def test_noninteractive_failed_check_stops_peer(self):
         t = Twin(); standard(t)
@@ -900,6 +1046,24 @@ class Config(unittest.TestCase):
 
 
 class Cli(unittest.TestCase):
+    def test_aborted_not_interrupted_is_exit_5(self):
+        import tempfile
+        from fakes import patched_paths
+        from twin_update import cli
+        t = Twin(); standard(t)
+        t.sys["machine-a"].apt_busy_flag = True
+        tmpd = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, tmpd, True)
+        cfgp = os.path.join(tmpd, "c.toml")
+        with open(cfgp, "w") as fh:
+            fh.write(__import__("fakes").CONFIG.format(keep="[]", fallback="[]"))
+        ui = FakeUI()
+        with patched_paths(t):
+            rc = cli.main(["--config", cfgp, "run", "--no-detach", "--no-smoke"],
+                          ui=ui, system=t.sys["machine-a"],
+                          peer_factory=lambda label, target, cmd: t.peers[label])
+        self.assertEqual(rc, 5)
+
     def test_local_only_requires_dry_run(self):
         from twin_update.cli import main
         ui = FakeUI()

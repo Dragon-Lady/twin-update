@@ -1,29 +1,16 @@
-"""Signal and lifecycle behaviour.
+"""Real-signal subprocess tests for interrupt and ssh isolation.
 
-Matrix (each cell: apps afterwards, reopen once?, recorded?, user told?, exit):
+Covered here (each fails on the previous head if the wait/kill contract
+regresses):
+- SIGINT to the prompt parent does not SIGKILL the run child.
+- SIGTERM of a run child is waited out through its cleanup.
+- System.run (apt/sudo path) waits out KeyboardInterrupt instead of SIGKILL.
+- The ssh child ignores SIGTERM and keeps answering.
+- Exit 3 says you stopped it; exit 5 says the update stopped before finishing.
 
-Signal/event x phase x role
-- SIGINT in the prompt window during a running child: run stays in its
-  own session; parent does not SIGKILL; apps follow the run's own
-  cleanup (reopen on SIGTERM of the unit). Exit is the child's.
-- SIGTERM (`systemctl --user stop <unit>`) during close_wait / apt /
-  rollback question / final reopen: apps that were closed are reopened
-  exactly once; run is recorded; message says interrupted; exit 3.
-- SIGHUP / window closed: ignored in the run and in the prompt while a
-  child exists; update continues; no reopen (apps stay as the run left
-  them until it finishes).
-- SIGKILL of the run / killed apt: nothing here can recover; doctor
-  warns if /var/lib/dpkg/updates is not empty; README says
-  `sudo dpkg --configure -a`.
-- EOF on stdin at the password: abort before close, nothing changed,
-  exit 1, no traceback.
-- EOF at the rollback question: treat as no; failed version held;
-  peer not upgraded; apps reopened; recorded.
-- ssh drop mid-call: next call opens a fresh session (or skips stale
-  ids); peer reopen still attempted.
-- unit stop: same as SIGTERM.
-
-Tests below cover the distinct classes with real signals in a subprocess.
+In-process coverage for close_start on the second machine, record_run
+during SIGTERM, EOF at rollback, and hold/state files lives in
+test_twin_update.py.
 """
 
 from __future__ import annotations
@@ -168,14 +155,60 @@ class SshIgnoresTerm(unittest.TestCase):
         self.assertEqual(first["pid"], second["pid"])
 
 
+class RunDoesNotKill(unittest.TestCase):
+    def test_run_waits_out_interrupt(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, tmp, True)
+        started = os.path.join(tmp, "started")
+        done = os.path.join(tmp, "done")
+        child = os.path.join(tmp, "child.py")
+        with open(child, "w") as fh:
+            fh.write(textwrap.dedent(f"""\
+                import os, signal, time, sys
+                signal.signal(signal.SIGINT, signal.SIG_IGN)
+                signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                open({started!r}, "w").write(str(os.getpid()))
+                time.sleep(0.4)
+                open({done!r}, "w").write("ok")
+            """))
+        env = dict(os.environ)
+        env["PYTHONPATH"] = os.path.abspath("src")
+        parent = os.path.join(tmp, "parent.py")
+        with open(parent, "w") as fh:
+            fh.write(textwrap.dedent(f"""\
+                import sys, os, signal, time
+                sys.path.insert(0, {os.path.abspath('src')!r})
+                from twin_update.system import System
+                def boom(s, f):
+                    raise KeyboardInterrupt
+                signal.signal(signal.SIGINT, boom)
+                try:
+                    System().run([sys.executable, {child!r}])
+                except KeyboardInterrupt:
+                    sys.exit(9)
+            """))
+        proc = subprocess.Popen([sys.executable, parent], env=env)
+        deadline = time.time() + 5
+        while time.time() < deadline and not os.path.exists(started):
+            time.sleep(0.05)
+        self.assertTrue(os.path.exists(started))
+        os.kill(proc.pid, signal.SIGINT)
+        rc = proc.wait(timeout=8)
+        self.assertTrue(os.path.exists(done), "child was SIGKILL'd before it finished")
+        self.assertEqual(rc, 9)
+
+
 class Announce(unittest.TestCase):
     def test_failed_run_says_plain_reason(self):
         from fakes import FakeUI
         from twin_update import notice
         ui = FakeUI()
         notice._announce_run_result(ui, 3, "exit-code", 3)
-        self.assertTrue(any("aborted by you" in l for l in ui.lines))
+        self.assertTrue(any("you stopped it" in l for l in ui.lines))
         self.assertFalse(any("exit-code" in l for l in ui.lines))
+        ui2 = FakeUI()
+        notice._announce_run_result(ui2, 5, "exit-code", 5)
+        self.assertTrue(any("stopped before finishing" in l for l in ui2.lines))
 
 
 def _pid_alive(pid):

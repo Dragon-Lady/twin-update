@@ -27,7 +27,11 @@ def _adapters(engine):
     root = Path(engine.cfg.raft.script_dir)
     # Legacy scripts have incompatible fixed-path behavior. Never execute them
     # merely because their filenames match the new protocol.
-    if json.loads((root / "twin-update-raft.json").read_text()) != {"protocol": 1}:
+    try:
+        proto = json.loads((root / "twin-update-raft.json").read_text())
+    except (OSError, ValueError) as exc:
+        raise ValueError("snapshot-only adapter protocol 1 required") from exc
+    if not isinstance(proto, dict) or proto != {"protocol": 1}:
         raise ValueError("snapshot-only adapter protocol 1 required")
     if not all((root / name).is_file() for name in SCRIPTS):
         raise ValueError("snapshot-only adapters missing")

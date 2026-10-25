@@ -31,10 +31,6 @@ EXTRA_NOTIFY_BODY = "Updates waiting: see the Twin Update window"
 UPDATE_NOW = "Update now?"
 CHECKING = "Checking..."
 CLOSE_DOES_NOT_STOP = "Closing this window does not stop the update."
-CANCEL_HINT = (
-    "Ctrl-C in this window does not stop the update. "
-    "To cancel and reopen closed apps: systemctl --user stop <the update unit shown below>."
-)
 SUDO_NEEDED = ("sudo password needed but this run has no terminal and none was "
                "supplied; start it from a Twin Update window or a terminal")
 UPDATE_FINISHED = "Update finished"
@@ -43,8 +39,9 @@ EXIT_MEANING = {
     0: "ok",
     1: "the update failed",
     2: "usage or config error",
-    3: "aborted by you",
+    3: "you stopped it",
     4: "doctor found a problem",
+    5: "The update stopped before finishing (see above)",
 }
 GUI_KEYS = ("WAYLAND_DISPLAY", "DISPLAY", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS")
 
@@ -661,10 +658,6 @@ def start_and_follow_run(system, argv: list[str], env: dict, ui) -> int:
     return rc
 
 
-def extra_notify_body() -> str:
-    return EXTRA_NOTIFY_BODY
-
-
 def shipped_systemd_dir() -> str:
     return os.path.join(os.path.dirname(__file__), "systemd")
 
@@ -692,8 +685,7 @@ def check_exec_start(service: str | None, home: str) -> str | None:
 
 
 def unit_drift_warnings(installed_service: str | None, installed_timer: str | None,
-                        shipped_service: str | None = None,
-                        shipped_timer: str | None = None) -> list[str]:
+                        shipped_service: str | None = None) -> list[str]:
     """Warnings when an installed check unit differs in a way that matters."""
     warnings = []
     service = installed_service or ""

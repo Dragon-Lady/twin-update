@@ -596,7 +596,7 @@ class PasswordHandoff(unittest.TestCase):
                           ui=ui, system=t.sys["machine-a"],
                           peer_factory=lambda label, target, cmd: t.peers[label])
         out = buf.getvalue() + "\n".join(ui.lines)
-        self.assertIn(rc, (1, 3))
+        self.assertIn(rc, (1, 3, 5))
         self.assertNotIn("Traceback", out)
         self.assertTrue("sudo" in out.lower() or notice.SUDO_NEEDED in out)
 
@@ -825,7 +825,7 @@ class SlotMerge(unittest.TestCase):
                           ui=cli.ConsoleUI(), system=t.sys["machine-a"],
                           peer_factory=lambda label, target, cmd: t.peers[label])
         out = buf.getvalue()
-        self.assertIn(rc, (1, 3))
+        self.assertIn(rc, (1, 3, 5))
         self.assertNotIn("Traceback", out)
         self.assertIn("sudo password needed", out)
 

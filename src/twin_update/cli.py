@@ -30,10 +30,6 @@ class ConsoleUI:
         return sys.stdin.isatty()
 
     def getpass(self, prompt: str) -> str:
-        preset = getattr(self, "_sudo_from_stdin", None)
-        if preset is not None:
-            self._sudo_from_stdin = None
-            return preset
         if not sys.stdin.isatty():
             raise EOFError(notice.SUDO_NEEDED)
         # Read this process's stdin (echo off). getpass() uses /dev/tty and
@@ -206,6 +202,9 @@ def _print(ui, data, as_json: bool) -> None:
                 elif k == "dpkg_interrupted":
                     if v:
                         ui.say(f"{l:8} dpkg interrupted: run sudo dpkg --configure -a")
+                elif k == "bad_state":
+                    for item in (v or []):
+                        ui.say(f"{l:8} state file: {item}")
                 elif k in ("locks_ok", "window_stale", "unit_warnings"):
                     continue
                 elif k != "locks_ok":
@@ -438,7 +437,13 @@ def main(argv=None, ui=None, system=None, peer_factory=SshPeer) -> int:
     if data.get("kind") == "doctor":
         return 0 if data.get("ok") else 4
     res = data.get("result")
-    return 0 if res in (None, "ok", "dry-run") else (3 if res == "aborted" else 1)
+    if res in (None, "ok", "dry-run"):
+        return 0
+    if data.get("interrupted"):
+        return 3
+    if res == "aborted":
+        return 5
+    return 1
 
 
 def _age(h) -> str:

@@ -162,6 +162,9 @@ class SshPeer:
         except ValueError:
             self._timed_out = True
             raise PeerError(f"{self.label}: {self._why()}") from None
+        if not isinstance(msg, dict):
+            self._timed_out = True
+            raise PeerError(f"{self.label}: {self._why()}")
         while isinstance(msg.get("id"), int) and msg["id"] < self._id:
             raw = self._readline(timeout)
             if not raw:
@@ -172,6 +175,9 @@ class SshPeer:
             except ValueError:
                 self._timed_out = True
                 raise PeerError(f"{self.label}: {self._why()}") from None
+            if not isinstance(msg, dict):
+                self._timed_out = True
+                raise PeerError(f"{self.label}: {self._why()}")
         if msg.get("id") != self._id:
             self._timed_out = True
             raise PeerError("unexpected peer response id")
@@ -195,8 +201,15 @@ class SshPeer:
         return classify_ssh_error(text, code, no_answer=no_answer and code is None)
 
     def abort(self) -> None:
+        """Stop the remote serve by closing stdin. SIGTERM is ignored by ssh."""
         try:
-            self.proc.terminate()
+            if self.proc.stdin:
+                self.proc.stdin.close()
+        except Exception:
+            pass
+        self._timed_out = True
+        try:
+            self.proc.wait(timeout=5)
         except Exception:
             pass
         self._close_err()
@@ -227,6 +240,8 @@ def serve(engine: Engine, rfile, wfile) -> int:
             rid = None
             try:
                 req = json.loads(raw)
+                if not isinstance(req, dict):
+                    raise EngineError("request is not a JSON object")
                 rid = req.get("id")
                 op = req.get("op")
                 if op not in OPS:
