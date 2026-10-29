@@ -11,11 +11,14 @@
   updates it when it is open, then leaves it closed. ChatGPT's raft still
   snapshots that closed profile so state can move; Cursor's no-launch gate
   is unchanged (no_launch still skips Cursor's raft).
-- `raft.chatgpt_db` selects the ChatGPT SQLite file. There is no silent
-  default: official Linux docs do not publish the path. Set it when enabling
-  ChatGPT raft (observed Codex Desktop state DB: `~/.codex/state_5.sqlite`;
-  the `state_N` filename is versioned). Snapshots are not read from or
-  written under `~/Documents/Codex`.
+- `raft.chatgpt_dbs` selects the ChatGPT SQLite files (snapshotted together
+  in one lock hold). The older `raft.chatgpt_db` key still works as a
+  one-item list. There is no silent default: official Linux docs do not
+  publish the paths. Observed under `~/.codex`: `state_5.sqlite`,
+  `thread_history_1.sqlite`, `memories_1.sqlite`, `memories_v2_1.sqlite`,
+  `goals_1.sqlite`, `queue_1.sqlite`. `logs_2.sqlite` is optional and
+  omitted from the example set. Snapshots are not read from or written
+  under `~/Documents/Codex`.
 
 ## 0.4.1 - 2026-10-25
 

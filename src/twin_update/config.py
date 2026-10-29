@@ -66,10 +66,18 @@ class Raft:
     keep: int = 2
     upload_prefix: str = "cursor-liferaft"
     machines: list[str] = field(default_factory=list)
-    # ChatGPT/Codex desktop SQLite path. Empty means ChatGPT raft is off.
-    # Linux vendor docs do not publish this path; set it explicitly.
+    # ChatGPT/Codex desktop SQLite paths. Empty means ChatGPT raft is off.
+    # chatgpt_db is the older one-file key and is treated as a one-item list.
     chatgpt_db: str = ""
+    chatgpt_dbs: list[str] = field(default_factory=list)
     chatgpt_upload_prefix: str = "chatgpt-liferaft"
+
+    def chatgpt_sources(self) -> list[str]:
+        out = []
+        for p in ([self.chatgpt_db] if self.chatgpt_db else []) + list(self.chatgpt_dbs):
+            if p and p not in out:
+                out.append(p)
+        return out
 
 
 @dataclass
@@ -191,9 +199,15 @@ def load(path: str | None = None, home: str | None = None, text: str | None = No
                 "chatgpt_upload_prefix"):
         if not isinstance(getattr(raft, key), str):
             raise ConfigError(f"raft.{key} must be text")
+    if not isinstance(raft.chatgpt_dbs, list) or any(not isinstance(x, str) for x in raft.chatgpt_dbs):
+        raise ConfigError("raft.chatgpt_dbs must be a list of paths")
     raft.script_dir = _expand(raft.script_dir or "~/.local/share/twin-update/raft", home)
     raft.lock_path = _expand(raft.lock_path, home)
     raft.chatgpt_db = _expand(raft.chatgpt_db, home) if raft.chatgpt_db else ""
+    raft.chatgpt_dbs = [_expand(p, home) for p in raft.chatgpt_dbs]
+    names = [os.path.basename(p) for p in raft.chatgpt_sources()]
+    if len(names) != len(set(names)):
+        raise ConfigError("raft ChatGPT database filenames must be unique")
     for key, limit in (("snapshot_timeout_s", 600), ("upload_timeout_s", 86400), ("keep", 100)):
         value = getattr(raft, key)
         if type(value) is not int or not 1 <= value <= limit:
@@ -206,8 +220,10 @@ def load(path: str | None = None, home: str | None = None, text: str | None = No
         raise ConfigError("raft.chatgpt_upload_prefix must be a simple name")
     if raft.enabled and (not os.path.isabs(raft.lock_path) or not raft.remote or raft.remote.startswith("-")):
         raise ConfigError("enabled raft requires an absolute lock_path and an explicit remote")
-    if raft.enabled and raft.chatgpt_db and (not os.path.isabs(raft.chatgpt_db) or raft.chatgpt_db.startswith("-")):
-        raise ConfigError("raft.chatgpt_db must be an absolute path")
+    if raft.enabled:
+        for p in raft.chatgpt_sources():
+            if not os.path.isabs(p) or p.startswith("-"):
+                raise ConfigError("raft ChatGPT database paths must be absolute")
     return Config(
         machines=machines, apps=apps, enabled=enabled,
         keep_holds=list(asec.get("keep_holds", [])),

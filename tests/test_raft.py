@@ -468,3 +468,63 @@ class ChatgptRaftTests(unittest.TestCase):
             self.assertTrue(raft.upload(e, snap)["ok"])
         self.assertRegex(calls[3][3], r"backup:archive/chatgpt-liferaft-machine-a-\d{8}T\d{6}Z-")
         self.assertFalse(Path(snap).exists())
+
+    def test_chatgpt_db_is_one_item_list(self):
+        text = CONFIG.format(keep="[]", fallback="[]") + (
+            '\n[raft]\nenabled=true\nremote="backup:archive"\n'
+            'lock_path="/tmp/example.lock"\nchatgpt_db="~/.codex/state_5.sqlite"\n')
+        cfg = load(text=text, home="/home/alice")
+        self.assertEqual(cfg.raft.chatgpt_sources(),
+                         ["/home/alice/.codex/state_5.sqlite"])
+
+    def test_chatgpt_dbs_list_and_legacy_key_merge(self):
+        text = CONFIG.format(keep="[]", fallback="[]") + (
+            '\n[raft]\nenabled=true\nremote="backup:archive"\n'
+            'lock_path="/tmp/example.lock"\n'
+            'chatgpt_db="~/.codex/state_5.sqlite"\n'
+            'chatgpt_dbs=["~/.codex/thread_history_1.sqlite",'
+            '"~/.codex/memories_1.sqlite"]\n')
+        cfg = load(text=text, home="/home/alice")
+        self.assertEqual(cfg.raft.chatgpt_sources(), [
+            "/home/alice/.codex/state_5.sqlite",
+            "/home/alice/.codex/thread_history_1.sqlite",
+            "/home/alice/.codex/memories_1.sqlite",
+        ])
+
+    def test_multiple_dbs_one_lock_hold(self):
+        t = Twin(); e = enabled(t)
+        root = Path(e.sys.home()) / ".codex"
+        root.mkdir(parents=True, exist_ok=True)
+        names = ("state_5.sqlite", "thread_history_1.sqlite", "memories_1.sqlite")
+        e.cfg.raft.chatgpt_dbs = [str(root / n) for n in names]
+        flocks = []
+        backups = []
+        original_flock = e.sys.try_flock
+        original_run = snapshot_runner(e)
+        def flock(path):
+            flocks.append(path)
+            return original_flock(path)
+        def run(argv, **kw):
+            if "--source" in argv:
+                backups.append(argv)
+            return original_run(argv, **kw)
+        with patch.object(e.sys, "try_flock", side_effect=flock), \
+             patch.object(e.sys, "run", side_effect=run):
+            result = e.pre_reopen_hook("chatgpt", True)
+        self.assertTrue(result["ok"], result)
+        path = Path(result["snapshot"])
+        for name in names:
+            self.assertTrue((path / name).is_file(), name)
+        self.assertEqual(len(backups), 3)
+        self.assertEqual(len(flocks), 1)
+
+    def test_running_skips_whole_chatgpt_set(self):
+        t = Twin(); e = enabled(t)
+        root = Path(e.sys.home()) / ".codex"
+        root.mkdir(parents=True, exist_ok=True)
+        e.cfg.raft.chatgpt_dbs = [str(root / "state_5.sqlite"),
+                                  str(root / "thread_history_1.sqlite")]
+        e.sys.add_app_procs(GPT)
+        result = e.pre_reopen_hook("chatgpt", True)
+        self.assertEqual(result["skipped"], "ChatGPT still running")
+        self.assertFalse(any("--source" in (c[0] if c else []) for c in e.sys.calls))

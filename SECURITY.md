@@ -57,11 +57,11 @@ Please report issues privately through the repository's security advisories.
 ## Opt-in snapshot exception
 
 The default remains no application-database access. The explicitly enabled raft
-path may make a read-only SQLite backup only while that database's owning app
+path may make a read-only SQLite backup only while that set's owning app
 has no process tree or known same-user database descriptor holders and the
-shared backup lock is held. Each watched database is skipped on its own: a
+shared backup lock is held. Each owning app is skipped on its own: a
 running Cursor does not block ChatGPT's raft, and a running ChatGPT does not
-block Cursor's. Checks are repeated after capture; this reduces races but
+block Cursor's. ChatGPT's configured files are snapshotted as one set. Checks are repeated after capture; this reduces races but
 cannot prevent an uncooperative external process from launching. The snapshot
 is discarded when activity is detected. Background export reads only the
 captured snapshot. Adapters and the configured destination are trusted

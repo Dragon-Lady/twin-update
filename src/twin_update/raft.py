@@ -50,20 +50,21 @@ def _snap_kind(path):
 
 
 def _target(engine, app_name):
-    """Per-database raft target. Cursor stays the built-in path; ChatGPT is opt-in."""
+    """Per-app raft target. Cursor stays the built-in path; ChatGPT is opt-in."""
     cfg = engine.cfg.raft
     if app_name == "cursor":
         return {
             "name": "cursor",
-            "source": Path(engine.sys.home()) / ".config/Cursor/User/globalStorage/state.vscdb",
+            "sources": [Path(engine.sys.home()) / ".config/Cursor/User/globalStorage/state.vscdb"],
             "snap_prefix": "snapshot-",
             "unit_prefix": "twin-raft-cursor-",
             "upload_prefix": cfg.upload_prefix,
         }
-    if app_name == "chatgpt" and cfg.chatgpt_db:
+    sources = [Path(p) for p in cfg.chatgpt_sources()]
+    if app_name == "chatgpt" and sources:
         return {
             "name": "chatgpt",
-            "source": Path(cfg.chatgpt_db),
+            "sources": sources,
             "snap_prefix": _CHATGPT_SNAP_PREFIX,
             "unit_prefix": "twin-raft-chatgpt-",
             "upload_prefix": cfg.chatgpt_upload_prefix,
@@ -123,26 +124,30 @@ def pre_reopen(engine, app_name, smoke_ok):
         if tree:
             display = engine.cfg.apps[target["name"]].display
             return skip(f"{display} still running", processes=[{"pid": pid, "comm": found["procs"][pid].comm} for pid in tree])
-        source = target["source"]
-        paths = [str(source) + suffix for suffix in ("", "-wal", "-shm")]
+        sources = target["sources"]
+        paths = [str(source) + suffix for source in sources for suffix in ("", "-wal", "-shm")]
         holders = engine.sys.fd_holders(paths)
         if holders:
             return skip("holder check incomplete" if any(h.get("unreadable") for h in holders) else "database holders", holders=holders)
         scripts = _adapters(engine)
         path = Path(tempfile.mkdtemp(prefix=target["snap_prefix"], dir=root))
         path.chmod(0o700)
-        result = engine.sys.run([sys.executable, str(scripts / SCRIPTS[0]),
-                                 "--source", str(source), "--output", str(path / source.name)],
-                                timeout=cfg.snapshot_timeout_s)
-        if not result.ok:
-            raise RuntimeError("snapshot timed out" if result.rc == 124 else "snapshot failed")
+        for source in sources:
+            result = engine.sys.run([sys.executable, str(scripts / SCRIPTS[0]),
+                                     "--source", str(source), "--output", str(path / source.name)],
+                                    timeout=cfg.snapshot_timeout_s)
+            if not result.ok:
+                raise RuntimeError("snapshot timed out" if result.rc == 124 else "snapshot failed")
         if engine.sys.fd_holders(paths) or engine.app_tree(engine.cfg.apps[target["name"]])["tree"]:
             raise RuntimeError("profile became active during snapshot")
         _snapshot(engine, path)
-        db = path / source.name
-        if not db.is_file() or db.stat().st_size == 0:
-            raise RuntimeError("snapshot is empty")
-        return {"ok": True, "snapshot": str(path), "size": db.stat().st_size}
+        size = 0
+        for source in sources:
+            db = path / source.name
+            if not db.is_file() or db.stat().st_size == 0:
+                raise RuntimeError("snapshot is empty")
+            size += db.stat().st_size
+        return {"ok": True, "snapshot": str(path), "size": size}
     except Exception as exc:
         if path is not None:
             shutil.rmtree(path, ignore_errors=True)

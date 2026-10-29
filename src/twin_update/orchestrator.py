@@ -418,7 +418,7 @@ def _raft_dry(s, rep, was_open):
         for label, apps in was_open.items():
             if "cursor" in apps and "cursor" not in s.cfg.no_launch:
                 rep["summary"].append(f"Cursor {label}: would raft (snapshot before reopen, upload to {s.cfg.raft.remote})")
-            if "chatgpt" in apps and s.cfg.raft.chatgpt_db:
+            if "chatgpt" in apps and s.cfg.raft.chatgpt_sources():
                 rep["summary"].append(f"ChatGPT {label}: would raft (snapshot before reopen, upload to {s.cfg.raft.remote})")
 
 
@@ -441,7 +441,7 @@ def _reopen(s, rep, was_open, results):
                 except Exception as exc:
                     hook = {"ok": False, "error": str(exc)}
                 rep.setdefault("raft", {})[label] = hook
-            if "chatgpt" in apps and s.cfg.raft.enabled and s.cfg.raft.chatgpt_db:
+            if "chatgpt" in apps and s.cfg.raft.enabled and s.cfg.raft.chatgpt_sources():
                 result = results.get("chatgpt", {}).get(label, {})
                 verification = result.get("rollback_verify", {}) if "rollback" in result else result.get("verify", {})
                 smoke = verification.get("smoke", {})

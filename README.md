@@ -308,20 +308,30 @@ configured launch behavior. No installed tool or machine configuration is
 changed by this policy.
 
 The optional `[raft]` hook takes the configured shared backup lock before
-checking that database's owning app and descriptor holders, then creates a
-private local SQLite snapshot. Raft work stops per database: a running Cursor
-does not block ChatGPT's snapshot, and a running ChatGPT does not block
-Cursor's. The file is never copied while its own app is running. It checks
-holders again and discards a raced or failed snapshot. Hook errors and
-timeouts cannot suppress reopening for apps whose launch policy permits it;
-`no_launch` apps remain closed throughout.
+checking that set's owning app and descriptor holders, then creates a
+private local SQLite snapshot. Raft work stops per owning app: a running
+Cursor does not block ChatGPT's snapshot, and a running ChatGPT does not
+block Cursor's. ChatGPT's configured files are one set — if ChatGPT is
+running, the whole set is skipped. Files are never copied while their own
+app is running. It checks holders again and discards a raced or failed
+snapshot. Hook errors and timeouts cannot suppress reopening for apps whose
+launch policy permits it; `no_launch` apps remain closed throughout.
 
 Cursor's raft still applies only when Cursor reopening is explicitly permitted
-and a real smoke check passed. ChatGPT's raft is opt-in via `raft.chatgpt_db`
-(there is no silent path default; official Linux docs do not publish the
-SQLite location) and also runs when ChatGPT is left closed, so state can move
-without Twin Update starting the app. The observed Codex Desktop state file is
-`~/.codex/state_5.sqlite`; the `state_N` name is versioned and may change.
+and a real smoke check passed. ChatGPT's raft is opt-in via `raft.chatgpt_dbs`
+(or the older one-file key `raft.chatgpt_db`) and also runs when ChatGPT is
+left closed, so state can move without Twin Update starting the app. Official
+Linux docs do not publish the SQLite locations. Observed files under
+`~/.codex` (versioned names may change):
+
+- `state_5.sqlite`
+- `thread_history_1.sqlite`
+- `memories_1.sqlite`
+- `memories_v2_1.sqlite`
+- `goals_1.sqlite`
+- `queue_1.sqlite`
+
+`logs_2.sqlite` is optional and is left out of the example set by default.
 `~/Documents/Codex` is not read or written by this hook.
 
 The snapshot is queued to a bounded user service after reopen. Its helper takes
@@ -335,8 +345,10 @@ files 0600. Snapshot data and external adapters are never included in this repo.
 the actual nightly-backup lock; do not invent a second lock. `remote_command`
 must resolve to the installed executable's absolute path for the background
 service; the interpreter is also absolute. A custom `--config` path is retained.
-Set `raft.chatgpt_db` to the ChatGPT/Codex SQLite file when that raft should
-run; `raft.chatgpt_upload_prefix` defaults to `chatgpt-liferaft`.
+Set `raft.chatgpt_dbs` to the ChatGPT/Codex SQLite files when that raft should
+run (`raft.chatgpt_db` still works as a one-item list).
+`raft.chatgpt_upload_prefix` defaults to `chatgpt-liferaft`. The files are
+snapshotted together in one lock hold.
 
 External snapshot-only adapter protocol 1 is required in `script_dir`:
 
