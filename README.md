@@ -312,7 +312,9 @@ checking that set's owning app and descriptor holders, then creates a
 private local SQLite snapshot. Raft work stops per owning app: a running
 Cursor does not block ChatGPT's snapshot, and a running ChatGPT does not
 block Cursor's. ChatGPT's configured files are one set — if ChatGPT is
-running, the whole set is skipped. Files are never copied while their own
+running, the whole set is skipped. Leftover processes under `~/.codex`
+(including the bundled Chrome `extension-host` after the app is quit)
+count as ChatGPT still running. Files are never copied while their own
 app is running. It checks holders again and discards a raced or failed
 snapshot. Hook errors and timeouts cannot suppress reopening for apps whose
 launch policy permits it; `no_launch` apps remain closed throughout.

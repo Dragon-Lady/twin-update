@@ -528,3 +528,17 @@ class ChatgptRaftTests(unittest.TestCase):
         result = e.pre_reopen_hook("chatgpt", True)
         self.assertEqual(result["skipped"], "ChatGPT still running")
         self.assertFalse(any("--source" in (c[0] if c else []) for c in e.sys.calls))
+
+    def test_codex_home_extension_host_skips_set(self):
+        t = Twin(); e = enabled_chatgpt(t)
+        host = (e.sys.home() +
+                "/.codex/plugins/cache/openai-bundled/chrome/latest/"
+                "extension-host/linux/x64/extension-host")
+        e.sys.proc_table[77] = Proc(77, 1, host, "extension-host", 9)
+        result = e.pre_reopen_hook("chatgpt", True)
+        self.assertEqual(result["skipped"], "ChatGPT still running")
+        self.assertEqual(result["processes"][0]["pid"], 77)
+        self.assertFalse(any("--source" in (c[0] if c else []) for c in e.sys.calls))
+        with patch.object(e.sys, "run", side_effect=snapshot_runner(e)):
+            cursor = e.pre_reopen_hook("cursor", True)
+        self.assertTrue(cursor["ok"], cursor)

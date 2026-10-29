@@ -93,6 +93,30 @@ def _snapshot(engine, value):
     return path
 
 
+def _codex_home_root(engine):
+    return os.path.join(engine.sys.home(), ".codex") + os.sep
+
+
+def _under_codex_home(engine, proc):
+    root = _codex_home_root(engine)
+    for value in (proc.exe, *proc.argv[:2]):
+        if os.path.isabs(value) and engine.sys.realpath(value).startswith(root):
+            return True
+    return False
+
+
+def _active_pids(engine, app_name, found):
+    """Pids that block this app's raft. ChatGPT includes leftover ~/.codex workers."""
+    pids = set(found["tree"])
+    if app_name != "chatgpt":
+        return pids
+    own = engine._own_tree(found["procs"])
+    for pid, proc in found["procs"].items():
+        if pid not in own and _under_codex_home(engine, proc):
+            pids.add(pid)
+    return pids
+
+
 def pre_reopen(engine, app_name, smoke_ok):
     cfg = engine.cfg.raft
     skip = lambda why, **kw: {"ok": False, "skipped": why, **kw}
@@ -120,7 +144,7 @@ def pre_reopen(engine, app_name, smoke_ok):
         for p in old[max(0, cfg.keep - 1):]:
             shutil.rmtree(p)
         found = engine.app_tree(engine.cfg.apps[target["name"]])
-        tree = found["tree"]
+        tree = _active_pids(engine, target["name"], found)
         if tree:
             display = engine.cfg.apps[target["name"]].display
             return skip(f"{display} still running", processes=[{"pid": pid, "comm": found["procs"][pid].comm} for pid in tree])
@@ -138,7 +162,8 @@ def pre_reopen(engine, app_name, smoke_ok):
                                     timeout=cfg.snapshot_timeout_s)
             if not result.ok:
                 raise RuntimeError("snapshot timed out" if result.rc == 124 else "snapshot failed")
-        if engine.sys.fd_holders(paths) or engine.app_tree(engine.cfg.apps[target["name"]])["tree"]:
+        found = engine.app_tree(engine.cfg.apps[target["name"]])
+        if engine.sys.fd_holders(paths) or _active_pids(engine, target["name"], found):
             raise RuntimeError("profile became active during snapshot")
         _snapshot(engine, path)
         size = 0

@@ -18,7 +18,9 @@
   `thread_history_1.sqlite`, `memories_1.sqlite`, `memories_v2_1.sqlite`,
   `goals_1.sqlite`, `queue_1.sqlite`. `logs_2.sqlite` is optional and
   omitted from the example set. Snapshots are not read from or written
-  under `~/Documents/Codex`.
+  under `~/Documents/Codex`. Leftover processes under `~/.codex`
+  (bundled Chrome `extension-host` included) count as ChatGPT still
+  running, so the whole set is skipped while any of them is alive.
 
 ## 0.4.1 - 2026-10-25
 
