@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import patch
 
 from fakes import CONFIG, FakeUI, Twin
-from test_twin_update import CUR, standard
+from test_twin_update import CUR, GPT, standard
 from twin_update.config import ConfigError, Raft, load
 from twin_update import orchestrator, raft
 from twin_update.system import Proc, Result, System
@@ -43,7 +43,19 @@ def snapshot_runner(engine, rc=0):
 class LaunchPolicy(unittest.TestCase):
     def test_default_blocks_cursor_launch(self):
         cfg = load(text=CONFIG.format(keep="[]", fallback="[]").replace("no_launch = []\n", ""))
-        self.assertEqual(cfg.no_launch, ["cursor"])
+        self.assertEqual(cfg.no_launch, ["cursor", "chatgpt"])
+
+    def test_default_blocks_chatgpt_launch(self):
+        t = Twin(); standard(t)
+        for engine in t.eng.values():
+            engine.cfg.no_launch = ["chatgpt"]
+        t.sys["machine-a"].add_app_procs(GPT)
+        result = orchestrator.run(t.session(FakeUI()), ["chatgpt"], dry=False)
+        self.assertEqual(result["result"], "ok")
+        self.assertTrue(any(e[1] == "TERM" for e in t.events))
+        self.assertTrue(any(e[1] == "INSTALL" for e in t.events))
+        self.assertFalse(any(e[1] == "LAUNCH" for e in t.events))
+        self.assertIn("skipped", result["reopen"]["machine-a"]["chatgpt"])
 
     def test_open_cursor_closes_updates_and_stays_closed(self):
         t = Twin(); standard(t)
@@ -363,3 +375,96 @@ class RaftTests(unittest.TestCase):
             for stream, fd in streams:
                 stream.close()
                 os.close(fd)
+
+
+def enabled_chatgpt(t):
+    e = enabled(t)
+    for engine in t.eng.values():
+        db = Path(engine.sys.home()) / ".codex" / "state_5.sqlite"
+        db.parent.mkdir(parents=True, exist_ok=True)
+        db.write_bytes(b"live")
+        engine.cfg.raft.chatgpt_db = str(db)
+    return e
+
+
+class ChatgptRaftTests(unittest.TestCase):
+    def test_unconfigured_stays_disabled(self):
+        t = Twin(); e = enabled(t)
+        self.assertEqual(e.pre_reopen_hook("chatgpt", True)["skipped"], "disabled")
+        self.assertEqual(e.sys.calls, [])
+
+    def test_lock_held_skips_without_inspecting(self):
+        t = Twin(); e = enabled_chatgpt(t)
+        with patch.object(e.sys, "try_flock", return_value=None), \
+             patch.object(e, "app_tree", side_effect=AssertionError):
+            self.assertEqual(e.pre_reopen_hook("chatgpt", True)["skipped"], "raft lock busy")
+
+    def test_app_running_skips(self):
+        t = Twin(); e = enabled_chatgpt(t)
+        e.sys.add_app_procs(GPT)
+        result = e.pre_reopen_hook("chatgpt", True)
+        self.assertEqual(result["skipped"], "ChatGPT still running")
+        self.assertFalse(any("--source" in (c[0] if c else []) for c in e.sys.calls))
+
+    def test_app_not_running_syncs(self):
+        t = Twin(); e = enabled_chatgpt(t)
+        with patch.object(e.sys, "run", side_effect=snapshot_runner(e)):
+            result = e.pre_reopen_hook("chatgpt", True)
+        self.assertTrue(result["ok"], result)
+        path = Path(result["snapshot"])
+        self.assertTrue(path.name.startswith("chatgpt-snapshot-"))
+        self.assertEqual((path / "state_5.sqlite").stat().st_mode & 0o777, 0o600)
+        started = e.raft_upload_start(str(path))
+        self.assertTrue(started["started"])
+        self.assertTrue(started["unit"].startswith("twin-raft-chatgpt-"))
+
+    def test_no_auto_launch_after_update(self):
+        t = Twin(); standard(t); e = enabled_chatgpt(t)
+        for engine in t.eng.values():
+            engine.cfg.no_launch = ["chatgpt"]
+        t.sys["machine-a"].add_app_procs(GPT)
+        with patch.object(e.sys, "run", side_effect=snapshot_runner(e)):
+            result = orchestrator.run(t.session(FakeUI()), ["chatgpt"], dry=False)
+        self.assertEqual(result["result"], "ok")
+        launched = [ev[2] for ev in t.events if ev[1] == "LAUNCH"]
+        self.assertTrue(all(str(u).startswith("twin-raft-") for u in launched), launched)
+        self.assertIn("skipped", result["reopen"]["machine-a"]["chatgpt"])
+        hook = result["raft_chatgpt"][e.label]
+        self.assertTrue(hook["ok"], hook)
+
+    def test_cursor_running_does_not_block_chatgpt(self):
+        t = Twin(); e = enabled_chatgpt(t)
+        e.sys.add_app_procs(CUR)
+        with patch.object(e.sys, "run", side_effect=snapshot_runner(e)):
+            result = e.pre_reopen_hook("chatgpt", True)
+        self.assertTrue(result["ok"], result)
+        cursor = e.pre_reopen_hook("cursor", True)
+        self.assertEqual(cursor["skipped"], "Cursor still running")
+
+    def test_chatgpt_running_does_not_block_cursor(self):
+        t = Twin(); e = enabled_chatgpt(t)
+        e.sys.add_app_procs(GPT)
+        with patch.object(e.sys, "run", side_effect=snapshot_runner(e)):
+            cursor = e.pre_reopen_hook("cursor", True)
+        self.assertTrue(cursor["ok"], cursor)
+        self.assertEqual(e.pre_reopen_hook("chatgpt", True)["skipped"], "ChatGPT still running")
+
+    def test_no_launch_still_rafts_chatgpt(self):
+        t = Twin(); e = enabled_chatgpt(t)
+        e.cfg.no_launch = ["chatgpt"]
+        with patch.object(e.sys, "run", side_effect=snapshot_runner(e)):
+            result = e.pre_reopen_hook("chatgpt", True)
+        self.assertTrue(result["ok"], result)
+
+    def test_upload_uses_chatgpt_prefix(self):
+        t = Twin(); e = enabled_chatgpt(t)
+        with patch.object(e.sys, "run", side_effect=snapshot_runner(e)):
+            snap = e.pre_reopen_hook("chatgpt", True)["snapshot"]
+        payload = Path(snap) / "payload"; payload.mkdir(); (payload / "archive").write_text("invented")
+        calls = []
+        def run(argv, **kw):
+            calls.append(argv); return Result(0)
+        with patch.object(e.sys, "run", side_effect=run):
+            self.assertTrue(raft.upload(e, snap)["ok"])
+        self.assertRegex(calls[3][3], r"backup:archive/chatgpt-liferaft-machine-a-\d{8}T\d{6}Z-")
+        self.assertFalse(Path(snap).exists())

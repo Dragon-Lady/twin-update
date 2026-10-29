@@ -22,7 +22,7 @@ lock_paths = []
 
 [apps]
 enabled = ["cursor", "chatgpt", "grok-bot"]
-no_launch = ["cursor"]  # close/update if open, then leave closed; no launch smoke test
+no_launch = ["cursor", "chatgpt"]  # close/update if open, then leave closed; no launch smoke test
 keep_holds = []          # apps whose apt holds twin-update must never clear
 
 # Override or add apps (package must be an apt package):
@@ -55,6 +55,10 @@ script_dir = "~/.local/share/twin-update/raft"
 # lock_path = "~/.local/state/example-backup/backup.lock"
 # remote = "backup:archive"
 upload_prefix = "cursor-liferaft"
+# ChatGPT/Codex desktop SQLite path. Official Linux docs do not publish it.
+# Observed Codex Desktop state DB (versioned filename, may change):
+# chatgpt_db = "~/.codex/state_5.sqlite"
+chatgpt_upload_prefix = "chatgpt-liferaft"
 snapshot_timeout_s = 120
 upload_timeout_s = 1200
 keep = 2

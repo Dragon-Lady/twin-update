@@ -66,6 +66,10 @@ class Raft:
     keep: int = 2
     upload_prefix: str = "cursor-liferaft"
     machines: list[str] = field(default_factory=list)
+    # ChatGPT/Codex desktop SQLite path. Empty means ChatGPT raft is off.
+    # Linux vendor docs do not publish this path; set it explicitly.
+    chatgpt_db: str = ""
+    chatgpt_upload_prefix: str = "chatgpt-liferaft"
 
 
 @dataclass
@@ -87,7 +91,7 @@ class Config:
     grace_launches: int = 2
     # Apps twin-update must never start: no smoke launch, no reopen after a run.
     # They are still closed gracefully before an update and still updated.
-    no_launch: list[str] = field(default_factory=lambda: ["cursor"])
+    no_launch: list[str] = field(default_factory=lambda: ["cursor", "chatgpt"])
     raft: Raft = field(default_factory=Raft)
     config_path: str = ""
 
@@ -170,7 +174,7 @@ def load(path: str | None = None, home: str | None = None, text: str | None = No
     for n in enabled:
         if n not in apps:
             raise ConfigError(f"unknown app in enabled: {n}")
-    no_launch = list(asec.get("no_launch", ["cursor"]))
+    no_launch = list(asec.get("no_launch", ["cursor", "chatgpt"]))
     for n in no_launch:
         if n not in apps:
             raise ConfigError(f"unknown app in no_launch: {n}")
@@ -183,11 +187,13 @@ def load(path: str | None = None, home: str | None = None, text: str | None = No
     raft = Raft(**rs)
     if not isinstance(raft.enabled, bool):
         raise ConfigError("raft.enabled must be boolean")
-    for key in ("script_dir", "remote", "lock_path", "upload_prefix"):
+    for key in ("script_dir", "remote", "lock_path", "upload_prefix", "chatgpt_db",
+                "chatgpt_upload_prefix"):
         if not isinstance(getattr(raft, key), str):
             raise ConfigError(f"raft.{key} must be text")
     raft.script_dir = _expand(raft.script_dir or "~/.local/share/twin-update/raft", home)
     raft.lock_path = _expand(raft.lock_path, home)
+    raft.chatgpt_db = _expand(raft.chatgpt_db, home) if raft.chatgpt_db else ""
     for key, limit in (("snapshot_timeout_s", 600), ("upload_timeout_s", 86400), ("keep", 100)):
         value = getattr(raft, key)
         if type(value) is not int or not 1 <= value <= limit:
@@ -196,8 +202,12 @@ def load(path: str | None = None, home: str | None = None, text: str | None = No
         raise ConfigError("raft.machines must contain configured machine labels")
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", raft.upload_prefix):
         raise ConfigError("raft.upload_prefix must be a simple name")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", raft.chatgpt_upload_prefix):
+        raise ConfigError("raft.chatgpt_upload_prefix must be a simple name")
     if raft.enabled and (not os.path.isabs(raft.lock_path) or not raft.remote or raft.remote.startswith("-")):
         raise ConfigError("enabled raft requires an absolute lock_path and an explicit remote")
+    if raft.enabled and raft.chatgpt_db and (not os.path.isabs(raft.chatgpt_db) or raft.chatgpt_db.startswith("-")):
+        raise ConfigError("raft.chatgpt_db must be an absolute path")
     return Config(
         machines=machines, apps=apps, enabled=enabled,
         keep_holds=list(asec.get("keep_holds", [])),

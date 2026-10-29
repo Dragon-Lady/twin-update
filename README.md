@@ -220,7 +220,8 @@ question is treated as no: apps reopen, the failed version stays.
 
 A rollback restores **program files, not app data**. If a new version migrated
 its settings or databases, keep your own data backups. Twin Update never opens,
-copies or modifies app databases.
+copies or modifies app databases unless the optional `[raft]` hook is enabled
+(see below).
 
 ## Install (each machine)
 
@@ -297,21 +298,31 @@ have left a version installed). If apt was mid-install, recover with
 
 Apache License 2.0. See [LICENSE](LICENSE).
 
-## Cursor launch policy and optional life-raft
+## Cursor and ChatGPT launch policy and optional life-raft
 
-Cursor is in `apps.no_launch` by default. If it is open when an update or rollback
-needs to close it, it is closed gracefully and updated, then left closed. Neither
-the smoke check nor reopen starts it. The opt-in raft hook never overrides this
-policy. Existing per-app no-launch lists are preserved. Other apps retain their
+Cursor and ChatGPT desktop are in `apps.no_launch` by default. If either is
+open when an update or rollback needs to close it, it is closed gracefully and
+updated, then left closed. Neither the smoke check nor reopen starts it.
+Existing per-app no-launch lists are preserved. Other apps retain their
 configured launch behavior. No installed tool or machine configuration is
 changed by this policy.
 
-The optional `[raft]` hook applies only when Cursor reopening is explicitly
-permitted, a real smoke check passed, and the machine is allowed. It takes the
-configured shared backup lock before checking processes and database holders,
-then creates a private local SQLite snapshot. It checks holders again and discards
-a raced or failed snapshot. Hook errors and timeouts cannot suppress reopening
-for apps whose policy permits it; `no_launch` apps remain closed throughout.
+The optional `[raft]` hook takes the configured shared backup lock before
+checking that database's owning app and descriptor holders, then creates a
+private local SQLite snapshot. Raft work stops per database: a running Cursor
+does not block ChatGPT's snapshot, and a running ChatGPT does not block
+Cursor's. The file is never copied while its own app is running. It checks
+holders again and discards a raced or failed snapshot. Hook errors and
+timeouts cannot suppress reopening for apps whose launch policy permits it;
+`no_launch` apps remain closed throughout.
+
+Cursor's raft still applies only when Cursor reopening is explicitly permitted
+and a real smoke check passed. ChatGPT's raft is opt-in via `raft.chatgpt_db`
+(there is no silent path default; official Linux docs do not publish the
+SQLite location) and also runs when ChatGPT is left closed, so state can move
+without Twin Update starting the app. The observed Codex Desktop state file is
+`~/.codex/state_5.sqlite`; the `state_N` name is versioned and may change.
+`~/Documents/Codex` is not read or written by this hook.
 
 The snapshot is queued to a bounded user service after reopen. Its helper takes
 the same lock with a 30-second wait, logs lock/start/upload failures, and retains
@@ -324,6 +335,8 @@ files 0600. Snapshot data and external adapters are never included in this repo.
 the actual nightly-backup lock; do not invent a second lock. `remote_command`
 must resolve to the installed executable's absolute path for the background
 service; the interpreter is also absolute. A custom `--config` path is retained.
+Set `raft.chatgpt_db` to the ChatGPT/Codex SQLite file when that raft should
+run; `raft.chatgpt_upload_prefix` defaults to `chatgpt-liferaft`.
 
 External snapshot-only adapter protocol 1 is required in `script_dir`:
 
