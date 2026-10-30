@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Recheck Cursor main-process presence after each helper CPU sample so a
+  startup during the final sample prevents helper termination.
+- Keep `close-helpers --json` stdout limited to its JSON report, including
+  when helpers generate diagnostics.
+
 ## 0.5.2 - 2026-10-30
 
 - Leftover Cursor sandbox helpers (`cursorsandbox` with parent PID 1, left

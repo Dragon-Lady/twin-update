@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from contextlib import redirect_stdout
+import io
 import json
 import os
 import signal
@@ -16,7 +18,7 @@ from twin_update.helpers import (ACTIVE, ORPHANED_IDLE, UNKNOWN, HelperFacts, cl
 from twin_update.system import Proc, System
 
 SPEC = helpers.SPECS["cursor"]
-HOME = "/home/tanya"
+HOME = "/home/example"
 LOG = HOME + "/.config/Cursor/logs/20261029T191759/main.log"
 
 
@@ -251,6 +253,30 @@ class CloseHelpers(unittest.TestCase):
         self.assertTrue(all("main app running" in r["reasons"] for r in rep["helpers"]))
         self.assertEqual(s.term_calls, [])
 
+    def test_cursor_starting_during_either_sample_prevents_signals(self):
+        for sample in (1, 2):
+            with self.subTest(sample=sample):
+                t = Twin()
+                pids = orphans(t, n=2)
+                system = t.sys["machine-b"]
+                original_sleep = system.sleep
+                sleeps = 0
+
+                def start_cursor_during_sample(seconds):
+                    nonlocal sleeps
+                    original_sleep(seconds)
+                    sleeps += 1
+                    if sleeps == sample:
+                        system.proc_table[50] = Proc(
+                            50, 1, "/usr/share/cursor/cursor", "cursor", 10)
+
+                with mock.patch.object(system, "sleep", side_effect=start_cursor_during_sample):
+                    report = t.eng["machine-b"].close_helpers("cursor")
+                self.assertEqual(report["status"], helpers.HELPERS_ACTIVE)
+                self.assertEqual(report["counts"][ACTIVE], len(pids))
+                self.assertEqual(system.term_calls, [])
+                self.assertTrue(all(pid in system.proc_table for pid in pids))
+
     def test_dry_run_reports_without_signals(self):
         t = Twin()
         orphans(t)
@@ -292,6 +318,31 @@ class CloseHelpersCli(unittest.TestCase):
         rc = cli.main(["--config", self._cfg(t), "close-helpers"], ui=ui, system=t.sys["machine-a"])
         self.assertEqual(rc, 0, ui.lines)
         self.assertTrue(any("now closed" in l for l in ui.lines))
+
+    def test_json_stdout_is_one_report_when_helpers_generate_diagnostics(self):
+        for state in ("idle", "active", "confined"):
+            with self.subTest(state=state):
+                t = Twin()
+                pids = orphans(t, label="machine-a", n=2)
+                system = t.sys["machine-a"]
+                if state == "active":
+                    system.cpu_growth[pids[0]] = 2
+                    system.cpu_growth[pids[1]] = 2
+                elif state == "confined":
+                    system.self_label = "restricted (enforce)"
+                stdout = io.StringIO()
+                with redirect_stdout(stdout):
+                    rc = cli.main(["--config", self._cfg(t), "close-helpers", "--json"],
+                                  ui=cli.ConsoleUI(), system=system)
+                report = json.loads(stdout.getvalue())
+                expected = {"idle": helpers.HELPERS_CLEARED,
+                            "active": helpers.HELPERS_ACTIVE,
+                            "confined": helpers.HELPERS_NEED_USER_SESSION}
+                self.assertEqual(report["status"], expected[state])
+                self.assertEqual(rc, 0 if state == "idle" else 1)
+                self.assertNotIn("SECRET-TOKEN", stdout.getvalue())
+                if state != "idle":
+                    self.assertEqual(system.term_calls, [])
 
     def test_cli_need_session_exit_1(self):
         t = Twin()

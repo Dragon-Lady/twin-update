@@ -582,6 +582,9 @@ class Engine:
             reapers = set()
         facts = helpers.collect(self.sys, pids, {p: procs[p].argv for p in pids},
                                 self.cfg.helper_sample_s)
+        # Sampling sleeps: a main process may have started while we waited.
+        # Either observation of an owner keeps its helpers protected.
+        main = self._main_present(app, spec, self.sys.procs()) or main
         out = []
         for f in facts:
             r = helpers.classify(f, spec, main_present=main, reapers=reapers,
