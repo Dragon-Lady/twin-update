@@ -13,6 +13,8 @@ from datetime import datetime, timezone
 SCRIPTS = ("backup_cursor.py", "export_cursor_return.py", "verify_cursor_payload.py",
            "make_return_manifest.py")
 
+_CHATGPT_SNAP_PREFIX = "chatgpt-snapshot-"
+
 
 def _root(engine):
     root = Path(engine.cfg.state_dir) / "raft"
@@ -38,10 +40,51 @@ def _adapters(engine):
     return root
 
 
+def _snap_kind(path):
+    name = Path(path).name
+    if name.startswith(_CHATGPT_SNAP_PREFIX):
+        return "chatgpt"
+    if name.startswith("snapshot-"):
+        return "cursor"
+    return None
+
+
+def _target(engine, app_name):
+    """Per-app raft target. Cursor stays the built-in path; ChatGPT is opt-in."""
+    cfg = engine.cfg.raft
+    if app_name == "cursor":
+        return {
+            "name": "cursor",
+            "sources": [Path(engine.sys.home()) / ".config/Cursor/User/globalStorage/state.vscdb"],
+            "snap_prefix": "snapshot-",
+            "unit_prefix": "twin-raft-cursor-",
+            "upload_prefix": cfg.upload_prefix,
+        }
+    sources = [Path(p) for p in cfg.chatgpt_sources()]
+    if app_name == "chatgpt" and sources:
+        return {
+            "name": "chatgpt",
+            "sources": sources,
+            "snap_prefix": _CHATGPT_SNAP_PREFIX,
+            "unit_prefix": "twin-raft-chatgpt-",
+            "upload_prefix": cfg.chatgpt_upload_prefix,
+        }
+    return None
+
+
+def _snap_suffix(path):
+    kind = _snap_kind(path)
+    if kind == "cursor":
+        return path.name[9:]
+    if kind == "chatgpt":
+        return path.name[len(_CHATGPT_SNAP_PREFIX):]
+    raise ValueError("invalid snapshot path")
+
+
 def _snapshot(engine, value):
     path = Path(value)
     root = _root(engine).resolve()
-    if path.is_symlink() or path.parent.resolve() != root or not path.name.startswith("snapshot-") or not path.is_dir():
+    if path.is_symlink() or path.parent.resolve() != root or _snap_kind(path) is None or not path.is_dir():
         raise ValueError("invalid snapshot path")
     for entry in path.rglob("*"):
         if entry.is_symlink():
@@ -50,12 +93,39 @@ def _snapshot(engine, value):
     return path
 
 
+def _codex_home_root(engine):
+    return os.path.join(engine.sys.home(), ".codex") + os.sep
+
+
+def _under_codex_home(engine, proc):
+    root = _codex_home_root(engine)
+    for value in (proc.exe, *proc.argv[:2]):
+        if os.path.isabs(value) and engine.sys.realpath(value).startswith(root):
+            return True
+    return False
+
+
+def _active_pids(engine, app_name, found):
+    """Pids that block this app's raft. ChatGPT includes leftover ~/.codex workers."""
+    pids = set(found["tree"])
+    if app_name != "chatgpt":
+        return pids
+    own = engine._own_tree(found["procs"])
+    for pid, proc in found["procs"].items():
+        if pid not in own and _under_codex_home(engine, proc):
+            pids.add(pid)
+    return pids
+
+
 def pre_reopen(engine, app_name, smoke_ok):
     cfg = engine.cfg.raft
     skip = lambda why, **kw: {"ok": False, "skipped": why, **kw}
-    if app_name != "cursor" or not cfg.enabled:
+    target = _target(engine, app_name)
+    if target is None or not cfg.enabled:
         return skip("disabled")
-    if app_name in engine.cfg.no_launch:
+    # Cursor keeps the historical gate: no_launch skips the snapshot. ChatGPT
+    # still never launches; it snapshots the closed profile so state can move.
+    if app_name == "cursor" and app_name in engine.cfg.no_launch:
         return skip("no_launch: left closed")
     if cfg.machines and engine.label not in cfg.machines:
         return skip("machine excluded")
@@ -68,35 +138,41 @@ def pre_reopen(engine, app_name, smoke_ok):
         if lock is None:
             return skip("raft lock busy")
         root = _root(engine)
-        old = sorted((p for p in root.glob("snapshot-*") if p.is_dir() and not p.is_symlink()),
+        old = sorted((p for p in root.glob(target["snap_prefix"] + "*") if p.is_dir() and not p.is_symlink()),
                      key=lambda p: p.stat().st_mtime, reverse=True)
         # Reserve one slot for the next snapshot. Uploads hold this same lock.
         for p in old[max(0, cfg.keep - 1):]:
             shutil.rmtree(p)
-        found = engine.app_tree(engine.cfg.apps["cursor"])
-        tree = found["tree"]
+        found = engine.app_tree(engine.cfg.apps[target["name"]])
+        tree = _active_pids(engine, target["name"], found)
         if tree:
-            return skip("Cursor still running", processes=[{"pid": pid, "comm": found["procs"][pid].comm} for pid in tree])
-        source = Path(engine.sys.home()) / ".config/Cursor/User/globalStorage/state.vscdb"
-        paths = [str(source) + suffix for suffix in ("", "-wal", "-shm")]
+            display = engine.cfg.apps[target["name"]].display
+            return skip(f"{display} still running", processes=[{"pid": pid, "comm": found["procs"][pid].comm} for pid in tree])
+        sources = target["sources"]
+        paths = [str(source) + suffix for source in sources for suffix in ("", "-wal", "-shm")]
         holders = engine.sys.fd_holders(paths)
         if holders:
             return skip("holder check incomplete" if any(h.get("unreadable") for h in holders) else "database holders", holders=holders)
         scripts = _adapters(engine)
-        path = Path(tempfile.mkdtemp(prefix="snapshot-", dir=root))
+        path = Path(tempfile.mkdtemp(prefix=target["snap_prefix"], dir=root))
         path.chmod(0o700)
-        result = engine.sys.run([sys.executable, str(scripts / SCRIPTS[0]),
-                                 "--source", str(source), "--output", str(path / "state.vscdb")],
-                                timeout=cfg.snapshot_timeout_s)
-        if not result.ok:
-            raise RuntimeError("snapshot timed out" if result.rc == 124 else "snapshot failed")
-        if engine.sys.fd_holders(paths) or engine.app_tree(engine.cfg.apps["cursor"])["tree"]:
+        for source in sources:
+            result = engine.sys.run([sys.executable, str(scripts / SCRIPTS[0]),
+                                     "--source", str(source), "--output", str(path / source.name)],
+                                    timeout=cfg.snapshot_timeout_s)
+            if not result.ok:
+                raise RuntimeError("snapshot timed out" if result.rc == 124 else "snapshot failed")
+        found = engine.app_tree(engine.cfg.apps[target["name"]])
+        if engine.sys.fd_holders(paths) or _active_pids(engine, target["name"], found):
             raise RuntimeError("profile became active during snapshot")
         _snapshot(engine, path)
-        db = path / "state.vscdb"
-        if not db.is_file() or db.stat().st_size == 0:
-            raise RuntimeError("snapshot is empty")
-        return {"ok": True, "snapshot": str(path), "size": db.stat().st_size}
+        size = 0
+        for source in sources:
+            db = path / source.name
+            if not db.is_file() or db.stat().st_size == 0:
+                raise RuntimeError("snapshot is empty")
+            size += db.stat().st_size
+        return {"ok": True, "snapshot": str(path), "size": size}
     except Exception as exc:
         if path is not None:
             shutil.rmtree(path, ignore_errors=True)
@@ -115,7 +191,9 @@ def upload_start(engine, snapshot):
         command = Path(os.path.expanduser(engine.cfg.machines[engine.label].remote_command))
         if not command.is_absolute() or not command.is_file():
             raise ValueError("remote_command must be an absolute installed executable path")
-        unit = f"twin-raft-cursor-{int(engine.sys.now())}-{path.name[9:]}"
+        target = _target(engine, _snap_kind(path))
+        unit_prefix = target["unit_prefix"] if target else "twin-raft-cursor-"
+        unit = f"{unit_prefix}{int(engine.sys.now())}-{_snap_suffix(path)}"
         config_args = ["--config", engine.cfg.config_path] if engine.cfg.config_path else []
         result = engine.sys.run(["systemd-run", "--user", "--quiet", "--collect", f"--unit={unit}",
                                  "-p", f"RuntimeMaxSec={cfg.upload_timeout_s}", "-p", "UMask=0077",
@@ -157,7 +235,9 @@ def upload(engine, snapshot):
             raise RuntimeError("empty payload; snapshot retained")
         label = re.sub(r"[^A-Za-z0-9_-]", "-", engine.label)
         stamp = datetime.fromtimestamp(engine.sys.now(), timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        target = cfg.remote.rstrip("/") + f"/{cfg.upload_prefix}-{label}-{stamp}-{path.name[9:]}"
+        spec = _target(engine, _snap_kind(path))
+        prefix = spec["upload_prefix"] if spec else cfg.upload_prefix
+        target = cfg.remote.rstrip("/") + f"/{prefix}-{label}-{stamp}-{_snap_suffix(path)}"
         for op in ("copy", "check"):
             args = ["rclone", op, str(payload), target]
             if op == "check":

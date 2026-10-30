@@ -220,7 +220,8 @@ question is treated as no: apps reopen, the failed version stays.
 
 A rollback restores **program files, not app data**. If a new version migrated
 its settings or databases, keep your own data backups. Twin Update never opens,
-copies or modifies app databases.
+copies or modifies app databases unless the optional `[raft]` hook is enabled
+(see below).
 
 ## Install (each machine)
 
@@ -297,21 +298,43 @@ have left a version installed). If apt was mid-install, recover with
 
 Apache License 2.0. See [LICENSE](LICENSE).
 
-## Cursor launch policy and optional life-raft
+## Cursor and ChatGPT launch policy and optional life-raft
 
-Cursor is in `apps.no_launch` by default. If it is open when an update or rollback
-needs to close it, it is closed gracefully and updated, then left closed. Neither
-the smoke check nor reopen starts it. The opt-in raft hook never overrides this
-policy. Existing per-app no-launch lists are preserved. Other apps retain their
+Cursor and ChatGPT desktop are in `apps.no_launch` by default. If either is
+open when an update or rollback needs to close it, it is closed gracefully and
+updated, then left closed. Neither the smoke check nor reopen starts it.
+Existing per-app no-launch lists are preserved. Other apps retain their
 configured launch behavior. No installed tool or machine configuration is
 changed by this policy.
 
-The optional `[raft]` hook applies only when Cursor reopening is explicitly
-permitted, a real smoke check passed, and the machine is allowed. It takes the
-configured shared backup lock before checking processes and database holders,
-then creates a private local SQLite snapshot. It checks holders again and discards
-a raced or failed snapshot. Hook errors and timeouts cannot suppress reopening
-for apps whose policy permits it; `no_launch` apps remain closed throughout.
+The optional `[raft]` hook takes the configured shared backup lock before
+checking that set's owning app and descriptor holders, then creates a
+private local SQLite snapshot. Raft work stops per owning app: a running
+Cursor does not block ChatGPT's snapshot, and a running ChatGPT does not
+block Cursor's. ChatGPT's configured files are one set — if ChatGPT is
+running, the whole set is skipped. Leftover processes under `~/.codex`
+(including the bundled Chrome `extension-host` after the app is quit)
+count as ChatGPT still running. Files are never copied while their own
+app is running. It checks holders again and discards a raced or failed
+snapshot. Hook errors and timeouts cannot suppress reopening for apps whose
+launch policy permits it; `no_launch` apps remain closed throughout.
+
+Cursor's raft still applies only when Cursor reopening is explicitly permitted
+and a real smoke check passed. ChatGPT's raft is opt-in via `raft.chatgpt_dbs`
+(or the older one-file key `raft.chatgpt_db`) and also runs when ChatGPT is
+left closed, so state can move without Twin Update starting the app. Official
+Linux docs do not publish the SQLite locations. Observed files under
+`~/.codex` (versioned names may change):
+
+- `state_5.sqlite`
+- `thread_history_1.sqlite`
+- `memories_1.sqlite`
+- `memories_v2_1.sqlite`
+- `goals_1.sqlite`
+- `queue_1.sqlite`
+
+`logs_2.sqlite` is optional and is left out of the example set by default.
+`~/Documents/Codex` is not read or written by this hook.
 
 The snapshot is queued to a bounded user service after reopen. Its helper takes
 the same lock with a 30-second wait, logs lock/start/upload failures, and retains
@@ -324,6 +347,10 @@ files 0600. Snapshot data and external adapters are never included in this repo.
 the actual nightly-backup lock; do not invent a second lock. `remote_command`
 must resolve to the installed executable's absolute path for the background
 service; the interpreter is also absolute. A custom `--config` path is retained.
+Set `raft.chatgpt_dbs` to the ChatGPT/Codex SQLite files when that raft should
+run (`raft.chatgpt_db` still works as a one-item list).
+`raft.chatgpt_upload_prefix` defaults to `chatgpt-liferaft`. The files are
+snapshotted together in one lock hold.
 
 External snapshot-only adapter protocol 1 is required in `script_dir`:
 

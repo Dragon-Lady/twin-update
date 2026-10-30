@@ -391,11 +391,35 @@ def status(s: Session) -> dict:
     return {"kind": "status", "machines": s.both("status", apps=s.cfg.enabled)}
 
 
+def _chatgpt_raft_smoke_ok(smoke):
+    """ChatGPT raft may run while left closed; a no_launch smoke skip is still safe."""
+    if smoke.get("ok") is True and not smoke.get("skipped"):
+        return True
+    skipped = smoke.get("skipped")
+    return isinstance(skipped, str) and skipped.startswith("no_launch")
+
+
+def _start_raft_upload(s, hook, label, display):
+    if hook.get("ok"):
+        try:
+            started = s.peers[label].call("raft_upload_start", snapshot=hook["snapshot"], call_timeout=30)
+        except Exception as exc:
+            started = {"started": False, "reason": str(exc)}
+        hook["upload"] = started
+        detail = f"upload running in {started['unit']}" if started.get("started") else "upload not started; snapshot retained"
+        s_rep = f"{display} {label}: raft snapshot taken, {detail}"
+    else:
+        s_rep = f"{display} {label}: raft skipped ({hook.get('skipped') or hook.get('error')})"
+    return s_rep
+
+
 def _raft_dry(s, rep, was_open):
     if s.cfg.raft.enabled:
         for label, apps in was_open.items():
             if "cursor" in apps and "cursor" not in s.cfg.no_launch:
                 rep["summary"].append(f"Cursor {label}: would raft (snapshot before reopen, upload to {s.cfg.raft.remote})")
+            if "chatgpt" in apps and s.cfg.raft.chatgpt_sources():
+                rep["summary"].append(f"ChatGPT {label}: would raft (snapshot before reopen, upload to {s.cfg.raft.remote})")
 
 
 def _reopen(s, rep, was_open, results):
@@ -404,6 +428,7 @@ def _reopen(s, rep, was_open, results):
         if not apps:
             continue
         hook = None
+        chatgpt_hook = None
         try:
             if "cursor" in apps and s.cfg.raft.enabled and "cursor" not in s.cfg.no_launch:
                 result = results.get("cursor", {}).get(label, {})
@@ -416,6 +441,18 @@ def _reopen(s, rep, was_open, results):
                 except Exception as exc:
                     hook = {"ok": False, "error": str(exc)}
                 rep.setdefault("raft", {})[label] = hook
+            if "chatgpt" in apps and s.cfg.raft.enabled and s.cfg.raft.chatgpt_sources():
+                result = results.get("chatgpt", {}).get(label, {})
+                verification = result.get("rollback_verify", {}) if "rollback" in result else result.get("verify", {})
+                smoke = verification.get("smoke", {})
+                try:
+                    chatgpt_hook = s.peers[label].call(
+                        "pre_reopen_hook", app_name="chatgpt",
+                        smoke_ok=_chatgpt_raft_smoke_ok(smoke),
+                        call_timeout=s.cfg.raft.snapshot_timeout_s + 30)
+                except Exception as exc:
+                    chatgpt_hook = {"ok": False, "error": str(exc)}
+                rep.setdefault("raft_chatgpt", {})[label] = chatgpt_hook
         finally:
             # The engine honors no_launch. A hook failure never suppresses
             # reopening of apps whose launch policy explicitly permits it.
@@ -439,6 +476,8 @@ def _reopen(s, rep, was_open, results):
                 rep["summary"].append(f"Cursor {label}: raft snapshot taken, {detail}")
             else:
                 rep["summary"].append(f"Cursor {label}: raft skipped ({hook.get('skipped') or hook.get('error')})")
+        if chatgpt_hook:
+            rep["summary"].append(_start_raft_upload(s, chatgpt_hook, label, "ChatGPT"))
     return reopened
 
 

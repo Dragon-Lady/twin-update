@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.5.0 - 2026-10-29
+
+- ChatGPT desktop (Codex) uses the same optional raft hook as Cursor: the
+  shared lock, per-database running and holder checks, snapshot-only adapters,
+  and bounded background upload. A running Cursor does not block ChatGPT's
+  raft, and the reverse is also true. The file is never copied while its own
+  app is running.
+- ChatGPT is in the default `no_launch` list. Twin Update still closes and
+  updates it when it is open, then leaves it closed. ChatGPT's raft still
+  snapshots that closed profile so state can move; Cursor's no-launch gate
+  is unchanged (no_launch still skips Cursor's raft).
+- `raft.chatgpt_dbs` selects the ChatGPT SQLite files (snapshotted together
+  in one lock hold). The older `raft.chatgpt_db` key still works as a
+  one-item list. There is no silent default: official Linux docs do not
+  publish the paths. Observed under `~/.codex`: `state_5.sqlite`,
+  `thread_history_1.sqlite`, `memories_1.sqlite`, `memories_v2_1.sqlite`,
+  `goals_1.sqlite`, `queue_1.sqlite`. `logs_2.sqlite` is optional and
+  omitted from the example set. Snapshots are not read from or written
+  under `~/Documents/Codex`. Leftover processes under `~/.codex`
+  (bundled Chrome `extension-host` included) count as ChatGPT still
+  running, so the whole set is skipped while any of them is alive.
+
 ## 0.4.1 - 2026-10-25
 
 - Confirming Update starts the update in its own user scope that keeps
