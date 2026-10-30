@@ -88,6 +88,10 @@ class Config:
     keep_holds: list[str]
     fallback_rollback: list[str]
     close_timeout_s: float = 90.0
+    # Leftover sandbox helper idle check ([close] table).
+    helper_sample_s: float = 3.0
+    helper_min_age_min: float = 10.0
+    helper_wait_s: float = 10.0
     smoke_s: float = 20.0
     apt_lock_timeout_s: int = 300
     lock_wait_s: float = 600.0
@@ -188,6 +192,15 @@ def load(path: str | None = None, home: str | None = None, text: str | None = No
             raise ConfigError(f"unknown app in no_launch: {n}")
 
     t = data.get("timeouts") or {}
+    cs = data.get("close") or {}
+    close_keys = {"helper_sample_s": 60, "helper_min_age_min": 1440, "helper_wait_s": 120}
+    if not isinstance(cs, dict) or set(cs) - set(close_keys):
+        raise ConfigError("unknown close configuration key")
+    for key, limit in close_keys.items():
+        value = cs.get(key)
+        if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float))
+                                  or not 0 <= value <= limit):
+            raise ConfigError(f"close.{key} must be a number between 0 and {limit}")
     r = data.get("rollback") or {}
     rs = data.get("raft") or {}
     if not isinstance(rs, dict) or set(rs) - set(Raft.__dataclass_fields__):
@@ -229,6 +242,9 @@ def load(path: str | None = None, home: str | None = None, text: str | None = No
         keep_holds=list(asec.get("keep_holds", [])),
         fallback_rollback=list(r.get("fallback", [])),
         close_timeout_s=float(t.get("close_s", 90)),
+        helper_sample_s=float(cs.get("helper_sample_s", 3.0)),
+        helper_min_age_min=float(cs.get("helper_min_age_min", 10.0)),
+        helper_wait_s=float(cs.get("helper_wait_s", 10.0)),
         smoke_s=float(t.get("smoke_s", 20)),
         apt_lock_timeout_s=int(t.get("apt_lock_s", 300)),
         lock_wait_s=float(t.get("lock_wait_s", 600)),

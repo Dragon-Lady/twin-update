@@ -18,6 +18,7 @@ import time
 from typing import Callable
 
 from twin_update import __version__
+from twin_update import helpers
 from twin_update.config import App, Config
 from twin_update.system import Proc, System
 
@@ -46,6 +47,16 @@ def deb_name(pkg: str, version: str, arch: str) -> str:
     return f"{pkg}_{version.replace(':', '%3a')}_{arch}.deb"
 
 
+def _helper_summary(rep: dict) -> dict:
+    """Short helper report for close_wait results (no per-pid detail beyond pids)."""
+    out = {k: rep[k] for k in ("status", "counts", "hint", "command", "pids") if k in rep}
+    active = [r for r in rep.get("helpers", []) if r["class"] != helpers.ORPHANED_IDLE]
+    if active:
+        out["not_idle"] = [{"pid": r["pid"], "class": r["class"], "reasons": r["reasons"]}
+                           for r in active[:10]]
+    return out
+
+
 class Engine:
     def __init__(self, cfg: Config, system: System, label: str,
                  log: Callable[[str], None] | None = None):
@@ -64,6 +75,7 @@ class Engine:
         self.dpkg_updates = "/var/lib/dpkg/updates"
         self._reopened: set[str] = set()
         self._bad_state: list[str] = []
+        self._helper_reports: dict[str, dict] = {}
 
     # ------------------------------------------------------------------ util
     def log(self, msg: str) -> None:
@@ -452,17 +464,36 @@ class Engine:
         procs = self.sys.procs()
         for app in self._apps(apps):
             t = self.app_tree(app, procs)
-            info = {"was_open": bool(t["tree"]), "processes": len(t["tree"]),
-                    "mains": [self._redact(procs[p].exe) for p in t["mains"]]}
+            spec = helpers.SPECS.get(app.name)
+            side = self._helper_side(spec, t) if spec else set()
+            mains = [p for p in t["mains"] if p not in side]
+            rest = t["tree"] - side
+            info = {"was_open": bool(rest), "processes": len(t["tree"]),
+                    "mains": [self._redact(procs[p].exe) for p in mains]}
+            if side:
+                info["helper_processes"] = len(side)
             if dry:
-                info["action"] = "would send SIGTERM" if t["tree"] else "not running"
+                if rest:
+                    info["action"] = "would send SIGTERM"
+                elif side:
+                    info["action"] = "leftover helpers only; would check they are idle"
+                else:
+                    info["action"] = "not running"
+                if side:
+                    info["helpers"] = self.close_helpers(app.name, dry=True)
             else:
+                # Leftover sandbox helpers are never signalled here. close_wait
+                # checks they are idle once the rest of the tree is gone.
                 sent = 0
-                for pid in t["mains"]:
+                for pid in mains:
                     if self.sys.term(pid, procs[pid].start):
                         sent += 1
-                info["action"] = f"SIGTERM sent to {sent} main process(es)" if t["tree"] \
-                    else "not running"
+                if rest:
+                    info["action"] = f"SIGTERM sent to {sent} main process(es)"
+                elif side:
+                    info["action"] = "leftover helpers only; checking they are idle"
+                else:
+                    info["action"] = "not running"
                 self.log(f"close {app.name}: {info['action']}")
             out[app.name] = info
         return out
@@ -473,7 +504,27 @@ class Engine:
         while True:
             procs = self.sys.procs()
             left = {a.name: self.app_tree(a, procs) for a in apps_l}
+            # Only leftover sandbox helpers remain: check them once, close the
+            # idle ones, and do not wait out the timeout on the rest.
+            helpers_only = []
+            for a in apps_l:
+                t = left[a.name]
+                spec = helpers.SPECS.get(a.name)
+                if not t["tree"] or spec is None:
+                    continue
+                if t["tree"] <= self._helper_side(spec, t):
+                    helpers_only.append(a.name)
+                    if a.name not in self._helper_reports:
+                        self._helper_reports[a.name] = self.close_helpers(a.name)
+            if helpers_only:
+                procs = self.sys.procs()
+                left = {a.name: self.app_tree(a, procs) for a in apps_l}
             if all(not t["tree"] for t in left.values()) or self.sys.now() >= deadline:
+                break
+            if all(not t["tree"] or (n in self._helper_reports
+                                     and n in helpers_only
+                                     and t["tree"] <= self._helper_side(helpers.SPECS[n], t))
+                   for n, t in left.items()):
                 break
             self.sys.sleep(1.0)
         out = {}
@@ -482,7 +533,130 @@ class Engine:
                    for pid in sorted(t["tree"])]
             out[name] = {"closed": not rem, "remaining": rem[:10],
                          "remaining_count": len(rem)}
+            rep = self._helper_reports.get(name)
+            if rep is not None:
+                out[name]["helpers"] = _helper_summary(rep)
         return out
+
+    # ------------------------------------------------- leftover sandbox helpers
+    def _helper_pids(self, spec: helpers.HelperSpec, t: dict) -> set[int]:
+        procs = t["procs"]
+        return {pid for pid in t["tree"]
+                if procs[pid].exe == spec.exe and procs[pid].comm == spec.comm}
+
+    def _helper_side(self, spec: helpers.HelperSpec, t: dict) -> set[int]:
+        """Sandbox helpers in the tree whose parent is outside it, plus their descendants."""
+        procs = t["procs"]
+        side = {pid for pid in self._helper_pids(spec, t) if procs[pid].ppid not in t["tree"]}
+        changed = True
+        while changed:
+            changed = False
+            for pid in t["tree"]:
+                if pid not in side and procs[pid].ppid in side:
+                    side.add(pid)
+                    changed = True
+        return side
+
+    def _main_present(self, app: App, spec: helpers.HelperSpec, procs: dict[int, Proc]) -> bool:
+        own = self._own_tree(procs)
+        for pid, p in procs.items():
+            if pid in own or (p.exe == spec.exe and p.comm == spec.comm):
+                continue
+            if p.comm in spec.main_comms:
+                return True
+            if self._matches(app, p.exe) and (self._is_main_exe(app, p.exe)
+                                              or not self._looks_like_helper(p.exe)):
+                return True
+        return False
+
+    def _classify_helpers(self, app: App, spec: helpers.HelperSpec) -> list[dict]:
+        procs = self.sys.procs()
+        t = self.app_tree(app, procs)
+        pids = sorted(self._helper_side(spec, t) & self._helper_pids(spec, t))
+        if not pids:
+            return []
+        main = self._main_present(app, spec, procs)
+        try:
+            reapers = self.sys.user_subreapers()
+        except OSError:
+            reapers = set()
+        facts = helpers.collect(self.sys, pids, {p: procs[p].argv for p in pids},
+                                self.cfg.helper_sample_s)
+        out = []
+        for f in facts:
+            r = helpers.classify(f, spec, main_present=main, reapers=reapers,
+                                 min_age_s=self.cfg.helper_min_age_min * 60,
+                                 home=self.sys.home())
+            r["exe"] = self._redact(r["exe"])
+            out.append(r)
+        return sorted(out, key=lambda r: r["pid"])
+
+    def close_helpers(self, app_name: str, dry: bool = False) -> dict:
+        """Check leftover sandbox helpers are idle; SIGTERM only the idle ones.
+
+        One attempt. Never SIGKILL, never sudo. Signals are sent only when this
+        process runs as the user's own session (AppArmor label ``unconfined``).
+        """
+        app = self._apps([app_name])[0]
+        spec = helpers.SPECS.get(app.name)
+        rep = {"app": app.name, "status": helpers.HELPERS_NONE, "counts": helpers.counts([]),
+               "helpers": []}
+        if spec is None:
+            return rep
+        first = self._classify_helpers(app, spec)
+        rep["helpers"], rep["counts"] = first, helpers.counts(first)
+        idle = {r["pid"]: r["start"] for r in first if r["class"] == helpers.ORPHANED_IDLE}
+        if not first:
+            return rep
+        if not idle:
+            rep["status"] = helpers.HELPERS_ACTIVE
+            return self._log_helpers(rep)
+        if dry:
+            rep["status"] = helpers.HELPERS_WOULD_CLOSE
+            return rep
+        label = self.sys.own_label()
+        rep["own_label"] = label
+        if label != "unconfined":
+            rep.update(status=helpers.HELPERS_NEED_USER_SESSION, pids=sorted(idle),
+                       hint=helpers.NEED_SESSION_HINT, command=helpers.USER_COMMAND)
+            return self._log_helpers(rep)
+        # Check again right before signalling; only same-pid, same-start idle ones.
+        second = self._classify_helpers(app, spec)
+        rep["helpers"], rep["counts"] = second, helpers.counts(second)
+        confirm = {r["pid"]: r["start"] for r in second
+                   if r["class"] == helpers.ORPHANED_IDLE and idle.get(r["pid"]) == r["start"]}
+        results = {pid: self.sys.term_result(pid, start) for pid, start in sorted(confirm.items())}
+        rep["signals"] = {str(pid): res for pid, res in results.items()}
+        sent = [pid for pid, res in results.items() if res == "sent"]
+        deadline = self.sys.now() + self.cfg.helper_wait_s
+        while True:
+            procs = self.sys.procs()
+            survivors = [p for p in sent if p in procs and procs[p].start == confirm[p]]
+            if not survivors or self.sys.now() >= deadline:
+                break
+            self.sys.sleep(0.5)
+        failed = sorted(p for p, res in results.items() if res in ("denied", "error"))
+        rep["denied"] = sorted(p for p, res in results.items() if res == "denied")
+        rep["survivors"] = survivors
+        not_idle = [r["pid"] for r in second if r["pid"] not in confirm]
+        if failed or survivors:
+            rep.update(status=helpers.HELPERS_STILL_RUNNING, hint=helpers.STILL_RUNNING_HINT,
+                       command=helpers.USER_COMMAND, pids=sorted(set(failed) | set(survivors)))
+        elif not_idle:
+            rep["status"] = helpers.HELPERS_ACTIVE
+        else:
+            rep["status"] = helpers.HELPERS_CLEARED
+        return self._log_helpers(rep)
+
+    def _log_helpers(self, rep: dict) -> dict:
+        c = rep["counts"]
+        self.log(f"close-helpers {rep['app']}: {rep['status']} (idle {c[helpers.ORPHANED_IDLE]}, "
+                 f"active {c[helpers.ACTIVE]}, unknown {c[helpers.UNKNOWN]})")
+        sig = rep.get("signals", {})
+        for r in rep["helpers"]:
+            self.log(f"close-helpers {rep['app']}: pid {r['pid']} {r['class']} "
+                     f"label={r['label'] or '?'} result={sig.get(str(r['pid']), 'not signalled')}")
+        return rep
 
     # ----------------------------------------------------------------- store
     def _app_store(self, app: App) -> str:

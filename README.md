@@ -64,6 +64,21 @@ twin-update run [--apps cursor,chatgpt] [--dry-run]
    No force-kill. If anything is still running after `close_s`, the run
    **aborts on both machines before any update**, names the app and process,
    and reopens what it closed.
+   Leftover Cursor sandbox helpers (`cursorsandbox`, parent PID 1, left after
+   Cursor exits) are never signalled blindly. Once nothing else of Cursor is
+   running, each one is checked from `/proc`: no Cursor main process, the
+   exact helper binary and `cursor_sandbox` AppArmor label, orphaned (parent
+   1 or the user's `systemd --user`), no Cursor database file open, no
+   children, no CPU use over `helper_sample_s`, no live TCP connection (a
+   loopback listener is fine) and older than `helper_min_age_min`. Only
+   helpers that pass every check (ORPHANED_IDLE) get SIGTERM, after a second
+   check, once, with no retry and no SIGKILL. Busy or unreadable helpers
+   (ACTIVE / UNKNOWN) are left alone and the run aborts. Cursor's AppArmor
+   profile only accepts signals from `unconfined` processes, so when Twin
+   Update runs under another label (for example started by an agent) it
+   sends nothing and tells you to run `twin-update close-helpers` from your
+   own terminal, or to log out and back in. A refused signal is reported,
+   not retried; no sudo, and the profile is never edited.
 6. **Update** each machine from its own repo: `apt-get install --only-upgrade
    <pkg>=<version>`. Nothing is copied between machines.
 7. **Verify**: dpkg version, `dpkg -V`, and a launch smoke test in the graphical
@@ -105,6 +120,7 @@ twin-update status [--local-only]          # per machine/app: installed, candida
 twin-update rollback <app> [--machine <label>|both] [--dry-run] [--no-hold]
 twin-update holds
 twin-update unhold <app> [--machine ...] [--dry-run]
+twin-update close-helpers [--dry-run]      # this machine: idle-check leftover Cursor sandbox helpers, SIGTERM the idle ones
 twin-update doctor                         # identity, sudo group, apt idle, locks, session, terminal, timer; exit 4 on problems
 twin-update local --serve                  # per-machine engine; the peer runs this over ssh
 ```

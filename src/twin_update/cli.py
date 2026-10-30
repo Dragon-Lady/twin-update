@@ -272,6 +272,23 @@ def _print(ui, data, as_json: bool) -> None:
         ui.say(json.dumps(data, indent=2, sort_keys=True))
 
 
+def _helpers_line(data: dict) -> str:
+    c = data["counts"]
+    words = {
+        "HELPERS_NONE": "No leftover Cursor sandbox helpers.",
+        "HELPERS_CLEARED": "Leftover Cursor sandbox helpers were idle and are now closed.",
+        "HELPERS_WOULD_CLOSE": "Dry run: the idle helpers would get a stop signal (SIGTERM).",
+        "HELPERS_ACTIVE": "Some helpers look busy or could not be read, so they were left alone.",
+        "HELPERS_NEED_USER_SESSION": "Nothing was sent.",
+        "HELPERS_STILL_RUNNING": "Some helpers are still running.",
+    }
+    line = (f"{words.get(data['status'], data['status'])} (idle {c['ORPHANED_IDLE']}, "
+            f"busy {c['ACTIVE']}, unreadable {c['UNKNOWN']})")
+    if data.get("hint"):
+        line += "\n" + data["hint"]
+    return line
+
+
 def main(argv=None, ui=None, system=None, peer_factory=SshPeer) -> int:
     ui = ui or ConsoleUI()
     ap = argparse.ArgumentParser(prog="twin-update", description=__doc__)
@@ -317,6 +334,11 @@ def main(argv=None, ui=None, system=None, peer_factory=SshPeer) -> int:
                    help="run the prompt in this terminal (do not open another window)")
     p.add_argument("--slot", default=None, help=argparse.SUPPRESS)
     p = sub.add_parser("doctor"); common(p)
+    p = sub.add_parser("close-helpers",
+                       help="this machine only: check leftover Cursor sandbox helpers are idle, "
+                            "then SIGTERM the idle ones (run from your own terminal)")
+    p.add_argument("--json", action="store_true", help="print the full JSON report")
+    p.add_argument("--dry-run", action="store_true", help="check only; send nothing")
     p = sub.add_parser("local", help="per-machine engine (used by the peer over ssh)")
     p.add_argument("--serve", action="store_true")
     p.add_argument("--as", dest="as_label", default=None)
@@ -334,6 +356,16 @@ def main(argv=None, ui=None, system=None, peer_factory=SshPeer) -> int:
             cfg = load(args.config)
             me = cfg.self_label(system.whoami(), system.machine_id())
             return 0 if upload(Engine(cfg, system, me), args.snapshot)["ok"] else 1
+        if args.cmd == "close-helpers":
+            cfg = load(args.config)
+            me = cfg.self_label(system.whoami(), system.machine_id())
+            data = Engine(cfg, system, me, log=ui.say).close_helpers("cursor", dry=args.dry_run)
+            if args.json:
+                ui.say(json.dumps(data, indent=2, sort_keys=True))
+            else:
+                ui.say(_helpers_line(data))
+            ok = ("HELPERS_NONE", "HELPERS_CLEARED", "HELPERS_WOULD_CLOSE")
+            return 0 if data["status"] in ok else 1
         if args.cmd == "local":
             cfg = load(args.config)
             me = cfg.self_label(system.whoami(), system.machine_id())
