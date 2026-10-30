@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.1 - 2026-10-30
+
+- Same ChatGPT raft as 0.5.0. This release exists so an update that did not finish can run.
+
 ## 0.5.0 - 2026-10-29
 
 - ChatGPT desktop (Codex) uses the same optional raft hook as Cursor: the
