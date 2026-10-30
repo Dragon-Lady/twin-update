@@ -359,7 +359,8 @@ def main(argv=None, ui=None, system=None, peer_factory=SshPeer) -> int:
         if args.cmd == "close-helpers":
             cfg = load(args.config)
             me = cfg.self_label(system.whoami(), system.machine_id())
-            data = Engine(cfg, system, me, log=ui.say).close_helpers("cursor", dry=args.dry_run)
+            logger = None if args.json else ui.say
+            data = Engine(cfg, system, me, log=logger).close_helpers("cursor", dry=args.dry_run)
             if args.json:
                 ui.say(json.dumps(data, indent=2, sort_keys=True))
             else:
