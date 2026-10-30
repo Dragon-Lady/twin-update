@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.3 - 2026-10-30
 
 - Recheck Cursor main-process presence after each helper CPU sample so a
   startup during the final sample prevents helper termination.
