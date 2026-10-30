@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.5.2 - 2026-10-30
+
+- Leftover Cursor sandbox helpers (`cursorsandbox` with parent PID 1, left
+  after Cursor exits) no longer cause a 90 s close timeout by default. They
+  are checked first: each is ORPHANED_IDLE only if no Cursor main process
+  runs, it is the exact helper binary with a `cursor_sandbox` AppArmor
+  label, it is orphaned, holds no Cursor database file, has no children,
+  used no CPU over the sample, has no live TCP connection (loopback listener
+  allowed) and is older than the minimum age. Anything else is ACTIVE; any
+  unreadable `/proc` fact is UNKNOWN. Neither is ever signalled.
+- Only ORPHANED_IDLE helpers get SIGTERM (pidfd, start-time checked, after
+  a second check), once, never SIGKILL. Signals are sent only from an
+  `unconfined` AppArmor label (the user's own session), since Cursor's
+  profile refuses others. Otherwise nothing is sent and the run aborts with
+  `HELPERS_NEED_USER_SESSION` and how to fix it. A refused signal or a
+  survivor aborts with `HELPERS_STILL_RUNNING`: no retry, no sudo, no
+  profile edits.
+- New `twin-update close-helpers [--dry-run] [--json]` runs the same check
+  and close on this machine from your own terminal.
+- New optional `[close]` settings: `helper_sample_s` (3), `helper_min_age_min`
+  (10), `helper_wait_s` (10).
+- A tree with only leftover helpers no longer counts as the app being open,
+  so it is not reopened after the run.
+- Command lines are never logged or reported (only `run-proxy` / `policy`
+  flags).
+
 ## 0.5.1 - 2026-10-30
 
 - Same ChatGPT raft as 0.5.0. This release exists so an update that did not finish can run.

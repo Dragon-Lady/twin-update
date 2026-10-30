@@ -290,6 +290,20 @@ def _mark_internal_after_close(rep: dict, exc: BaseException) -> None:
         rep["summary"].append(line)
 
 
+def _stuck_detail(label: str, app: str, r: dict) -> str:
+    h = r.get("helpers") or {}
+    if h.get("status") in (None, "HELPERS_NONE", "HELPERS_CLEARED"):
+        return (f"{app} on {label} still running ({r['remaining_count']} proc, e.g. "
+                f"{r['remaining'][0]['exe'] if r['remaining'] else '?'})")
+    c = h.get("counts", {})
+    line = (f"{app} on {label}: {r['remaining_count']} leftover sandbox helper process(es) "
+            f"still running ({h['status']}: idle {c.get('ORPHANED_IDLE', 0)}, "
+            f"active {c.get('ACTIVE', 0)}, unknown {c.get('UNKNOWN', 0)})")
+    if h.get("hint"):
+        line += ". " + h["hint"]
+    return line
+
+
 def _close_all(s: Session, rep: dict, per_machine: dict, dry: bool) -> dict:
     """per_machine: label -> [apps]. Returns was_open map; raises Abort if anything stays."""
     started = {}
@@ -343,9 +357,7 @@ def _close_all(s: Session, rep: dict, per_machine: dict, dry: bool) -> dict:
             if closed_ok:
                 reopen_map[l] = closed_ok
         rep["close"]["reopened_after_abort"] = _reopen_each(s, reopen_map, rep)
-        detail = "; ".join(
-            f"{a} on {l} still running ({r['remaining_count']} proc, e.g. "
-            f"{r['remaining'][0]['exe'] if r['remaining'] else '?'})" for l, a, r in stuck)
+        detail = "; ".join(_stuck_detail(l, a, r) for l, a, r in stuck)
         raise Abort(f"graceful close timed out, nothing was updated on either machine: {detail}")
     return was_open
 

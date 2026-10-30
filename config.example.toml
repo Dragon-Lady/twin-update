@@ -40,6 +40,11 @@ apt_lock_s = 300         # wait for apt/dpkg locks
 lock_wait_s = 600        # wait for lock_paths
 rollback_prompt_s = 60   # failed-check rollback question; times out to no
 
+[close]
+helper_sample_s = 3      # leftover Cursor sandbox helpers: CPU sample window
+helper_min_age_min = 10  # helpers younger than this are treated as busy
+helper_wait_s = 10       # wait after SIGTERM before reporting survivors (never SIGKILL)
+
 [rollback]
 # store = "~/.local/share/twin-update/rollback"
 search_dirs = ["~/Downloads"]   # also look here for the exact installed .deb

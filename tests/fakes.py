@@ -126,6 +126,20 @@ class FakeSystem(System):
         self.follow_script = None  # list of {active, show} snapshots
         self.follow_idx = 0
         self.cleaned_units = []  # ("reset-failed"|"stop", unit)
+        # fake /proc for the sandbox helper idle check
+        self.self_label = "unconfined"
+        self.labels = {}          # pid -> AppArmor label
+        self.fd_table = {}        # pid -> [fd link targets]
+        self.net_table = {}       # pid -> /proc/PID/net/tcp{,6} text
+        self.cpu = {}             # pid -> utime+stime ticks
+        self.cpu_growth = {}      # pid -> ticks added per stat read
+        self.unreadable = set()   # pids whose fds raise PermissionError
+        self.denied = set()       # pids whose SIGTERM is refused (EPERM)
+        self.reapers = set()
+        self.uptime = 200_000.0
+        self.term_calls = []      # (pid, start) for every term_result
+        self.reuse_at = {}        # pid -> (stat read number, new start): PID reuse
+        self._stat_reads = {}
 
     # identity
     def whoami(self): return self.user
@@ -179,6 +193,86 @@ class FakeSystem(System):
         for d in doomed:
             self.proc_table.pop(d, None)
         return True
+
+    def add_sandbox_orphans(self, n=28, start=100, label="cursor_sandbox (enforce)"):
+        """Tonight's shape: n cursorsandbox helpers, parent 1, half run-proxy."""
+        exe = "/usr/share/cursor/resources/app/resources/helpers/cursorsandbox"
+        base = max(self.proc_table or [100000]) + 1
+        pids = []
+        for i in range(n):
+            pid = base + i
+            argv = (exe, "--run-proxy") if i % 2 == 0 else (exe, "--policy-json={\"allow\":\"SECRET-TOKEN\"}")
+            self.proc_table[pid] = Proc(pid, 1, exe, "cursorsandbox", start, False, argv)
+            self.labels[pid] = label
+            log = self._home + "/.config/Cursor/logs/20261029T191759/main.log"
+            fds = ["/dev/null", log, "socket:[%d]" % (7000 + i)]
+            self.fd_table[pid] = fds
+            self.net_table[pid] = (
+                "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n"
+                "   0: 0100007F:9BCD 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 %d 1\n"
+                % (7000 + i))
+            pids.append(pid)
+        return pids
+
+    def proc_stat(self, pid):
+        p = self.proc_table.get(pid)
+        if p is None:
+            raise FileNotFoundError(pid)
+        self._stat_reads[pid] = self._stat_reads.get(pid, 0) + 1
+        if pid in self.reuse_at and self._stat_reads[pid] == self.reuse_at[pid][0]:
+            p = Proc(p.pid, p.ppid, p.exe, p.comm, self.reuse_at.pop(pid)[1],
+                     p.deleted, p.argv)
+            self.proc_table[pid] = p
+        self.cpu[pid] = self.cpu.get(pid, 0) + self.cpu_growth.get(pid, 0)
+        f = ["0"] * 50
+        f[0], f[1], f[11], f[12], f[19] = "S", str(p.ppid), str(self.cpu[pid]), "0", str(p.start)
+        return f"{pid} ({p.comm}) " + " ".join(f)
+
+    def proc_exe(self, pid):
+        p = self.proc_table.get(pid)
+        if p is None:
+            raise FileNotFoundError(pid)
+        return p.exe + (" (deleted)" if p.deleted else "")
+
+    def proc_label(self, pid):
+        return self.labels.get(pid, "unconfined")
+
+    def own_label(self):
+        return self.self_label
+
+    def proc_fds(self, pid):
+        if pid in self.unreadable:
+            raise PermissionError(pid)
+        if pid not in self.proc_table:
+            raise FileNotFoundError(pid)
+        return list(self.fd_table.get(pid, []))
+
+    def proc_net_tcp(self, pid):
+        return self.net_table.get(pid, "")
+
+    def ppid_map(self):
+        return {pid: p.ppid for pid, p in self.proc_table.items()}
+
+    def user_subreapers(self):
+        return set(self.reapers)
+
+    def uptime_s(self):
+        return self.uptime
+
+    def clock_ticks(self):
+        return 100
+
+    def term_result(self, pid, start):
+        self.term_calls.append((pid, start))
+        if pid in self.denied and pid in self.proc_table:
+            self.events.append((self.user, "TERM_DENIED", self.proc_table[pid].exe))
+            return "denied"
+        p = self.proc_table.get(pid)
+        if p is None:
+            return "gone"
+        if p.start != start:
+            return "reused"
+        return "sent" if self.term(pid, start) else "error"
 
     # locks
     def try_flock(self, path):

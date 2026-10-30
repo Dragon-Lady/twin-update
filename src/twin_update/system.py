@@ -241,20 +241,103 @@ class System:
 
     def term(self, pid: int, start: int) -> bool:
         """SIGTERM via pidfd, only if the pid still has the same start time."""
+        return self.term_result(pid, start) == "sent"
+
+    def term_result(self, pid: int, start: int) -> str:
+        """SIGTERM via pidfd with a reason: sent, gone, reused, denied or error.
+
+        ``denied`` is EPERM/EACCES, e.g. an AppArmor profile that refuses
+        signals from this process's label. SIGTERM only, one attempt.
+        """
         try:
             fd = os.pidfd_open(pid)
+        except ProcessLookupError:
+            return "gone"
+        except PermissionError:
+            return "denied"
         except OSError:
-            return False
+            return "error"
         try:
-            cur = self.procs().get(pid)
-            if cur is None or cur.start != start:
-                return False
+            if self.pid_start(pid) != start:
+                return "reused"
             signal.pidfd_send_signal(fd, signal.SIGTERM)
-            return True
+            return "sent"
+        except ProcessLookupError:
+            return "gone"
+        except PermissionError:
+            return "denied"
         except OSError:
-            return False
+            return "error"
         finally:
             os.close(fd)
+
+    # raw /proc reads for the helper idle check (twin_update.helpers) -----
+    def proc_stat(self, pid: int) -> str:
+        with open(f"/proc/{pid}/stat", "rb") as fh:
+            return fh.read().decode("utf-8", "replace")
+
+    def proc_exe(self, pid: int) -> str:
+        return os.readlink(f"/proc/{pid}/exe")
+
+    def proc_label(self, pid: int | str) -> str:
+        with open(f"/proc/{pid}/attr/current", "rb") as fh:
+            return fh.read().decode("utf-8", "replace").strip("\0\n ")
+
+    def own_label(self) -> str | None:
+        """AppArmor label of this process, or None if it cannot be read."""
+        try:
+            return self.proc_label("self")
+        except OSError:
+            return None
+
+    def proc_fds(self, pid: int) -> list[str]:
+        out = []
+        for fd in os.listdir(f"/proc/{pid}/fd"):
+            try:
+                out.append(os.readlink(f"/proc/{pid}/fd/{fd}"))
+            except FileNotFoundError:
+                continue
+        return out
+
+    def proc_net_tcp(self, pid: int) -> str:
+        parts = []
+        for name in ("tcp", "tcp6"):
+            try:
+                with open(f"/proc/{pid}/net/{name}", encoding="ascii", errors="replace") as fh:
+                    parts.append(fh.read())
+            except FileNotFoundError:
+                if name == "tcp":
+                    raise
+        return "\n".join(parts)
+
+    def ppid_map(self) -> dict[int, int]:
+        """pid -> ppid for every process (any user), to find children."""
+        out = {}
+        for name in os.listdir("/proc"):
+            if not name.isdigit():
+                continue
+            try:
+                with open(f"/proc/{name}/stat", "rb") as fh:
+                    raw = fh.read().decode("utf-8", "replace")
+                out[int(name)] = int(raw[raw.rindex(")") + 2:].split()[1])
+            except (OSError, ValueError, IndexError):
+                continue
+        return out
+
+    def user_subreapers(self) -> set[int]:
+        """PIDs of this user's ``systemd --user`` managers (they adopt orphans)."""
+        out = set()
+        for pid, p in self.procs().items():
+            if p.comm == "systemd" and "--user" in p.argv:
+                out.add(pid)
+        return out
+
+    def uptime_s(self) -> float:
+        with open("/proc/uptime", encoding="ascii") as fh:
+            return float(fh.read().split()[0])
+
+    def clock_ticks(self) -> int:
+        return os.sysconf("SC_CLK_TCK")
 
     def own_pid(self) -> int:
         return os.getpid()
